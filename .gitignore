@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local bulk dataset downloads (TalkingCelebs, VoxMini, etc.) -- never commit raw video
+.data/
+
+# Github repo
+human/
+
+# IDEs
+.vscode/
+.claude/
+CLAUDE.md
+.claudeignore
+docs/

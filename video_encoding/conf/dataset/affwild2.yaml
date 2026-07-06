@@ -1,0 +1,6 @@
+name: affwild2
+role: probe  # ssl | probe | eval — see REPO_SETUP.md §1, never share loaders across roles
+present: false  # flip to true once the signed academic application is approved
+va_range: [-1.0, 1.0]
+annotation_hz: 30.0
+path: ${oc.env:AFFWILD2_ROOT,???}

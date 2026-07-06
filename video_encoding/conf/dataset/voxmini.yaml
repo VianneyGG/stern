@@ -1,0 +1,7 @@
+name: voxmini
+role: ssl  # unlabelled SSL-adaptation set, never touches VA labels
+present: false  # flip to true once select_voxmini_subset.py has written a manifest
+path: ${oc.env:VOXMINI_ROOT,???}
+manifest_path: ${.path}/manifest.csv
+target_hours: 218
+seed: 42

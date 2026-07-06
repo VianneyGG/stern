@@ -1,0 +1,39 @@
+# Hyperparameter surface for src/probe/train.py.
+# Field defaults mirror src/ssl.ssl_adapt's and src/probe.train_probe's own
+# function defaults (docs/superpowers/specs/2026-07-01-training-pipeline-design.md
+# §4.5/§4.6) -- exposed here as Hydra values (not hardcoded kwargs) so they're
+# addressable as train.<field> overrides, which the paused HPO phase will need.
+seed: 42
+lora_rank: 8
+batch_size: 4
+grad_accum_steps: 1   # legacy alias; new code reads train.accum_steps below.
+checkpoint_root: ${oc.env:STERN_CHECKPOINT_ROOT,/tmp/stern_checkpoints}
+results_root: ${oc.env:STERN_RESULTS_ROOT,.claude/results}
+
+# --- Training-loop knobs (added in the WHN-style pipeline enhancement) ---
+# See conf/CONFIGS.md > "train/" for what each field does and why the
+# ddp defaults are what they are (T2/T3 cluster findings).
+accum_steps: 1              # micro-steps per optimizer step (uses DDP no_sync)
+use_amp: false              # torch.amp.autocast + GradScaler
+grad_clip: 1.0              # 0.0 disables clip_grad_norm_
+warmup_epochs: 1            # cosine schedule warmup ramp
+lr_scheduler: cosine        # currently the only implemented option
+resume: true                # resume from checkpoint_root/<experiment>/latest.pt if present
+save_latest: true           # write a per-epoch snapshot for crash recovery
+
+ddp:
+  bucket_cap_mb: 25         # tuned for 1GbE fabric (T3: NCCL busBW saturates at ~0.115 GB/s)
+  grad_compress: ""         # "" | "fp16" — halves NCCL bytes at negligible convergence cost
+  nccl_timeout_sec: 300
+  find_unused_parameters: false
+  backend: nccl
+  nccl_env: {}              # e.g. {NCCL_ALGO: Ring, NCCL_PROTO: Simple}
+
+ssl:
+  learning_rate: 1e-4
+  epochs: 10
+  mask_ratio: 0.90
+
+probe:
+  learning_rate: 1e-3
+  epochs: 50

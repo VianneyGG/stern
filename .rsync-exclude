@@ -1,0 +1,13 @@
+.venv/
+.git
+uv.toml
+.hf_cache/
+.claude/worktrees/
+human/
+.pytest_cache/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+/.data/
+outputs/
+multirun/

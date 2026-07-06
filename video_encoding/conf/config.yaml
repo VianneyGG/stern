@@ -1,0 +1,13 @@
+defaults:
+  - dataset: affwild2
+  - model: videomae_v2_base
+  - experiment: videomae_frozen_probe_affwild2
+  - preprocess
+  - train: default
+  - _self_
+
+hydra:
+  job:
+    chdir: false  # keep cache paths stable; see REPO_SETUP.md §4 caching contract
+
+cache_root: ${oc.env:STERN_CACHE_ROOT,/tmp/stern_cache}
