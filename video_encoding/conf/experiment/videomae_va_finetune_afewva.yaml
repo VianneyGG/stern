@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - override /dataset: afewva
+
+experiment:
+  name: videomae_va_finetune_afewva
+  description: "End-to-end fine-tune of the from-scratch VideoMAE encoder + 2-D VA head on AFEW-VA (CCC objective, no freezing)."
+  stage: va_finetune

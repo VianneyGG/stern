@@ -1,0 +1,127 @@
+#!/usr/bin/env python
+"""Build the STERN manifest + per-clip VA label CSVs from an extracted AFEW-VA tree.
+
+AFEW-VA (ibug, EULA-gated) ships 600 clip folders, each with zero-padded frame
+images and one JSON annotation file mapping every frame to integer valence /
+arousal in [-10, 10] plus 68 landmarks:
+
+    {"video_id": "001",
+     "frames": {"00000": {"valence": 2, "arousal": -3, "landmarks": [[x, y] * 68]},
+                ...}}
+
+This writes, under `--out-root` (defaults to the AFEW-VA root):
+  labels/<clip>.csv   two columns `valence,arousal`, one row per frame (raw [-10,10])
+  manifest.csv        one ManifestRecord per clip (role=probe)
+
+`conf/dataset/afewva.yaml` sets `va_range=[-10,10]`, so `harmonise_va` maps these
+to [-1,1] at load time. The exact JSON schema is not published on the ibug page --
+run this on the first real clip after download and eyeball the CSV to confirm the
+parser matches (verification step in the plan).
+
+Run as (repo root, `data.manifest` needs the root on PYTHONPATH -- pytest sets
+this via pyproject.toml's `pythonpath`, a bare script invocation does not):
+    PYTHONPATH=. uv run python video_encoding/scripts/build_afewva_manifest.py \\
+        --afewva-root $AFEWVA_ROOT
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from data.labels import write_label_csv
+from data.manifest import ManifestRecord, write_manifest
+from video_encoding.data.frame_decoder import _IMAGE_EXTS
+
+
+def parse_clip_annotations(json_path: Path) -> list[tuple[float, float]]:
+    """Return `[(valence, arousal), ...]` in frame order from one clip's JSON.
+
+    Sorts frame keys numerically when every key is an integer, matching
+    `frame_decoder.list_frame_files`' numeric-sort guard: a plain lexicographic
+    `sorted(frames)` would order unpadded keys as "0","1","10","11","2",...,
+    silently misaligning every label from frame index 2 onward. The real
+    AFEW-VA JSON schema is unconfirmed (per this module's docstring), so this
+    guards against that risk rather than assuming zero-padding.
+    """
+    data = json.loads(Path(json_path).read_text())
+    frames = data.get("frames")
+    if not isinstance(frames, dict):
+        raise ValueError(
+            f"{json_path}: expected a 'frames' object, got {type(frames).__name__}"
+        )
+    keys = (
+        sorted(frames, key=int) if all(k.isdigit() for k in frames) else sorted(frames)
+    )
+    rows = [
+        (float(frames[key]["valence"]), float(frames[key]["arousal"])) for key in keys
+    ]
+    if not rows:
+        raise ValueError(f"{json_path}: 'frames' is empty")
+    return rows
+
+
+def build(afewva_root: Path, out_root: Path, *, annotation_hz: float = 30.0) -> Path:
+    afewva_root = Path(afewva_root)
+    out_root = Path(out_root)
+    labels_dir = out_root / "labels"
+    labels_dir.mkdir(parents=True, exist_ok=True)
+
+    records: list[ManifestRecord] = []
+    for clip_dir in sorted(p for p in afewva_root.iterdir() if p.is_dir()):
+        if clip_dir.resolve() == labels_dir.resolve():
+            continue
+        jsons = sorted(clip_dir.glob("*.json"))
+        if not jsons:
+            continue
+        rows = parse_clip_annotations(jsons[0])
+        clip = clip_dir.name
+        n_frames = sum(1 for p in clip_dir.iterdir() if p.suffix.lower() in _IMAGE_EXTS)
+        if n_frames == 0:
+            print(
+                f"WARNING: skipping {clip!r} -- 0 extracted frames (annotations present)"
+            )
+            continue
+        if n_frames != len(rows):
+            print(
+                f"WARNING: {clip!r} has {n_frames} frames but {len(rows)} annotation "
+                "rows -- will align to the shorter of the two at training time"
+            )
+        csv_rel = f"labels/{clip}.csv"
+        write_label_csv(out_root / csv_rel, rows)
+        records.append(
+            ManifestRecord(
+                identity_id=clip,
+                clip_path=clip,
+                duration_s=n_frames / annotation_hz,
+                role="probe",
+                label_path=csv_rel,
+            )
+        )
+
+    if not records:
+        raise ValueError(f"no AFEW-VA clips (dir + *.json) found under {afewva_root}")
+    manifest_path = out_root / "manifest.csv"
+    write_manifest(manifest_path, records)
+    return manifest_path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--afewva-root", type=Path, required=True)
+    parser.add_argument("--out-root", type=Path, default=None)
+    parser.add_argument("--annotation-hz", type=float, default=30.0)
+    args = parser.parse_args()
+
+    manifest_path = build(
+        args.afewva_root,
+        args.out_root or args.afewva_root,
+        annotation_hz=args.annotation_hz,
+    )
+    print(f"wrote {manifest_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

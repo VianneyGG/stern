@@ -23,13 +23,22 @@ dependencies = [
     "imageio-ffmpeg>=0.6.0",
 ]
 
+# CUDA 12.8 torch for the fish cluster (RTX 3090, driver 595, cuda-12.6/12.9).
+# Mirrors the What_Happens_Next repo, whose single uv env runs TF 2.21 + cu128
+# torch on this same cluster — so the TF/torch CUDA coexistence CLAUDE.md flags
+# is already proven here. macOS has no CUDA wheels and falls back to PyPI (CPU)
+# via the marker.
 [tool.uv.sources]
-torch = { index = "pytorch-cpu" }
-torchvision = { index = "pytorch-cpu" }
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
 
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [dependency-groups]

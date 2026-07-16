@@ -18,7 +18,7 @@ import numpy as np
 from omegaconf import DictConfig
 
 from data.manifest import ManifestRecord, read_manifest
-from video_encoding.data.frame_decoder import decode_frames
+from video_encoding.data.frame_decoder import load_clip_frames
 
 
 class DatasetNotAcquiredError(RuntimeError):
@@ -38,7 +38,7 @@ class SSLDataset:
     def load_frames(
         self, identity_id: str, clip_path: str, num_frames: int = 16
     ) -> list[np.ndarray]:
-        return decode_frames(self.root / clip_path, num_frames=num_frames)
+        return load_clip_frames(self.root / clip_path, num_frames=num_frames)
 
 
 @dataclass
@@ -48,7 +48,7 @@ class LabelledDataset:
     root: Path
 
     def load_frames(self, clip_path: str, num_frames: int = 16) -> list[np.ndarray]:
-        return decode_frames(self.root / clip_path, num_frames=num_frames)
+        return load_clip_frames(self.root / clip_path, num_frames=num_frames)
 
 
 def _require_acquired(dataset_cfg: DictConfig) -> None:

@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - override /dataset: veatic
+
+experiment:
+  name: videomae_probe_veatic
+  description: "Stage 2 VA probe: frozen encoder (from Stage 1) + trainable 1-layer VA head on VEATIC."
+  stage: va_finetune
+
+train:
+  # Stage 1 output -- see videomae_ssl_pretrain_voxmini.yaml. Assumes that run
+  # used no run_tag (sweep cells nest under checkpoint_root/<name>/<run_tag>/
+  # instead and need this path overridden per cell).
+  pretrain_encoder_path: ${train.checkpoint_root}/videomae_ssl_pretrain_voxmini/best.pt
+  freeze_backbone: true    # probe: only the VA head trains, encoder stays frozen

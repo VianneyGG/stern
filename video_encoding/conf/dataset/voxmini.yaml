@@ -1,7 +1,15 @@
 name: voxmini
 role: ssl  # unlabelled SSL-adaptation set, never touches VA labels
-present: false  # flip to true once select_voxmini_subset.py has written a manifest
+# `present: true` hardcoded here would be a lie for any checkout except the
+# 4 fish nodes (node001/node002/node003/node004) staged 2026-07-08 -- see
+# veatic.yaml for the same env-driven convention. Set VOXMINI_PRESENT=true
+# on those nodes before running.
+present: ${oc.decode:${oc.env:VOXMINI_PRESENT,false}}
 path: ${oc.env:VOXMINI_ROOT,???}
 manifest_path: ${.path}/manifest.csv
+# Pre-decoded 8fps/224px JPEG cache (Workstream A4b) -- null means "not
+# cached", and the SSL window dataset falls back to live mp4 decode from
+# `path` in that case.
+frames_path: ${oc.env:VOXMINI_FRAMES_ROOT,null}
 target_hours: 218
 seed: 42

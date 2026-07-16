@@ -1,5 +1,0 @@
-name: videomae_frozen_probe_affwild2
-description: "Frozen encoder, cache embeddings once, train only the VA head. Scientific comparison anchor."
-freeze_encoder: true
-use_lora: false
-use_ssl: false

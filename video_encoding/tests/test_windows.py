@@ -1,7 +1,42 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
+from PIL import Image
 
-from video_encoding.data.windows import make_windows
+from video_encoding.data.windows import build_frame_windows, make_windows
+
+
+def _write_frames(clip_dir: Path, n: int) -> None:
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(
+            clip_dir / f"{i:04d}.jpg"
+        )
+
+
+def test_build_frame_windows_matches_window_starts(tmp_path):
+    clip_dir = tmp_path / "clip"
+    _write_frames(clip_dir, n=24)
+
+    windows = build_frame_windows(clip_dir, num_frames=16, overlap=0.5)
+
+    # window_starts(24, 16, 0.5) -> step=8 -> starts at [0, 8]
+    assert len(windows) == 2
+    assert windows[0][1] == list(range(0, 16))
+    assert windows[1][1] == list(range(8, 24))
+    assert len(windows[0][0]) == 24  # frame_files listing, shared across windows
+
+
+def test_build_frame_windows_n_frames_override_clamps_below_disk_count(tmp_path):
+    clip_dir = tmp_path / "clip"
+    _write_frames(clip_dir, n=24)
+
+    # Labels only cover 20 frames -- windows must not run past that.
+    windows = build_frame_windows(clip_dir, num_frames=16, overlap=0.0, n_frames=20)
+
+    assert len(windows) == 1
+    assert windows[0][1] == list(range(0, 16))
 
 
 def test_make_windows_no_overlap_exact_division():

@@ -24,6 +24,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping
 
+import io
+import os
+import zipfile
+
 import torch
 
 
@@ -169,10 +173,97 @@ def unwrap(model: torch.nn.Module) -> torch.nn.Module:
     """Strip DDP + torch.compile wrappers to expose the raw nn.Module.
 
     Public: shared by every module that needs to inspect/save the raw
-    model (this file, `video_encoding/ssl/__init__.py`, `video_encoding/probe/train.py`) instead
-    of each re-implementing the same two-step unwrap.
+    model (this file, `video_encoding/training/pretrain.py`,
+    `video_encoding/training/train.py`) instead of each re-implementing the
+    same two-step unwrap.
     """
     raw = model.module if hasattr(model, "module") else model
     if hasattr(raw, "_orig_mod"):
         raw = raw._orig_mod
     return raw
+
+
+def base_payload(
+    *,
+    model,
+    optimizer,
+    epoch: int,
+    best_val_metric: float,
+    model_name: str,
+    optimizer_name: str,
+) -> dict[str, Any]:
+    """Common 4-key checkpoint payload spine shared by every training stage.
+
+    Each stage's own `_payload()` calls this for the shared fields and adds
+    whatever else it needs on top (e.g. `scheduler_state_dict`) -- the exact
+    `model_name`/`optimizer_name` strings passed in are load-bearing:
+    `load()`'s `expected_model_name`/`expected_optimizer_name` checks them
+    verbatim to decide whether a checkpoint is compatible.
+    """
+    return {
+        "model_state_dict": unwrap(model).state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "optimizer_name": optimizer_name,
+        "epoch": epoch,
+        "best_val_metric": best_val_metric,
+        "model_name": model_name,
+    }
+
+
+def load_encoder_state(
+    encoder: torch.nn.Module, state_dict: Mapping[str, Any]
+) -> tuple[list[str], list[str]]:
+    """Load an encoder state dict, inflating/truncating patch_embed input
+    channels when they differ from the target encoder's configured
+    in_channels, instead of failing on a shape mismatch.
+
+    Extra channels are zero-initialized: a zero-init channel starts as a
+    no-op, so the pretrained RGB weights are preserved exactly and gradient
+    updates "activate" the new channel(s) during fine-tuning rather than
+    corrupting what was already learned. Returns the `(missing, unexpected)`
+    keys from the underlying `load_state_dict(strict=False)` call.
+    """
+    state_dict = dict(state_dict)
+    w = state_dict.get("patch_embed.proj.weight")
+    target_w = encoder.patch_embed.proj.weight
+    if w is not None and target_w.shape[1] != w.shape[1]:
+        if target_w.shape[1] > w.shape[1]:
+            extra = torch.zeros(
+                w.shape[0],
+                target_w.shape[1] - w.shape[1],
+                *w.shape[2:],
+                dtype=w.dtype,
+            )
+            state_dict["patch_embed.proj.weight"] = torch.cat([w, extra], dim=1)
+        else:
+            state_dict["patch_embed.proj.weight"] = w[
+                :, : target_w.shape[1]
+            ].contiguous()
+    result = encoder.load_state_dict(state_dict, strict=False)
+    return list(result.missing_keys), list(result.unexpected_keys)
+
+
+def load_checkpoint_file(path: Path | str) -> dict:
+    """torch.load a checkpoint, transparently supporting an unzipped PyTorch
+    archive directory (data.pkl, data/, version, ...) alongside a normal
+    single-file checkpoint.
+
+    A directory is repacked into an in-memory ZIP (ZIP_STORED, no compression)
+    so torch.load can consume it -- useful for checkpoints synced off the
+    cluster as an extracted directory rather than the single .pt file.
+    """
+    p = Path(path)
+    if not p.is_dir():
+        return torch.load(p, map_location="cpu", weights_only=False)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        for root, _, files in os.walk(str(p)):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                arcname = "archive/" + os.path.relpath(fpath, str(p))
+                # Files may carry pre-1980 timestamps; ZipInfo requires >= 1980.
+                zi = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+                with open(fpath, "rb") as fh:
+                    zf.writestr(zi, fh.read())
+    buf.seek(0)
+    return torch.load(buf, map_location="cpu", weights_only=False)

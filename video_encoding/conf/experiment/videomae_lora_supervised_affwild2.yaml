@@ -1,5 +1,0 @@
-name: videomae_lora_supervised_affwild2
-description: "LoRA + VA head jointly trained with labels. Deployment-optimum experiment."
-freeze_encoder: true  # base weights frozen; only LoRA params train
-use_lora: true
-use_ssl: false

@@ -1,14 +1,47 @@
 # video_encoding/tests/test_select_voxmini_subset.py
+from fractions import Fraction
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from video_encoding.scripts.select_voxmini_subset import (
     Identity,
+    _probe_duration_av,
     list_clips,
     load_identities,
     select_stratified_subset,
 )
+
+
+def _fake_container(duration, streams):
+    container = MagicMock(duration=duration, streams=streams)
+    container.__enter__.return_value = container
+    container.__exit__.return_value = False
+    return container
+
+
+def test_probe_duration_av_falls_back_to_video_stream_duration(tmp_path: Path):
+    # A handful of real VoxCeleb2 mp4s have no container-level duration; PyAV
+    # still exposes it on the video stream itself (duration * time_base).
+    video_stream = MagicMock(
+        type="video", duration=90_000, time_base=Fraction(1, 90_000)
+    )
+    container = _fake_container(duration=None, streams=[video_stream])
+
+    with patch("av.open", return_value=container):
+        result = _probe_duration_av(tmp_path / "clip.mp4")
+
+    assert result == pytest.approx(1.0)
+
+
+def test_probe_duration_av_returns_zero_when_no_duration_anywhere(tmp_path: Path):
+    container = _fake_container(duration=None, streams=[])
+
+    with patch("av.open", return_value=container):
+        result = _probe_duration_av(tmp_path / "clip.mp4")
+
+    assert result == 0.0
 
 
 def test_list_clips_walks_identity_directories_and_uses_injected_prober(tmp_path: Path):
@@ -25,12 +58,33 @@ def test_list_clips_walks_identity_directories_and_uses_injected_prober(tmp_path
     assert all(duration == 3.5 for clips in result.values() for _, duration in clips)
 
 
+def test_list_clips_skips_clips_whose_prober_raises(tmp_path: Path):
+    # A handful of real VoxCeleb2 mp4s are corrupt/truncated (av.error raised
+    # on open) -- one bad file must not crash the whole corpus scan, and the
+    # unreadable clip must be excluded rather than recorded with a fake duration.
+    (tmp_path / "id00012" / "vid001").mkdir(parents=True)
+    (tmp_path / "id00012" / "vid001" / "00001.mp4").touch()
+    (tmp_path / "id00012" / "vid001" / "00002.mp4").touch()
+
+    def flaky_prober(path: Path) -> float:
+        if path.name == "00002.mp4":
+            raise RuntimeError("Invalid data found when processing input")
+        return 3.5
+
+    result = list_clips(tmp_path, probe_duration_s=flaky_prober)
+
+    assert len(result["id00012"]) == 1
+    assert result["id00012"][0][1] == 3.5
+
+
 def test_load_identities_joins_meta_and_clips(tmp_path: Path):
+    # Real vox2_meta.csv is tab-delimited with padding whitespace around every
+    # header/value despite the .csv extension -- mirror that, not a clean comma-CSV.
     meta_csv = tmp_path / "vox2_meta.csv"
     meta_csv.write_text(
-        "VoxCeleb2 ID,VGGFace2 ID,Gender,Set\n"
-        "id00012,n000001,m,dev\n"
-        "id00013,n000002,f,dev\n"
+        "VoxCeleb2 ID \tVGGFace2 ID \tGender \tSet \n"
+        "id00012 \tn000001 \tm \tdev \n"
+        "id00013 \tn000002 \tf \tdev \n"
     )
     raw_root = tmp_path / "raw"
     (raw_root / "id00012" / "vid001").mkdir(parents=True)
@@ -48,7 +102,9 @@ def test_load_identities_joins_meta_and_clips(tmp_path: Path):
 
 def test_load_identities_skips_clips_with_no_metadata(tmp_path: Path):
     meta_csv = tmp_path / "vox2_meta.csv"
-    meta_csv.write_text("VoxCeleb2 ID,VGGFace2 ID,Gender,Set\nid00012,n000001,m,dev\n")
+    meta_csv.write_text(
+        "VoxCeleb2 ID \tVGGFace2 ID \tGender \tSet \nid00012 \tn000001 \tm \tdev \n"
+    )
     raw_root = tmp_path / "raw"
     (raw_root / "id00012" / "vid001").mkdir(parents=True)
     (raw_root / "id00012" / "vid001" / "00001.mp4").touch()

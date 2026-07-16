@@ -1,9 +1,9 @@
 defaults:
-  - dataset: affwild2
-  - model: videomae_v2_base
-  - experiment: videomae_frozen_probe_affwild2
+  - dataset: afewva
+  - model: videomae_base
   - preprocess
   - train: default
+  - experiment: videomae_va_finetune_afewva
   - _self_
 
 hydra:

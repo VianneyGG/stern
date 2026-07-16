@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - override /dataset: veatic
+
+experiment:
+  name: videomae_va_finetune_veatic
+  description: "End-to-end fine-tune of the from-scratch VideoMAE encoder + 2-D VA head on VEATIC (CCC objective, no freezing)."
+  stage: va_finetune

@@ -10,12 +10,29 @@ from __future__ import annotations
 import argparse
 import csv
 import random
+import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from data.manifest import ManifestRecord, write_manifest
+
+
+def _safe_probe(
+    clip_path: Path, probe_duration_s: Callable[[Path], float]
+) -> float | None:
+    """Wrap a prober so one corrupt/unreadable file (real occurrence in the
+    VoxCeleb2 corpus -- e.g. `av.error.InvalidDataError` on a truncated mp4)
+    doesn't crash a ~1h, 1.24M-clip run. Skipped clips are excluded from the
+    manifest entirely (an unopenable file is unusable for training either
+    way), not just counted as zero duration."""
+    try:
+        return probe_duration_s(clip_path)
+    except Exception as exc:
+        print(f"skipping unreadable clip {clip_path}: {exc}", file=sys.stderr)
+        return None
 
 
 @dataclass
@@ -30,34 +47,64 @@ class Identity:
 
 
 def _probe_duration_av(clip_path: Path) -> float:
+    """Some VoxCeleb2 mp4s have no container-level duration (a handful out of
+    ~1.24M hit this in practice) -- fall back to the video stream's own
+    duration/time_base, then to 0.0 rather than crashing the whole run."""
     import av
 
     with av.open(str(clip_path)) as container:
-        return float(container.duration) / 1_000_000.0  # av duration is in microseconds
+        if container.duration is not None:
+            return (
+                float(container.duration) / 1_000_000.0
+            )  # av duration is in microseconds
+        video_stream = next((s for s in container.streams if s.type == "video"), None)
+        if video_stream is not None and video_stream.duration is not None:
+            return float(video_stream.duration * video_stream.time_base)
+        return 0.0
 
 
 def list_clips(
-    raw_mp4_root: Path, probe_duration_s: Callable[[Path], float] | None = None
+    raw_mp4_root: Path,
+    probe_duration_s: Callable[[Path], float] | None = None,
+    max_workers: int = 32,
 ) -> dict[str, list[tuple[str, float]]]:
     """Walk `raw_mp4_root/<identity_id>/<video_id>/<clip_id>.mp4` and return
     identity_id -> [(clip_path relative to raw_mp4_root, duration_s), ...].
 
     `probe_duration_s` defaults to probing the real file via `av`; injectable
     for testing without real video files.
+
+    Probing is I/O-bound (each `av.open` is mostly a disk seek + header read,
+    ~28ms measured on the real corpus) and independent per clip, so it's run
+    across a thread pool -- at VoxCeleb2's full-corpus scale (~1.24M clips)
+    the sequential version takes ~10 hours regardless of `target_hours`
+    (selection only happens after every clip is probed).
     """
     if probe_duration_s is None:
         probe_duration_s = _probe_duration_av
 
-    clips_by_identity: dict[str, list[tuple[str, float]]] = defaultdict(list)
-    for identity_dir in sorted(raw_mp4_root.iterdir()):
-        if not identity_dir.is_dir():
-            continue
-        identity_id = identity_dir.name
-        for clip_path in sorted(identity_dir.rglob("*.mp4")):
-            duration_s = probe_duration_s(clip_path)
-            clips_by_identity[identity_id].append(
-                (str(clip_path.relative_to(raw_mp4_root)), duration_s)
+    identity_dirs = sorted(d for d in raw_mp4_root.iterdir() if d.is_dir())
+    ordered_clips: list[tuple[str, Path]] = [
+        (identity_dir.name, clip_path)
+        for identity_dir in identity_dirs
+        for clip_path in sorted(identity_dir.rglob("*.mp4"))
+    ]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        durations = list(
+            pool.map(
+                lambda p: _safe_probe(p, probe_duration_s),
+                (p for _, p in ordered_clips),
             )
+        )
+
+    clips_by_identity: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    for (identity_id, clip_path), duration_s in zip(ordered_clips, durations):
+        if duration_s is None:
+            continue
+        clips_by_identity[identity_id].append(
+            (str(clip_path.relative_to(raw_mp4_root)), duration_s)
+        )
     return dict(clips_by_identity)
 
 
@@ -65,17 +112,27 @@ def load_identities(
     meta_csv: Path,
     raw_mp4_root: Path,
     probe_duration_s: Callable[[Path], float] | None = None,
+    max_workers: int = 32,
 ) -> list[Identity]:
     """Join `vox2_meta.csv` (identity -> gender) with the actual clip files
     found under `raw_mp4_root`. Identities present on disk but absent from
-    `meta_csv` are skipped (no gender to stratify by)."""
-    genders: dict[str, str] = {}
-    with meta_csv.open(newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            genders[row["VoxCeleb2 ID"]] = row["Gender"]
+    `meta_csv` are skipped (no gender to stratify by).
 
-    clips_by_identity = list_clips(raw_mp4_root, probe_duration_s=probe_duration_s)
+    The official file is tab-delimited with padding whitespace around every
+    header and value (e.g. `"VoxCeleb2 ID "`, `"m "`) despite the `.csv`
+    extension -- not a clean comma-CSV -- so every field is stripped after
+    parsing.
+    """
+    genders: dict[str, str] = {}
+    with meta_csv.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            clean = {k.strip(): v.strip() for k, v in row.items()}
+            genders[clean["VoxCeleb2 ID"]] = clean["Gender"]
+
+    clips_by_identity = list_clips(
+        raw_mp4_root, probe_duration_s=probe_duration_s, max_workers=max_workers
+    )
 
     return [
         Identity(identity_id=identity_id, gender=genders[identity_id], clips=clips)
@@ -133,9 +190,17 @@ def main() -> int:
     parser.add_argument("--manifest-out", type=Path, required=True)
     parser.add_argument("--target-hours", type=float, default=218.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--probe-workers",
+        type=int,
+        default=32,
+        help="thread-pool size for per-clip duration probing (I/O-bound)",
+    )
     args = parser.parse_args()
 
-    identities = load_identities(args.meta_csv, args.raw_root)
+    identities = load_identities(
+        args.meta_csv, args.raw_root, max_workers=args.probe_workers
+    )
     selected = select_stratified_subset(identities, args.target_hours, args.seed)
 
     records = [

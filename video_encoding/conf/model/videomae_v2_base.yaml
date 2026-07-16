@@ -1,6 +1,0 @@
-name: videomae_v2_base
-encoder: videomae
-checkpoint: OpenGVLab/VideoMAEv2-Base
-num_frames: 16
-embed_dim: 768
-output_granularity: per_frame

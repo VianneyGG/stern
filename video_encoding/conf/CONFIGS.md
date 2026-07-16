@@ -1,189 +1,127 @@
 # Config registry
 
 Living index of every Hydra config file under `conf/`. Update this table
-whenever a config is added, its status changes, or it's deprecated — this
-replaces "grep the yaml files to remember what they mean" with one file to
-read. Experiments are no longer a fixed enum of 3; see the naming convention
-below before adding a new one.
+whenever a config is added, its status changes, or it's deprecated.
 
-## Experiment naming convention
+## Composition order (`conf/config.yaml`)
 
-Follows the What_Happens_Next repo's `configs/experiment/` scheme (chosen for
-cross-project consistency — same repos, same cluster, same team). File name:
+```
+defaults:
+  - dataset: afewva
+  - model: videomae_base
+  - preprocess
+  - train: default
+  - experiment: <name>
+  - _self_
+```
 
-    <encoder>_<strategy>[_<variant>]_<dataset>.yaml
+`experiment` composes **after** `train` deliberately: an experiment's own
+`train:`/`dataset:` overrides (see below) must win over the plain group
+selection, and Hydra composes top-to-bottom.
 
-- `<encoder>`: `videomae`, `vjepa2`, `marlin` (matches `model/` file stems)
-- `<strategy>`: `frozen_probe`, `lora_ssl`, `lora_supervised`
-- `<variant>` (optional): distinguishing knob, e.g. `s2_lowlr`, `perceiver`
-- `<dataset>`: dataset the experiment is bound to at its defaults
+## Experiment pattern
 
-Examples: `videomae_frozen_probe_affwild2.yaml`,
-`videomae_lora_ssl_voxmini.yaml`, `videomae_lora_supervised_affwild2.yaml`.
+`conf/experiment/*.yaml` are self-contained, not name-only stubs. Each one
+uses Hydra's `# @package _global_` + `defaults: [override /group: x]`
+pattern:
 
-Inside the YAML, `name:` MUST equal the file stem — checkpoints and result
-JSONs key off it. Only add a sibling file for a new
-dataset/objective/encoder combination — never overload an existing
-experiment's meaning by silently changing what it points to.
+```yaml
+# @package _global_
+defaults:
+  - override /dataset: veatic   # re-target a config group this experiment owns
 
-## `dataset/`
+experiment:
+  name: <must equal the file stem>
+  description: "..."
+  stage: pretrain | va_finetune   # routes scripts/run_experiment.sh
 
-| Name | Role | Present | Purpose | Status | Introduced by |
-|---|---|---|---|---|---|
-| `affwild2` | probe | false | Labelled VA, per-frame, 30Hz | stub | video-arm-scaffold |
-| `voxmini` | ssl | false | Unlabelled SSL adaptation, 218h target | stub | video-arm-scaffold |
-| `talkingcelebs` | ssl | false | Full-corpus unlabelled SSL set (HF `samarrik/talkingcelebs`) | scaffolded (download/ingest scripts real) | video-arm-scaffold |
-| `talkingcelebs_mini` | ssl | **true** | Real acquired mini slice: 25 clips / 5 identities / ~0.2h (the whole corpus is only 5 identities, not the ~40 assumed) | **acquired**, on login-node `/Data/$USER/talkingcelebs_mini` | T5/HPO plan Phase 2 |
-| `sewa` | eval | false | Domain-shift eval, VA range **[0,1]** (not [-1,1] — harmonise before use) | stub | video-arm-scaffold |
-| `afew_va` | eval | false | Domain-shift eval, native68 landmarks | stub | video-arm-scaffold |
+model:
+  drop_path_rate: 0.2   # only if this experiment needs an architecture delta
 
-Known fix: `manifest_path: ${path}/manifest.csv` doesn't resolve once composed
-under the full Hydra tree (`path` isn't a root-level key) -- all three
-`manifest_path` fields (`talkingcelebs`, `talkingcelebs_mini`, `voxmini`) now
-use the relative-reference form `${.path}/manifest.csv` instead.
+train:
+  pretrain_encoder_path: ${train.checkpoint_root}/<ssl-experiment-name>/best.pt
+  freeze_backbone: true
+```
+
+`model:`/`train:`/`dataset:` blocks are **deltas only** — they override
+specific fields on top of `conf/model/videomae_base.yaml` and
+`conf/train/{default,ssl}.yaml`, which remain the source of truth for the
+full recipe. Comment every override with the rationale, not just the value.
+
+`override /dataset: x` / `override /train: x` replace shell-level CLI flags
+(`scripts/run_experiment.sh` no longer hardcodes `dataset=voxmini train=ssl`
+for pretrain-stage runs — see the experiment file itself).
+
+Naming convention (unchanged): `<encoder>_<strategy>[_<variant>]_<dataset>.yaml`,
+`name:` inside the file MUST equal the file stem (checkpoints/result JSONs key
+off it).
 
 ## `model/`
 
-| Name | Encoder | Embed dim | Purpose | Status | Introduced by |
-|---|---|---|---|---|---|
-| `videomae_v2_base` | videomae | 768 | **Working encoder** for the approved pipeline (2026-07-01-training-pipeline-design.md) | implemented (`src/encoders/videomae.py`) | T5/HPO plan Phase 1 |
-| `vjepa2_vitl` | vjepa2 | 1024 | Target long-term encoder (D-MODEL-1) | deferred (encoder stub, not built against) | video-arm-scaffold |
-| `vjepa2_vitg` | vjepa2 | 1408 | Ablation-only per D-MODEL-1 | deferred | video-arm-scaffold |
-| `marlin` | marlin | 768 | Clip-level alternative encoder | deferred | video-arm-scaffold |
-
-Note: `conf/config.yaml`'s default `model:` is still `vjepa2_vitl` (D-MODEL-1
-remains formally open) — all real runs pass `model=videomae_v2_base`
-explicitly rather than changing the shared default.
-
-## `experiment/`
-
-| Name | Purpose | Status | Introduced by |
-|---|---|---|---|
-| `videomae_frozen_probe_affwild2` | Frozen encoder, cache once, train VA head only | probe stage implemented + tested against synthetic fixtures; a real run is blocked on Aff-Wild2 acquisition | video-arm-scaffold |
-| `videomae_lora_ssl_voxmini` | LoRA + SSL objective on VoxMini, then freeze + probe | SSL stage implemented; probe tail implemented (frozen-cache path) but a real run is blocked on Aff-Wild2 | video-arm-scaffold |
-| `videomae_lora_supervised_affwild2` | LoRA + VA head jointly trained, supervised | approved; blocked on Aff-Wild2 acquisition | video-arm-scaffold |
-| `videomae_lora_ssl_talkingcelebs_mini` | LoRA + SSL on the mini TalkingCelebs slice | ready — talkingcelebs_mini is the only `present: true` dataset, though its data only exists on the acquiring cluster machine (no `TALKINGCELEBS_MINI_ROOT`/local dir in this worktree) | T5/HPO plan Phase 4 |
-
-The old letter-based files (`a_frozen`, `b_lora_ssl`, `c_lora_sup`) have been
-renamed to the WHN-style names above; the letter shorthand no longer exists.
-
-## `train/`
-
-Phase 1 fields (`conf/train/default.yaml`): `seed`, `lora_rank`,
-`batch_size`, `grad_accum_steps` (legacy alias — `accum_steps` below is
-what new code reads), `checkpoint_root`, `results_root`, plus per-stage
-groups `ssl.{learning_rate,epochs,mask_ratio}` and
-`probe.{learning_rate,epochs}` mirroring `ssl_adapt()`/`train_probe()`'s
-own function defaults.
-
-Phase 2 fields (WHN-style training pipeline enhancement,
-2026-07-02):
+One shared architecture (`videomae_base`) — Stage 1 (SSL) and Stage 2
+(probe/finetune) use the same `VideoMAEEncoder`, so there is nothing to
+select between; per-stage/per-experiment knobs live as fields on this one
+file, overridden per-experiment where needed.
 
 | Field | Default | Purpose |
 |---|---|---|
-| `accum_steps` | `1` | Gradient accumulation micro-steps per optimizer step. Uses DDP `no_sync()` on non-boundary micro-steps to avoid useless allreduces. |
-| `use_amp` | `false` | Enable `torch.amp.autocast('cuda')` + `GradScaler`. Off by default because AMP masks numerical bugs; opt in per experiment. |
-| `grad_clip` | `1.0` | `clip_grad_norm_` threshold. `0.0` disables. |
-| `warmup_epochs` | `1` | Linear LR warmup epochs before cosine anneal. |
-| `lr_scheduler` | `cosine` | Only option currently — cosine anneal with warmup. |
-| `resume` | `true` | Auto-resume from `checkpoint_root/<experiment>/{ssl_best,ssl_best_latest}.pt` if present. |
-| `save_latest` | `true` | Also save a per-epoch snapshot for crash recovery. |
-| `ddp.bucket_cap_mb` | `25` | DDP allreduce bucket size in MB — see rationale below. |
-| `ddp.grad_compress` | `""` | `""` or `"fp16"`. fp16 halves NCCL bytes at negligible convergence cost. |
-| `ddp.nccl_timeout_sec` | `300` | Passed as `timedelta` to `init_process_group`. |
-| `ddp.find_unused_parameters` | `false` | Set `true` for LoRA experiments whose forward path leaves some LoRA branches cold. |
-| `ddp.backend` | `nccl` | Override to `gloo` only for CPU-only debug runs. |
-| `ddp.nccl_env` | `{}` | Kwargs like `{NCCL_ALGO: Ring, NCCL_PROTO: Simple}` propagated to `os.environ` via `setdefault`. |
+| `num_frames`, `image_size`, `in_channels`, `tubelet_size`, `patch_size`, `embed_dim`, `depth`, `num_heads`, `mlp_ratio` | ViT-B geometry | Architecture, shared by both stages |
+| `dropout` | `0.0` | Standard dropout inside attention/MLP |
+| `drop_path_rate` | `0.0` | Stochastic depth, linearly scaled across blocks; override per-experiment for finetune-style runs |
+| `decoder_depth`, `decoder_embed_dim`, `decoder_num_heads` | `4`/`256`/`8` | MAE decoder (Stage 1 only; unused by the probe/finetune path) |
+| `mask_ratio` | `0.9` | Fraction of tubelets masked during SSL pretraining |
+| `motion_mask` | `false` | `true` -> mask highest-motion tubelets (`MotionGuidedTubeMasking`) instead of random ones |
+| `decoder_mask_ratio` | `0.0` | V2 dual masking: fraction of masked tokens the decoder skips reconstructing |
 
-**Why `ddp.bucket_cap_mb=25` and `grad_compress=fp16` are cluster-specific
-defaults.** SallesInfo is 1GbE end to end; T2/T3 probes measured NCCL
-`busBW` saturating at ~0.115 GB/s for messages ≥16 MB. Two consequences:
+## `train/`
 
-1. Smaller allreduce buckets (25 MB vs. WHN's 200 MB default) let more of
-   the allreduce overlap with the next micro-step's compute. On a fat
-   interconnect the larger bucket wins by amortising latency; on 1GbE
-   bandwidth dominates and pipelining wins.
-2. `grad_compress='fp16'` halves the bytes-per-allreduce. On this fabric
-   that translates ~1:1 into halved comm time for any run where allreduce
-   is >5% of step time (i.e. anything with a non-trivial gradient volume).
-   Off by default because it can degrade convergence on toy models;
-   safe-and-recommended for the current VideoMAEv2 + LoRA runs.
+| File | Used by | Notes |
+|---|---|---|
+| `default.yaml` | Stage 2 (`training/train.py`) | Adam, flat LR, CCC-loss batch sizing |
+| `ssl.yaml` | Stage 1 (`training/pretrain.py`) | AdamW, linear-scaling-rule LR (`base_lr`/`lr_mult`), warmup+cosine, throughput/VRAM instrumentation fields |
 
-## Logger + checkpoint contract
+Both share the checkpoint-hand-off fields (`default.yaml` only, since
+Stage 1 never loads a downstream checkpoint):
 
-`src/training/logger.py` is two plain functions, not a class — no
-wrapper object to keep in sync with `SummaryWriter`'s own API.
-`make_writer(log_dir, rank=)` returns a `SummaryWriter` on rank 0 and
-`None` everywhere else; call sites gate every write with `if writer:`.
-TB scalars land under `checkpoint_root/<experiment>/tb_ssl/`.
-`write_result_json(metrics, cfg, results_root=, flops=)` is rank-gated the
-same way and writes the final result JSON under `train.results_root`
-(default `.claude/results/`) with WHN-compatible schema so cross-project
-isoFLOP tables keep working. Per-rank status prints use plain `print()`
-gated on `rank == 0` at the call site — no logging abstraction.
+| Field | Default | Purpose |
+|---|---|---|
+| `pretrain_encoder_path` | `null` | Path to a Stage 1 SSL `best.pt`; `null` = train the encoder from scratch |
+| `freeze_backbone` | `false` | `true` = frozen-encoder probe (only the VA head trains); `false` = end-to-end fine-tune |
 
-`src/training/checkpoint.py` writes atomically (tmp→rename) and guards
-against overwriting a better all-time-best on resume via a cached
-`_disk_best` float — deliberately avoiding a full `torch.load` per epoch
-on NFS, which stalls rank 0 and can trip the NCCL watchdog.
+See inline comments in each file for the rest of the hyperparameter surface
+(`accum_steps`, `ddp.*`, `warmup_epochs`, etc.) — those are unchanged by this
+registry rewrite.
 
-## VA label contract (`common/data/labels.py`)
+## `dataset/`
 
-`ManifestRecord.label_path` points to a CSV with two columns
-`valence,arousal`, one row per annotated frame at the dataset's
-`annotation_hz` (matches Aff-Wild2's actual per-frame annotation export --
-no explicit timestamp column, row index implies frame number).
-`load_clip_va_label(label_path, annotation_hz, va_range)` harmonises each
-column to `[-1, 1]` via `common/data/harmonise.py:harmonise_va`, then
-mean-pools over the clip's frames to one `(valence, arousal)` pair --
-`train_probe`/`LinearVAHead` operate at one embedding per clip (matching
-`VideoMaeV2Encoder.encode_clip`'s single mean-pooled-over-time output), not
-per-frame.
+| Name | Role | Present | Notes |
+|---|---|---|---|
+| `afewva` | probe | `false` | Flip to `true` after the ibug EULA download + `scripts/build_afewva_manifest.py` |
+| `veatic` | probe | env-gated (`VEATIC_PRESENT`) | Never hardcode `true` in-repo — cluster-only |
+| `voxmini` | ssl | env-gated (`VOXMINI_PRESENT`) | Never hardcode `true` in-repo — cluster-only |
+| `affwild2` | probe | `false` | Blocked on signed academic application |
+| `talkingcelebs` | ssl | `false` | Scaffolded, download/ingest scripts real |
+| `talkingcelebs_mini` | ssl | `true` | Real acquired mini slice (25 clips / 5 identities) |
 
-## Fixed: `run_experiment.sh` / `train.sbatch` never actually ran
+## `experiment/`
 
-`python -m video_encoding.probe.train` initializes the `video_encoding.probe` package first, whose
-`__init__.py` imports `common.eval.ccc` as a side effect — that import only
-resolved under pytest (`pythonpath=["."]` + pytest's own rootdir insertion),
-never under a plain invocation. `scripts/run_experiment.sh` only `cd`s into
-`video_encoding/`, so `common/` (one level up) was never on
-`sys.path`; every experiment (SSL included, not just probe) failed with
-`ModuleNotFoundError: No module named 'common'` before reaching any real
-logic. This matches the earlier finding that `train.sbatch` has no evidence
-of a completed real run. Fixed by exporting `PYTHONPATH` to include the repo
-root in `run_experiment.sh` (inherited by `train.sbatch`, which only wraps
-it) — verified end-to-end: `videomae_frozen_probe_affwild2` now reaches and
-fails at the correct place (`DatasetNotAcquiredError` on Aff-Wild2), not an
-import error.
+| Name | Stage | Dataset (self-selected) | Purpose |
+|---|---|---|---|
+| `videomae_ssl_pretrain_voxmini` | `pretrain` | `voxmini` | Stage 1 MAE pretraining |
+| `videomae_probe_veatic` | `va_finetune` | `veatic` | Stage 2 frozen-encoder probe, loads Stage 1's `best.pt` |
+| `videomae_va_finetune_afewva` | `va_finetune` | `afewva` | End-to-end from-scratch fine-tune, no freezing |
+| `videomae_va_finetune_veatic` | `va_finetune` | `veatic` | End-to-end from-scratch fine-tune, no freezing |
 
-## Known gaps (not implemented, not faked)
+## Training watcher (cron)
 
-- **`video_encoding/probe/train.py:run_probe_stage`**: now code-complete (caches
-  frozen-encoder embeddings via `common/cache/store.py`, loads labels via
-  `common/data/labels.py`, trains via `video_encoding/probe/train_probe`) and covered
-  by `video_encoding/tests/test_probe_stage.py` against synthetic
-  fixtures. Still can't produce a real trained probe until Aff-Wild2 is
-  actually acquired (`conf/dataset/affwild2.yaml: present: false`) — that
-  part remains gated on the signed academic access application, not code.
-  Recipe C (`videomae_lora_supervised_affwild2`: `use_lora: true`,
-  `use_ssl: false`) currently falls through to this same frozen-cache path
-  via `run_training`'s `use_ssl` branch, which is **wrong** for it: LoRA
-  adapter params need gradients from the joint CCC loss flowing back
-  through the encoder, so embeddings can't be cached once the way Recipe
-  A's truly-frozen encoder allows. `run_probe_stage` doesn't check
-  `cfg.experiment.use_lora` at all yet — needs its own LoRA-attached,
-  no-caching training path before Recipe C can actually run correctly.
-- **`common/eval/baselines.py`, `src/eval/*`**: unchanged stubs, out of scope
-  for this plan (per the approved spec's own §7).
+`scripts/cron/poll_squeue.sh` / `scripts/cron/aggregate_results.sh` were never
+installed and are superseded by a single script:
+`video_encoding/scripts/watch_training.py`
+(docs/superpowers/specs/2026-07-15-slurm-training-watcher-design.md). Install
+on login-node via `crontab -e`:
 
-## Superseded / conflicting docs (do not build against)
+    * * * * *  cd ~/stern && uv run python video_encoding/scripts/watch_training.py
 
-`docs/superpowers/specs/2026-06-30-cluster-deep-network-protocol.md`,
-`2026-06-30-cluster-tier1-findings.md`, and
-`2026-07-01-t5-real-recipe-c-benchmark-design.md` exist only on `master` and
-describe a V-JEPA2 + RetinaFace scaffold (`bench_recipe_c.py`,
-`vjepa2_vitl.yaml` as the working encoder) that was never actually built on
-this branch. The cluster/network/SLURM *infrastructure* facts in those docs
-are still valid (architecture-independent); the encoder/pipeline design in
-them is not — this branch's approved architecture is
-`2026-07-01-training-pipeline-design.md` (VideoMAEv2).
+State lives in `.claude/state/` (`jobs_registry.json`, `watcher_state.json`,
+`squeue.json`, `watcher.log`, `escalations/*.md`) — gitignored, inspect with
+`cat`/`jq` on login-node directly.

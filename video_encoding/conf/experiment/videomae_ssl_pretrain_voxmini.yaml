@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - override /dataset: voxmini
+  - override /train: ssl
+
+experiment:
+  name: videomae_ssl_pretrain_voxmini
+  description: "Stage 1 MAE self-supervised pretraining on VoxCeleb2 (voxmini subset). Produces frozen encoder checkpoint for Stage 2 probe."
+  stage: pretrain

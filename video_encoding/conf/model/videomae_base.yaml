@@ -1,0 +1,23 @@
+# From-scratch VideoMAE-style video ViT (ViT-B geometry). No pretrained weights.
+name: videomae_base
+encoder: videomae
+# --- input geometry ---
+num_frames: 16
+image_size: 224
+in_channels: 3
+tubelet_size: 2   # temporal patch depth (16 frames / 2 -> 8 tubelets)
+patch_size: 16    # spatial patch (224 / 16 -> 14x14 grid); tokens = 8*14*14 = 1568
+# --- transformer ---
+embed_dim: 768
+depth: 12
+num_heads: 12
+mlp_ratio: 4.0
+dropout: 0.0
+drop_path_rate: 0.0   # stochastic depth, linearly scaled across blocks; 0.0 = off
+# --- SSL pretraining (Stage 1) ---
+decoder_depth: 4
+decoder_embed_dim: 256
+decoder_num_heads: 8
+mask_ratio: 0.9   # mask 90% of tubelets, keep 10% for visible encoding
+motion_mask: false        # true -> mask highest-motion tubelets instead of random ones
+decoder_mask_ratio: 0.0   # V2 dual masking: fraction of masked tokens the decoder skips reconstructing (0.0 = reconstruct all, V1 behavior)

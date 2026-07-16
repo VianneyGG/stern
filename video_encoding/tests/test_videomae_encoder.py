@@ -1,0 +1,105 @@
+"""From-scratch VideoMAEEncoder: shape, gradient flow, and the token guard.
+
+Uses a tiny ViT config so a real forward/backward runs on CPU in CI -- this is
+the real-architecture coverage the HF-loading design could not have (loading
+those weights needed network + a GPU).
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+from omegaconf import OmegaConf
+
+from video_encoding.models.videomaev2.encoder import VideoMAEEncoder, preprocess_window
+from video_encoding.models import VideoMAEVARegressor
+
+
+def _tiny_cfg(**overrides):
+    cfg = {
+        "num_frames": 4,
+        "image_size": 16,
+        "in_channels": 3,
+        "tubelet_size": 2,
+        "patch_size": 8,
+        "embed_dim": 32,
+        "depth": 2,
+        "num_heads": 4,
+        "mlp_ratio": 2.0,
+        "dropout": 0.0,
+    }
+    cfg.update(overrides)
+    return OmegaConf.create(cfg)
+
+
+def test_encoder_returns_pooled_feature_and_flows_grad():
+    encoder = VideoMAEEncoder(_tiny_cfg())
+    x = torch.randn(2, 3, 4, 16, 16)
+
+    feat = encoder(x)
+
+    assert feat.shape == (2, 32)  # tokens = 2 tubelets * 2*2 grid = 8, pooled away
+    feat.sum().backward()
+    assert encoder.patch_embed.proj.weight.grad is not None  # random init is trainable
+
+
+def test_encoder_rejects_wrong_input_geometry():
+    encoder = VideoMAEEncoder(_tiny_cfg())
+    # 8 frames instead of 4 -> 16 tokens vs pos_embed's 8.
+    with pytest.raises(ValueError, match="tokens"):
+        encoder(torch.randn(1, 3, 8, 16, 16))
+
+
+def test_preprocess_window_shape_and_normalisation():
+    frames = [torch.zeros(16, 16, 3, dtype=torch.uint8).numpy() for _ in range(4)]
+
+    pv = preprocess_window(frames, num_frames=4, image_size=16)
+
+    assert pv.shape == (1, 3, 4, 16, 16)  # (B, C, T, H, W)
+    # zeros -> (0 - mean)/std, i.e. all-negative per-channel constants.
+    assert torch.all(pv < 0)
+
+
+def test_regressor_on_real_encoder_returns_bounded_va():
+    model = VideoMAEVARegressor(_tiny_cfg())
+    out = model(torch.randn(3, 3, 4, 16, 16))
+
+    assert out.shape == (3, 2)
+    assert torch.all(out >= -1.0) and torch.all(out <= 1.0)
+
+
+def test_drop_path_zeroes_and_scales_samples():
+    from video_encoding.models.videomaev2.encoder import DropPath
+
+    torch.manual_seed(0)
+    dp = DropPath(drop_prob=0.5)
+    dp.train()
+    x = torch.ones(200, 4)
+    out = dp(x)
+
+    row_sums = out.sum(dim=1)
+    assert torch.all((row_sums == 0.0) | (row_sums == 8.0))  # 0 or scaled by 1/keep=2.0
+    zeroed_frac = (row_sums == 0.0).float().mean().item()
+    assert 0.3 < zeroed_frac < 0.7  # ~50% with 200 samples, seeded
+
+
+def test_drop_path_is_identity_at_zero_rate_and_in_eval():
+    from video_encoding.models.videomaev2.encoder import DropPath
+
+    x = torch.randn(10, 4)
+
+    dp = DropPath(drop_prob=0.5)
+    dp.eval()
+    assert torch.equal(dp(x), x)  # eval mode -> always identity
+
+    dp2 = DropPath(drop_prob=0.0)
+    dp2.train()
+    assert torch.equal(dp2(x), x)  # zero rate -> always identity
+
+
+def test_encoder_scales_drop_path_linearly_across_blocks():
+    encoder = VideoMAEEncoder(_tiny_cfg(drop_path_rate=0.2))
+    rates = [blk.drop_path.drop_prob for blk in encoder.blocks]
+    assert rates[0] == pytest.approx(0.0)
+    assert rates[-1] == pytest.approx(0.2)
+    assert rates == sorted(rates)

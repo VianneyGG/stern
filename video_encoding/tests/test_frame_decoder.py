@@ -2,12 +2,14 @@ from pathlib import Path
 
 import av
 import numpy as np
-import pytest
+from PIL import Image
 
-from video_encoding.data.frame_decoder import decode_frames
+from video_encoding.data.frame_decoder import decode_frames, load_clip_frames
 
 
-def _write_synthetic_mp4(path: Path, num_frames: int, width: int = 64, height: int = 64) -> None:
+def _write_synthetic_mp4(
+    path: Path, num_frames: int, width: int = 64, height: int = 64
+) -> None:
     """Encode a tiny real mp4 whose frame N is solid color value N (mod 256)."""
     container = av.open(str(path), mode="w")
     stream = container.add_stream("mpeg4", rate=25)
@@ -58,3 +60,31 @@ def test_decode_frames_handles_fewer_source_frames_than_requested(tmp_path: Path
     frames = decode_frames(video_path, num_frames=16)
 
     assert len(frames) == 16
+
+
+def test_load_clip_frames_dispatches_to_frame_directory(tmp_path: Path):
+    # AFEW-VA/VEATIC layout: clip_path is a directory of frame images, not a
+    # video file -- LabelledDataset.load_frames() used to call decode_frames()
+    # unconditionally here and crash (av.open() can't open a directory).
+    clip_dir = tmp_path / "001"
+    clip_dir.mkdir()
+    for i in range(10):
+        Image.fromarray(np.full((8, 8, 3), i, dtype=np.uint8)).save(
+            clip_dir / f"{i}.png"
+        )
+
+    frames = load_clip_frames(clip_dir, num_frames=4, size=8)
+
+    assert len(frames) == 4
+    for frame in frames:
+        assert frame.shape == (8, 8, 3)
+
+
+def test_load_clip_frames_dispatches_to_video_file(tmp_path: Path):
+    video_path = tmp_path / "clip.mp4"
+    _write_synthetic_mp4(video_path, num_frames=20)
+
+    frames = load_clip_frames(video_path, num_frames=4)
+
+    assert len(frames) == 4
+    assert frames[0].shape == (224, 224, 3)

@@ -1,7 +1,0 @@
-name: videomae_lora_ssl_talkingcelebs_mini
-description: "LoRA adapters + encoder's own SSL objective on unlabelled video (talkingcelebs_mini), then freeze and probe."
-freeze_encoder: true  # base weights frozen; only LoRA params train
-use_lora: true
-use_ssl: true
-ssl_dataset: talkingcelebs_mini
-measure_step_time_first: true  # REPO_SETUP.md §3.2 — test on a small slice before a full run

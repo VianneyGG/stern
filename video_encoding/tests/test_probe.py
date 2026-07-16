@@ -1,7 +1,7 @@
-import numpy as np
 import torch
 
-from video_encoding.probe import LinearVAHead, ccc_loss, train_probe
+from eval.ccc import ccc_loss
+from video_encoding.models.videomaev2.regressor import LinearVAHead
 
 
 def test_linear_va_head_output_shape():
@@ -49,26 +49,3 @@ def test_ccc_loss_decreases_with_gradient_descent():
     final_loss = ccc_loss(head(x), target).item()
 
     assert final_loss < initial_loss
-
-
-def test_train_probe_returns_val_ccc_metrics():
-    rng = np.random.default_rng(0)
-    embed_dim = 4
-    train_embeddings = rng.standard_normal((40, embed_dim)).astype(np.float32)
-    train_labels = np.tanh(rng.standard_normal((40, 2))).astype(np.float32)
-    val_embeddings = rng.standard_normal((10, embed_dim)).astype(np.float32)
-    val_labels = np.tanh(rng.standard_normal((10, 2))).astype(np.float32)
-
-    result = train_probe(
-        train_embeddings,
-        train_labels,
-        val_embeddings,
-        val_labels,
-        embed_dim=embed_dim,
-        epochs=5,
-        lr=1e-3,
-    )
-
-    assert "val_ccc_v" in result and "val_ccc_a" in result
-    assert isinstance(result["val_ccc_v"], float)
-    assert isinstance(result["val_ccc_a"], float)

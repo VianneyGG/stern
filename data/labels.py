@@ -5,11 +5,10 @@ Defines the `ManifestRecord.label_path` CSV contract: two columns
 `annotation_hz` (matches Aff-Wild2's actual per-frame annotation export --
 no explicit timestamp column, row index implies frame number).
 
-`train_probe`/`LinearVAHead` (src/probe/__init__.py) operate at one
-embedding per clip, matching `VideoMaeV2Encoder.encode_clip`'s single
-mean-pooled-over-time output -- so a clip's per-frame annotations are
-harmonised then mean-pooled down to one (valence, arousal) pair here, not
-kept as a per-frame sequence.
+Two readers: `load_per_frame_va` keeps the full per-frame `(F, 2)` trajectory
+(used by the end-to-end trainer, which windows frames and takes a per-window
+mean), while `load_clip_va_label` mean-pools a whole clip to a single
+(valence, arousal) pair (legacy clip-level granularity).
 """
 
 from __future__ import annotations
@@ -46,3 +45,38 @@ def load_clip_va_label(
     harmonised_valence = harmonise_va(np.array(valence), va_range)
     harmonised_arousal = harmonise_va(np.array(arousal), va_range)
     return float(harmonised_valence.mean()), float(harmonised_arousal.mean())
+
+
+def load_per_frame_va(label_path: Path, va_range: tuple[float, float]) -> np.ndarray:
+    """Read a per-frame VA CSV and return an `(F, 2)` array of `[valence,
+    arousal]` harmonised to `[-1, 1]` -- WITHOUT mean-pooling.
+
+    Used by the end-to-end trainer, which windows frames and takes a per-window
+    mean, so it needs the full per-frame trajectory rather than one clip label.
+    """
+    with Path(label_path).open(newline="") as f:
+        reader = csv.DictReader(f)
+        rows = [(float(r["valence"]), float(r["arousal"])) for r in reader]
+
+    if not rows:
+        raise ValueError(f"label file {label_path} has no rows")
+
+    arr = np.array(rows, dtype=np.float64)
+    valence = harmonise_va(arr[:, 0], va_range)
+    arousal = harmonise_va(arr[:, 1], va_range)
+    return np.stack([valence, arousal], axis=1)
+
+
+def write_label_csv(path: Path, rows: list[tuple[float, float]]) -> None:
+    """Write the `valence,arousal` per-frame CSV this module's readers expect.
+
+    Shared by every dataset ingestion script (build_afewva_manifest.py,
+    build_veatic_manifest.py, ...) so the write side of the contract lives in
+    one place next to the read side, instead of each script re-implementing
+    the same few lines.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["valence", "arousal"])
+        writer.writerows(rows)
