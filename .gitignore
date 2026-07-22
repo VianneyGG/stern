@@ -12,12 +12,22 @@ wheels/
 # Local bulk dataset downloads (TalkingCelebs, VoxMini, etc.) -- never commit raw video
 .data/
 
-# Github repo
-human/
+# Model outputs
+outputs/
+docs/
+
+# Temporary files
+*.tmp
+cache/
+.pytest_cache/
+.ruff_cache/
+.superpowers/
 
 # IDEs
 .vscode/
 .claude/
 CLAUDE.md
 .claudeignore
-docs/
+
+# Worktrees (superpowers:using-git-worktrees)
+.worktrees/

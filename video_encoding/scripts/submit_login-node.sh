@@ -39,7 +39,7 @@ done
 
 OVERRIDES="$(printf '%q ' "$@")"
 FIXED_NODELIST="${FIXED_NODELIST:-}"
-ssh "${REMOTE_HOST}" bash -s <<REMOTE
+ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 "${REMOTE_HOST}" bash -s <<REMOTE
 set -euo pipefail
 cd ${REMOTE_DIR}
 
@@ -73,5 +73,16 @@ if [ -n "\${JOB_ID}" ]; then
     --run-tag "${RUN_TAG}" --nodelist "\${NODELIST}"
 else
   echo "WARNING: could not parse job id from sbatch output; jobs_registry not updated" >&2
+fi
+
+# Ensure the training watcher's cron entry is installed (video_encoding/watcher/*,
+# commit ec1a3be). It's cron-driven and stateless between ticks by design
+# (watcher/state.py: "no long-lived process -- it's cron-driven"), so
+# installing/verifying the crontab line is the correct launch mechanism --
+# not a PID file or screen/tmux session. grep-guarded so re-running
+# submit_login-node.sh never installs a duplicate line.
+if ! crontab -l 2>/dev/null | grep -q "watch_training.py"; then
+  (crontab -l 2>/dev/null; echo "* * * * * cd ${REMOTE_DIR} && uv run python video_encoding/scripts/watch_training.py") | crontab -
+  echo "Installed training watcher crontab entry."
 fi
 REMOTE

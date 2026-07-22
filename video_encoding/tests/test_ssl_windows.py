@@ -18,13 +18,16 @@ from unittest import mock
 
 import numpy as np
 import pytest
-import torch
 from omegaconf import OmegaConf
 from PIL import Image
 
 from data.manifest import ManifestRecord
 from video_encoding.data.loaders import SSLDataset
 from video_encoding.data.ssl_windows import SSLWindowDataset
+from video_encoding.scripts.build_wds_shards import (
+    BalancedShardWriter,
+    encode_frames_jpeg,
+)
 
 
 def _write_fake_frames(clip_dir: Path, n: int, size: int = 224) -> None:
@@ -102,9 +105,7 @@ def test_falls_back_to_live_decode_when_cache_root_unset(tmp_path, monkeypatch):
         assert len(ds) == 1  # one window per clip in the live-decode fallback
         pixel_values = ds[0]
 
-    mock_decode.assert_called_once_with(
-        tmp_path / "raw" / clip_path, 16
-    )
+    mock_decode.assert_called_once_with(tmp_path / "raw" / clip_path, 16)
     assert pixel_values.shape == (3, 16, 224, 224)
 
 
@@ -116,3 +117,60 @@ def test_skips_clip_with_no_cached_frames(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="no usable SSL clips"):
         SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.0)
+
+
+def _write_fake_shard(
+    shards_root: Path, clip_key: str, n_frames: int, size: int = 224
+) -> None:
+    writer = BalancedShardWriter(shards_root, n_shards=1)
+    frames = [np.zeros((size, size, 3), dtype=np.uint8) for _ in range(n_frames)]
+    writer.write(clip_key, encode_frames_jpeg(frames))
+    writer.close()
+
+
+def test_reads_from_wds_shards_when_shards_root_set(tmp_path, monkeypatch):
+    shards_root = tmp_path / "shards"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_shard(shards_root, "id00012/vid1/001", n_frames=16)
+
+    monkeypatch.delenv("VOXMINI_FRAMES_ROOT", raising=False)
+    monkeypatch.setenv("VOXMINI_SHARDS_ROOT", str(shards_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.0)
+
+    assert len(ds) == 1
+    pixel_values = ds[0]
+    assert pixel_values.shape == (3, 16, 224, 224)
+
+
+def test_wds_multiple_windows_read_distinct_frame_ranges(tmp_path, monkeypatch):
+    shards_root = tmp_path / "shards"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_shard(shards_root, "id00012/vid1/001", n_frames=24)
+
+    monkeypatch.delenv("VOXMINI_FRAMES_ROOT", raising=False)
+    monkeypatch.setenv("VOXMINI_SHARDS_ROOT", str(shards_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.5)
+
+    assert len(ds) == 2
+    assert ds._items[0][1] == list(range(0, 16))
+    assert ds._items[1][1] == list(range(8, 24))
+
+
+def test_wds_shards_root_takes_priority_over_frames_root(tmp_path, monkeypatch):
+    shards_root = tmp_path / "shards"
+    frames_root = tmp_path / "frames"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_shard(shards_root, "id00012/vid1/001", n_frames=16)
+    # Deliberately do NOT populate frames_root -- if the dataset reads it
+    # instead of the shard, this test fails with "no usable SSL clips".
+
+    monkeypatch.setenv("VOXMINI_SHARDS_ROOT", str(shards_root))
+    monkeypatch.setenv("VOXMINI_FRAMES_ROOT", str(frames_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.0)
+    assert len(ds) == 1

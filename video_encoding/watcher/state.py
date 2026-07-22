@@ -26,15 +26,38 @@ class JobState:
 
 
 @dataclass
+class RunState:
+    """Per-run state for the decentralized mesh training round machine.
+
+    round/status track outer-optimizer progress; missed_rounds counts
+    consecutive rounds a node failed to check in (keyed by node name),
+    reset to 0 by a successful round, and read by epoch_advance's
+    crash-loop exclusion (spec: docs/superpowers/plans mesh training).
+    """
+
+    run_id: str
+    round: int = 0
+    status: str = (
+        "ASSIGNING"  # ASSIGNING|RUNNING|AWAITING_CHECKPOINTS|MERGING|SYNCING|DONE
+    )
+    missed_rounds: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
 class WatcherState:
     next_full_check_at: float = 0.0
     current_interval_s: float = FAST_INTERVAL_S
     jobs: dict[str, JobState] = field(default_factory=dict)
     escalation_day: str | None = None
     escalation_count_today: int = 0
+    runs: dict[str, RunState] = field(default_factory=dict)
+    excluded_nodes: dict[str, str] = field(default_factory=dict)  # node -> reason
 
     def job(self, slurm_job_id: str) -> JobState:
         return self.jobs.setdefault(slurm_job_id, JobState(slurm_job_id=slurm_job_id))
+
+    def run(self, run_id: str) -> RunState:
+        return self.runs.setdefault(run_id, RunState(run_id=run_id))
 
 
 def load_state(path: Path) -> WatcherState:
@@ -44,12 +67,15 @@ def load_state(path: Path) -> WatcherState:
         return WatcherState()
     payload = json.loads(path.read_text())
     jobs = {k: JobState(**v) for k, v in payload.get("jobs", {}).items()}
+    runs = {k: RunState(**v) for k, v in payload.get("runs", {}).items()}
     return WatcherState(
         next_full_check_at=payload.get("next_full_check_at", 0.0),
         current_interval_s=payload.get("current_interval_s", FAST_INTERVAL_S),
         jobs=jobs,
         escalation_day=payload.get("escalation_day"),
         escalation_count_today=payload.get("escalation_count_today", 0),
+        runs=runs,
+        excluded_nodes=payload.get("excluded_nodes", {}),
     )
 
 
@@ -61,6 +87,8 @@ def save_state(path: Path, state: WatcherState) -> None:
         "jobs": {k: asdict(v) for k, v in state.jobs.items()},
         "escalation_day": state.escalation_day,
         "escalation_count_today": state.escalation_count_today,
+        "runs": {k: asdict(v) for k, v in state.runs.items()},
+        "excluded_nodes": state.excluded_nodes,
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2))

@@ -1,0 +1,363 @@
+"""Tests for `video_encoding.training.mesh_round` (Task 2 of the mesh
+round-loop-integration plan) plus the `pretrain.py` dispatch branch and
+`_train_epoch_ssl`'s new `progress_desc` param.
+
+Builds real, tiny WDS shard fixtures via `build_wds_shards.BalancedShardWriter`
++ `encode_frames_jpeg` (the same helpers `test_build_wds_shards.py` uses) so
+`MeshShardIterableDataset.__iter__`'s prefetch/decode path is exercised for
+real, not mocked -- `test_mesh_shard_dataset.py` deliberately skips this for
+lack of a shard fixture; this file supplies one.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import socket
+
+import numpy as np
+import pytest
+import torch
+from omegaconf import DictConfig
+from torch.utils.data import DataLoader
+
+import video_encoding.training.mesh_round as mesh_round
+from video_encoding.data.mesh_shard_dataset import MeshShardIterableDataset
+from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
+from video_encoding.models.videomaev2.masking import RandomTubeMasking
+from video_encoding.scripts.build_wds_shards import (
+    BalancedShardWriter,
+    encode_frames_jpeg,
+)
+from video_encoding.training.mesh_round import (
+    evaluate_val_loss,
+    push_checkpoint_and_wait,
+    run_mesh_pretrain_stage,
+    train_one_round,
+)
+from video_encoding.training.pretrain import (
+    _scaled_lr,
+    _select_stage,
+    _train_epoch_ssl,
+    run_pretrain_stage,
+)
+
+
+def _tiny_cfg() -> DictConfig:
+    # Same tiny model as test_pretrain_loop.py: image 32 / patch 16 -> 2x2
+    # spatial; frames 4 / tubelet 2 -> 2 temporal.
+    return DictConfig(
+        {
+            "num_frames": 4,
+            "image_size": 32,
+            "in_channels": 3,
+            "tubelet_size": 2,
+            "patch_size": 16,
+            "embed_dim": 32,
+            "depth": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "dropout": 0.0,
+            "decoder_depth": 1,
+            "decoder_embed_dim": 32,
+            "decoder_num_heads": 4,
+            "mask_ratio": 0.5,
+        }
+    )
+
+
+def _write_shard(root, clip_key: str, n_frames: int, image_size: int = 32) -> str:
+    """Write one real, tiny WDS shard with a single clip of `n_frames`
+    solid-color JPEG frames. Returns the shard's filename (relative to
+    `root`), matching what MeshShardIterableDataset expects in shard_names.
+    """
+    writer = BalancedShardWriter(root, n_shards=1)
+    frames = [
+        np.full((image_size, image_size, 3), i % 256, dtype=np.uint8)
+        for i in range(n_frames)
+    ]
+    writer.write(clip_key, encode_frames_jpeg(frames))
+    writer.close()
+    return "shard-000000.tar"
+
+
+def _mesh_dataset(root, clip_key: str, n_frames: int, overlap: float = 0.0):
+    shard_name = _write_shard(root, clip_key, n_frames)
+    return MeshShardIterableDataset(
+        [shard_name],
+        mesh_root=root,
+        shard_map={},
+        subnet="/254",
+        num_frames=4,
+        image_size=32,
+        overlap=overlap,
+    )
+
+
+def test_train_one_round_respects_steps_per_round(tmp_path):
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    model = VideoMAEForPreTraining(_tiny_cfg()).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    masker = RandomTubeMasking(mask_ratio=0.5)
+
+    # overlap=0.75 -> step=1 -> n_frames-3 windows; 53 frames -> 50 windows,
+    # comfortably more than steps_per_round=5 (batch_size=1 inside
+    # train_one_round, so windows == micro-steps here).
+    dataset = _mesh_dataset(tmp_path / "mesh", "clip0", n_frames=53, overlap=0.75)
+
+    stats = train_one_round(
+        model,
+        optimizer,
+        device,
+        masker,
+        dataset,
+        steps_per_round=5,
+        amp="off",
+        accum_steps=1,
+        grad_clip=0.0,
+        round_num=0,
+    )
+
+    assert stats["steps"] == 5
+
+
+def test_progress_desc_does_not_change_returned_stats():
+    device = torch.device("cpu")
+
+    def _run(progress_desc):
+        torch.manual_seed(0)
+        model = VideoMAEForPreTraining(_tiny_cfg()).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        masker = RandomTubeMasking(mask_ratio=0.5)
+        clips = [torch.randn(3, 4, 32, 32) for _ in range(8)]
+        loader = DataLoader(clips, batch_size=2, num_workers=0)
+        return _train_epoch_ssl(
+            model,
+            loader,
+            optimizer,
+            device,
+            masker,
+            accum_steps=1,
+            max_steps=0,
+            timing_warmup_steps=0,
+            amp="off",
+            progress_desc=progress_desc,
+        )
+
+    stats_none = _run(None)
+    stats_x = _run("round 3")
+
+    assert stats_none["loss"] == pytest.approx(stats_x["loss"])
+    assert stats_none["samples"] == stats_x["samples"]
+    assert stats_none["steps"] == stats_x["steps"]
+
+
+def test_evaluate_val_loss_leaves_model_in_train_mode(tmp_path):
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    model = VideoMAEForPreTraining(_tiny_cfg()).to(device)
+    model.train()
+    masker = RandomTubeMasking(mask_ratio=0.5)
+    val_dataset = _mesh_dataset(tmp_path / "val_mesh", "val_clip0", n_frames=8)
+
+    loss = evaluate_val_loss(model, val_dataset, device, masker, "off", max_windows=10)
+
+    assert model.training is True
+    assert math.isfinite(loss)
+
+
+def test_evaluate_val_loss_uses_no_grad(tmp_path):
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    model = VideoMAEForPreTraining(_tiny_cfg()).to(device)
+    masker = RandomTubeMasking(mask_ratio=0.5)
+    val_dataset = _mesh_dataset(tmp_path / "val_mesh", "val_clip0", n_frames=8)
+
+    for p in model.parameters():
+        assert p.grad is None
+
+    evaluate_val_loss(model, val_dataset, device, masker, "off", max_windows=10)
+
+    # No backward() ran under torch.no_grad(): every parameter's .grad is
+    # still exactly what it was before the call (None -- never populated).
+    for p in model.parameters():
+        assert p.grad is None
+
+
+def test_push_checkpoint_and_wait_returns_immediately_when_merge_false(
+    tmp_path, monkeypatch
+):
+    sleep_calls = []
+    monkeypatch.setattr(mesh_round.time, "sleep", lambda s: sleep_calls.append(s))
+
+    push_checkpoint_and_wait(
+        {"model_state_dict": {}, "n_samples": 1},
+        mesh_shared=tmp_path,
+        run_id="r1",
+        node="nodeA",
+        round_num=0,
+        merge=False,
+    )
+
+    assert sleep_calls == []
+    pending = tmp_path / "checkpoints" / "pending" / "r1_nodeA.pt"
+    assert pending.exists()
+
+
+def test_push_checkpoint_and_wait_times_out_and_exits(tmp_path, monkeypatch):
+    monkeypatch.setattr(mesh_round.time, "sleep", lambda s: None)
+
+    with pytest.raises(SystemExit):
+        push_checkpoint_and_wait(
+            {"model_state_dict": {}, "n_samples": 1},
+            mesh_shared=tmp_path,
+            run_id="r1",
+            node="nodeA",
+            round_num=0,
+            merge=True,
+            sync_timeout_s=0.01,
+        )
+
+
+def test_push_checkpoint_and_wait_succeeds_when_flag_appears(tmp_path, monkeypatch):
+    flag_dir = tmp_path / "checkpoints" / "flags"
+    flag_dir.mkdir(parents=True)
+    (flag_dir / "sync_complete_r1_0.flag").touch()
+
+    def _fail_sleep(_):
+        raise AssertionError(
+            "sleep should never be called: the flag already exists before "
+            "the first check"
+        )
+
+    monkeypatch.setattr(mesh_round.time, "sleep", _fail_sleep)
+
+    push_checkpoint_and_wait(
+        {"model_state_dict": {}, "n_samples": 1},
+        mesh_shared=tmp_path,
+        run_id="r1",
+        node="nodeA",
+        round_num=0,
+        merge=True,
+        sync_timeout_s=5.0,
+    )
+
+
+def test_run_mesh_pretrain_stage_cold_start_has_no_master_checkpoint(
+    tmp_path, monkeypatch
+):
+    torch.manual_seed(0)
+    hostname = socket.gethostname()
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)  # exactly 1 window
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    checkpoint_root = tmp_path / "stern_checkpoints"
+
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+
+    # master.pt intentionally never created -- this is the cold-start case.
+    assert not (mesh_shared / "checkpoints" / "run1" / "master.pt").exists()
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 1,
+                "steps_per_round": 1,
+                "merge": False,
+                "outer_lr": 0.7,
+                "outer_momentum": 0.9,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+    result = run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+
+    assert result["stage"] == "mesh_pretrain"
+    assert result["final_round"] == 0
+    assert math.isfinite(result["recon_loss"])
+
+
+def test_mesh_dispatch_branch_routes_on_env_var(monkeypatch):
+    cfg = DictConfig({})
+    device = torch.device("cpu")
+
+    monkeypatch.setenv("MESH_RUN_ID", "x")
+    stage = _select_stage(cfg, rank=0, world_size=1, local_rank=0, device=device)
+    assert stage.func is run_mesh_pretrain_stage
+
+    monkeypatch.delenv("MESH_RUN_ID")
+    stage = _select_stage(cfg, rank=0, world_size=1, local_rank=0, device=device)
+    assert stage.func is run_pretrain_stage
+
+
+def test_resolve_subnet_uses_real_per_host_mapping_not_a_single_constant():
+    """Review finding 1: a single yaml-wide subnet constant would report
+    every node as the same subnet regardless of which physical host it runs
+    on. node001 (fish tier) and node024 (birds tier) are real hostnames
+    from seed_mesh.py's NODE_SUBNETS roster with genuinely different real
+    subnets -- this must resolve them differently, not to one hardcoded
+    value."""
+    cfg = DictConfig({"mesh": {"subnet": "/999"}})
+
+    fish_subnet = mesh_round._resolve_subnet("node001", cfg)
+    birds_subnet = mesh_round._resolve_subnet("node024", cfg)
+
+    assert fish_subnet == "/254"
+    assert birds_subnet == "/253"
+    assert fish_subnet != birds_subnet
+
+
+def test_resolve_subnet_falls_back_to_cfg_for_unknown_hostname():
+    cfg = DictConfig({"mesh": {"subnet": "/999"}})
+
+    assert mesh_round._resolve_subnet("not-a-real-cluster-host", cfg) == "/999"
+
+
+def test_scaled_lr_uses_local_batch_override_not_train_batch_size():
+    """Review finding 2: the mesh path's real per-optimizer-step batch is
+    _MESH_BATCH_SIZE (1), not cfg.train.batch_size (16, from ssl.yaml,
+    never overridden by videomae_mesh_ssl.yaml). Passing local_batch must
+    change the resulting LR; omitting it must reproduce the exact existing
+    (pre-fix) behavior for every non-mesh caller."""
+    cfg = DictConfig(
+        {
+            "train": {
+                "base_lr": 1.5e-4,
+                "batch_size": 16,
+                "accum_steps": 1,
+                "lr_mult": 1.0,
+            }
+        }
+    )
+
+    lr_unmodified_callers = _scaled_lr(cfg, world_size=1)
+    lr_mesh = _scaled_lr(cfg, world_size=1, local_batch=mesh_round._MESH_BATCH_SIZE)
+
+    assert lr_unmodified_callers == pytest.approx(1.5e-4 * 16 / 256.0)
+    assert lr_mesh == pytest.approx(1.5e-4 * 1 / 256.0)
+    assert lr_mesh != pytest.approx(lr_unmodified_callers)

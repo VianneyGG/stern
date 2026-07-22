@@ -1,0 +1,17 @@
+# @package _global_
+defaults:
+  - override /train: ssl
+
+experiment:
+  name: videomae_mesh_ssl
+  description: "Decentralized mesh SSL pretraining -- consumes MESH_* env vars, bypasses cfg.dataset entirely (see training/mesh_round.py)."
+  stage: pretrain
+
+mesh:
+  rounds: 10
+  steps_per_round: 200        # spec S8: H, conservative starting point vs DiLoCo's H=500
+  merge: true
+  outer_lr: 0.7
+  outer_momentum: 0.9
+  sync_timeout_s: 1800.0
+  subnet: "/254"               # fish tier default (pick_nodes.sh); only affects P2P fetch preference, not correctness

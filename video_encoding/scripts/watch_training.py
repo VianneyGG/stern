@@ -21,6 +21,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from video_encoding.watcher.mesh_tick import advance_all_runs, load_run_configs
 from video_encoding.watcher.squeue import refresh_squeue_snapshot
 from video_encoding.watcher.state import load_state, save_state
 from video_encoding.watcher.tick import run_full_check
@@ -55,6 +56,33 @@ def main() -> int:
 
     state_path = STATE_DIR / "watcher_state.json"
     state = load_state(state_path)
+
+    # Mesh round advancement is unconditional -- not gated by the health-check
+    # backoff timer below, since worker jobs push checkpoints and wait on sync
+    # flags on their own schedule, independent of that cadence.
+    run_configs = load_run_configs(STATE_DIR / "mesh_run_configs.json")
+    if run_configs:
+        try:
+            mesh_actions = advance_all_runs(
+                run_configs,
+                state=state,
+                repo_root=REPO_ROOT,
+                mesh_shared=Path(
+                    os.environ.get("MESH_SHARED", Path.home() / "stern_mesh")
+                ),
+                mesh_root=Path("/Data/$USER/mesh"),
+                now=now,
+            )
+        except Exception as exc:
+            # A single bad mesh run config (e.g. n_shards mismatched against
+            # shard_map.json, or an unknown hostname) must not take down
+            # dead/stalled-job detection for the rest of the fleet below.
+            _log(f"mesh advancement FAILED: {exc}")
+            mesh_actions = []
+        save_state(state_path, state)  # advance_all_runs may have mutated state
+        for action in mesh_actions:
+            _log(f"mesh: {action}")
+
     if now < state.next_full_check_at:
         return 0  # fast path -- not due yet
 

@@ -2,8 +2,9 @@
 
 Mirrors _VAWindowDataset from probe/train.py but:
 - No labels (unlabelled video like VoxCeleb2)
-- Reads from cached JPEG frames (Workstream A4b) when available
-- Falls back to live mp4 decode if cache miss
+- Reads from WDS shards (VOXMINI_SHARDS_ROOT, preferred) or the legacy
+  cached-JPEG-directory layout (VOXMINI_FRAMES_ROOT) when available
+- Falls back to live mp4 decode if neither is set
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ from torch.utils.data import Dataset
 
 from video_encoding.data.frame_decoder import decode_frames, read_frames_at
 from video_encoding.data.loaders import SSLDataset
+from video_encoding.data.wds_frames import load_shard_index, read_shard_frames_at
+from video_encoding.data.windows import window_starts
 from video_encoding.models.videomaev2.encoder import preprocess_window
 from video_encoding.data.windows import build_frame_windows
 
@@ -23,19 +26,18 @@ from video_encoding.data.windows import build_frame_windows
 class SSLWindowDataset(Dataset):
     """Unlabelled, fixed-window dataset from SSLDataset.
 
-    Iterates identity→clip, reads fixed `num_frames`-long windows, emits only
-    pixel_values (no labels). Reads from the pre-decoded JPEG cache
-    (Workstream A4b, `VOXMINI_FRAMES_ROOT`) when set, using
-    `build_frame_windows` (shared with `VAWindowDataset`) -- multiple
-    overlapping windows per clip, each reading only its own slice of frame
-    files.
+    Iterates identity->clip, reads fixed `num_frames`-long windows, emits only
+    pixel_values (no labels). Three source priorities, checked in order:
 
-    Falls back to one live-decoded window per clip (via `decode_frames`'s
-    whole-clip uniform sampling) when `VOXMINI_FRAMES_ROOT` is unset -- this
-    path is for the small local smoke test only, where paying mp4 decode
-    once per clip is cheap and multi-window overlap isn't worth the
-    complexity of decoding+caching a whole clip's frames in memory just to
-    slice windows out of it.
+    1. VOXMINI_SHARDS_ROOT set: read from WDS shards (build_wds_shards.py).
+       `_items` entries are `((shard_path, clip_key), idx)` -- a tuple in
+       position 0 distinguishes this from the directory-cache case below.
+    2. VOXMINI_FRAMES_ROOT set: read from the legacy loose-JPEG-directory
+       cache via `build_frame_windows` -- `_items` entries are
+       `(frame_files, idx)`, unchanged from before.
+    3. Neither set: one live-decoded window per clip via `decode_frames`,
+       `_items` entries are `(None, clip_path)` -- for the small local smoke
+       test only, unchanged from before.
     """
 
     def __init__(
@@ -49,17 +51,27 @@ class SSLWindowDataset(Dataset):
         self._num_frames = num_frames
         self._image_size = image_size
         self._ssl_dataset = ssl_dataset
-        # Cache-backed window: (frame_files, idx). Live-decode window: (None, clip_path).
-        self._items: list[tuple[list[Path] | None, list[int] | str]] = []
+        self._items: list[tuple[object, list[int] | str]] = []
 
+        shards_root = os.environ.get("VOXMINI_SHARDS_ROOT")
         cache_root = os.environ.get("VOXMINI_FRAMES_ROOT")
+        shard_index = load_shard_index(Path(shards_root)) if shards_root else None
 
         skipped: list[str] = []
         for records in ssl_dataset.records_by_identity.values():
             for record in records:
                 clip_path = record.clip_path
                 try:
-                    if cache_root:
+                    if shard_index is not None:
+                        clip_key = str(Path(clip_path).with_suffix(""))
+                        entry = shard_index[clip_key]
+                        shard_path = Path(shards_root) / entry["shard"]
+                        for start in window_starts(
+                            entry["num_frames"], num_frames, overlap
+                        ):
+                            idx = list(range(start, start + num_frames))
+                            self._items.append(((shard_path, clip_key), idx))
+                    elif cache_root:
                         cache_dir = Path(cache_root) / Path(clip_path).with_suffix("")
                         self._items.extend(
                             build_frame_windows(
@@ -67,10 +79,8 @@ class SSLWindowDataset(Dataset):
                             )
                         )
                     else:
-                        # decode_frames already uniformly samples num_frames
-                        # from the whole clip -- one window, no start offset.
                         self._items.append((None, clip_path))
-                except (ValueError, OSError) as exc:
+                except (ValueError, OSError, KeyError) as exc:
                     skipped.append(f"{clip_path} ({exc})")
                     continue
 
@@ -83,17 +93,22 @@ class SSLWindowDataset(Dataset):
         if not self._items:
             raise ValueError(
                 f"no usable SSL clips (skipped: {len(skipped)}). "
-                "Check dataset presence and cache path (VOXMINI_FRAMES_ROOT)."
+                "Check dataset presence and cache path (VOXMINI_SHARDS_ROOT/VOXMINI_FRAMES_ROOT)."
             )
 
     def __len__(self) -> int:
         return len(self._items)
 
     def __getitem__(self, i: int) -> torch.Tensor:
-        frame_files, idx = self._items[i]
+        source, idx = self._items[i]
         try:
-            if frame_files is not None:
-                frames = read_frames_at(frame_files, idx, size=self._image_size)
+            if isinstance(source, tuple):
+                shard_path, clip_key = source
+                frames = read_shard_frames_at(
+                    shard_path, clip_key, idx, size=self._image_size
+                )
+            elif source is not None:
+                frames = read_frames_at(source, idx, size=self._image_size)
             else:
                 clip_file = self._ssl_dataset.root / idx
                 frames = decode_frames(clip_file, self._num_frames)

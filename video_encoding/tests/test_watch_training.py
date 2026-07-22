@@ -78,6 +78,59 @@ def test_main_runs_full_check_and_logs_when_due(tmp_path, monkeypatch):
     assert "flags=0" in log_text
 
 
+def test_main_survives_mesh_advancement_exception(tmp_path, monkeypatch):
+    """A single bad mesh run config (bad hostname, n_shards mismatched
+    against shard_map.json, etc.) must not crash main() before
+    run_full_check -- that would silently disable dead/stalled-job
+    detection for the entire fleet, not just the misconfigured mesh run."""
+    import video_encoding.scripts.watch_training as watch_mod
+    from video_encoding.watcher.tick import TickResult
+
+    monkeypatch.setattr(watch_mod, "REPO_ROOT", tmp_path)
+    state_dir = tmp_path / ".claude" / "state"
+    monkeypatch.setattr(watch_mod, "STATE_DIR", state_dir)
+    monkeypatch.setattr(watch_mod, "RESULTS_DIR", tmp_path / ".claude" / "results")
+    monkeypatch.setattr(watch_mod, "LOG_PATH", state_dir / "watcher.log")
+    monkeypatch.setattr(watch_mod, "LOCK_PATH", state_dir / "watch_training.lock")
+
+    state_dir.mkdir(parents=True)
+    (state_dir / "mesh_run_configs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": ["node001"],
+                    "n_shards": 9,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+
+    with (
+        patch("video_encoding.scripts.watch_training.refresh_squeue_snapshot"),
+        patch(
+            "video_encoding.scripts.watch_training.advance_all_runs",
+            side_effect=KeyError("bad-hostname"),
+        ),
+        patch(
+            "video_encoding.scripts.watch_training.run_full_check",
+            return_value=TickResult(num_flags=0, actions=[], action_taken=False),
+        ) as mock_full_check,
+    ):
+        rc = watch_mod.main()
+
+    assert rc == 0
+    mock_full_check.assert_called_once()
+    log_text = (state_dir / "watcher.log").read_text()
+    assert "mesh advancement FAILED" in log_text
+
+
 def test_main_skips_when_lock_held(tmp_path, monkeypatch):
     import video_encoding.scripts.watch_training as watch_mod
 

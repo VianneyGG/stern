@@ -13,6 +13,8 @@ Training loop mirrors training/train.py but:
 from __future__ import annotations
 
 import contextlib
+import functools
+import os
 import time
 from pathlib import Path
 
@@ -254,6 +256,7 @@ def _train_epoch_ssl(
     timing_warmup_steps: int = 10,
     amp: str = "off",
     scaler: "torch.amp.GradScaler | None" = None,
+    progress_desc: str | None = None,
 ) -> dict:
     """Train one epoch (or `max_steps` micro-steps) of SSL pretraining.
 
@@ -270,11 +273,20 @@ def _train_epoch_ssl(
     - Only steps after `timing_warmup_steps` are timed (cuDNN autotune +
       allocator growth make the first steps unrepresentative), with a single
       `cuda.synchronize()` at each end of the timed window.
+
+    `progress_desc`: when set, wraps the loader in a tqdm progress bar with
+    this label (used by the mesh round loop to show "round N" progress on an
+    interactive terminal). Purely cosmetic -- it only wraps the iterator, so
+    every numeric field in the returned dict is identical with or without it.
+    Default `None` preserves the exact existing behavior/output for every
+    call site that doesn't pass it.
     """
     model.train()
-    # Unwrap once: DDP wraps in `.module`, but wrap_ddp is a no-op at
-    # world_size=1 (N=1 baseline), so `model` may be the bare module.
-    core = model.module if hasattr(model, "module") else model
+    # Unwrap once. `model` may be bare (world_size=1 / mesh), DDP-wrapped, or
+    # torch.compile'd -- ckpt_io.unwrap strips both wrappers, so `core` is
+    # always the real module rather than an OptimizedModule we'd be reaching
+    # through by attribute proxy.
+    core = ckpt_io.unwrap(model)
     token_grid = core.encoder.token_grid  # (T', H', W')
     is_cuda = device.type == "cuda"
     autocast_enabled = amp in ("bf16", "fp16")
@@ -297,7 +309,13 @@ def _train_epoch_ssl(
     executed_steps = 0
     nan_steps = 0
 
-    for step, pixel_values in enumerate(loader):
+    iterable = loader
+    if progress_desc is not None:
+        from tqdm import tqdm
+
+        iterable = tqdm(loader, desc=progress_desc, total=num_steps)
+
+    for step, pixel_values in enumerate(iterable):
         if step == timing_warmup_steps:
             if is_cuda:
                 torch.cuda.synchronize(device)
@@ -399,18 +417,26 @@ def _payload(*, model, optimizer, scheduler, epoch: int, best_loss: float) -> di
     return payload
 
 
-def _scaled_lr(cfg, world_size: int) -> float:
+def _scaled_lr(cfg, world_size: int, *, local_batch: int | None = None) -> float:
     """Linear-scaling-rule LR: base_lr * effective_batch/256 * lr_mult.
 
     Falls back to the flat `train.learning_rate` when `base_lr` is unset, so
     throughput-only Phase-1 cells that don't care about convergence still run.
+
+    `local_batch` overrides `cfg.train.batch_size` as the per-step sample
+    count fed into `eff_batch`. Every existing (non-mesh) caller omits it, so
+    `eff_batch` still reads `cfg.train.batch_size` for them -- behavior is
+    unchanged. The mesh round loop passes its real per-step batch
+    (`_MESH_BATCH_SIZE`, currently 1) explicitly: `cfg.train.batch_size` (16
+    in ssl.yaml) is never the mesh path's actual per-optimizer-step sample
+    count, so scaling off it would silently mis-tune the LR for every mesh
+    run regardless of `accum_steps`.
     """
     base_lr = cfg.train.get("base_lr", None)
     if base_lr is None:
         return float(cfg.train.learning_rate)
-    eff_batch = (
-        world_size * int(cfg.train.batch_size) * int(cfg.train.get("accum_steps", 1))
-    )
+    batch = int(cfg.train.batch_size) if local_batch is None else int(local_batch)
+    eff_batch = world_size * batch * int(cfg.train.get("accum_steps", 1))
     return float(base_lr) * eff_batch / 256.0 * float(cfg.train.get("lr_mult", 1.0))
 
 
@@ -527,14 +553,47 @@ def _make_ssl_loader(
     )
 
 
+def _select_stage(
+    cfg: DictConfig,
+    *,
+    rank: int,
+    world_size: int,
+    local_rank: int,
+    device: torch.device,
+) -> functools.partial:
+    """Return a zero-arg-callable (functools.partial) for whichever training
+    stage this process should run.
+
+    Mesh dispatch is gated on the MESH_RUN_ID env var (set by
+    run_mesh_worker.sh before this process starts), not a Hydra config
+    field: every non-mesh SLURM entrypoint (train.sbatch) must stay
+    byte-for-byte unchanged, and an env-var gate keeps this dispatch purely
+    additive. Returns a `functools.partial` (not a lambda) so callers/tests
+    can inspect `.func` to see which stage was selected without running it.
+    """
+    if os.environ.get("MESH_RUN_ID"):
+        from video_encoding.training.mesh_round import run_mesh_pretrain_stage
+
+        return functools.partial(run_mesh_pretrain_stage, cfg, device=device)
+    return functools.partial(
+        run_pretrain_stage,
+        cfg,
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=device,
+    )
+
+
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig) -> dict:
     """Hydra entrypoint."""
     rank, world_size, local_rank, device = setup_ddp(cfg)
     try:
-        return run_pretrain_stage(
+        stage = _select_stage(
             cfg, rank=rank, world_size=world_size, local_rank=local_rank, device=device
         )
+        return stage()
     finally:
         teardown_ddp()
 

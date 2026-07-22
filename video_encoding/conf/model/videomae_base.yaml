@@ -21,3 +21,4 @@ decoder_num_heads: 8
 mask_ratio: 0.9   # mask 90% of tubelets, keep 10% for visible encoding
 motion_mask: false        # true -> mask highest-motion tubelets instead of random ones
 decoder_mask_ratio: 0.0   # V2 dual masking: fraction of masked tokens the decoder skips reconstructing (0.0 = reconstruct all, V1 behavior)
+                          # >0.0 makes masked-token count data-dependent (torch.randperm-sliced in mae.py forward) -> breaks torch.compile's static-shape assumption; re-benchmark train.compile if enabling this

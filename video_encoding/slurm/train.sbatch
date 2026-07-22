@@ -55,13 +55,25 @@ export MASTER_PORT="$((15000 + SLURM_JOB_ID % 5000))"
 export STERN_CHECKPOINT_ROOT="${STERN_CHECKPOINT_ROOT:-/Data/$USER/stern_checkpoints}"
 
 # VoxCeleb2 SSL data. Staged node-locally under /Data on the fish nodes
-# (node001/node002/node003/node004); frames are the pre-decoded 8fps/224px JPEG
-# cache. These are the cluster's canonical staging paths ($USER-generic, not
-# per-checkout) and stay overridable, so a node without the data can export
-# VOXMINI_PRESENT=false. The job MUST be pinned to a data node (see submit).
+# (node001/node002/node003/node004) as 100 balanced WDS shards
+# (video_encoding/scripts/build_wds_shards.py + distribute_shards.sh). The
+# job MUST be pinned to a data node (see submit_login-node.sh's FIXED_NODELIST).
 export VOXMINI_PRESENT="${VOXMINI_PRESENT:-true}"
 export VOXMINI_ROOT="${VOXMINI_ROOT:-/Data/$USER/voxceleb2}"
-export VOXMINI_FRAMES_ROOT="${VOXMINI_FRAMES_ROOT:-/Data/$USER/voxceleb2_frames}"
+export VOXMINI_SHARDS_ROOT="${VOXMINI_SHARDS_ROOT:-/Data/$USER/voxceleb2_shards}"
+
+# Fail fast if this node doesn't actually have the shard set, instead of
+# relying on a deep-dataloader FileNotFoundError plus the 30-min NCCL
+# heartbeat timeout to notice (train.sbatch's existing --kill-on-bad-exit
+# comment documents that exact 48-min-hang failure mode for a similar gap).
+if [[ "${VOXMINI_PRESENT}" == "true" ]]; then
+  n_shards=$(find "${VOXMINI_SHARDS_ROOT}" -maxdepth 1 -name 'shard-*.tar' 2>/dev/null | wc -l)
+  if [[ ! -f "${VOXMINI_SHARDS_ROOT}/manifest.json" || "${n_shards}" -ne 100 ]]; then
+    echo "ERROR: VOXMINI_SHARDS_ROOT=${VOXMINI_SHARDS_ROOT} on $(hostname) has ${n_shards}/100 shards" \
+         "or is missing manifest.json -- run build_wds_shards.py + distribute_shards.sh before submitting." >&2
+    exit 1
+  fi
+fi
 
 # Keep uv's wheel cache + torch caches on node-local /tmp, NOT the 30 GB student
 # home quota (~11 GB free): cu128 torch wheels are multi-GB and would blow it.

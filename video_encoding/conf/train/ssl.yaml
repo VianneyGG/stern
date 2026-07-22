@@ -17,6 +17,8 @@ num_workers: 8           # DataLoader workers (fish nodes have 16 cores)
 
 # --- Optimization / convergence (Phase 2) ---
 amp: bf16                # off | bf16 | fp16  (autocast precision)
+compile: false           # torch.compile the model for mesh rounds; off until benchmarked on-cluster
+compile_mode: default    # default | reduce-overhead | max-autotune (torch.compile's mode=)
 weight_decay: 0.05       # AdamW weight decay (MAE convention)
 base_lr: 1.5e-4          # LR at reference batch 256; actual lr = base_lr * eff_batch/256 * lr_mult
 lr_mult: 1.0             # extra multiplier on the linear-scaling rule
