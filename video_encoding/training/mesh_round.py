@@ -98,10 +98,18 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     checkpoint_root = Path(os.environ["STERN_CHECKPOINT_ROOT"])
     checkpoint_root.mkdir(parents=True, exist_ok=True)
 
-    node = socket.gethostname()
+    # socket.gethostname() reports whatever the node's NSS/DNS config
+    # returns -- a short name ("node008") or an FQDN ("node008.
+    # polytechnique.fr") depending on cluster configuration, and this has
+    # been observed to change cluster-wide between mesh runs. shard
+    # assignments, NODE_SUBNETS, and the per-node checkpoint naming
+    # convention are all keyed by the short name, so normalize here once
+    # rather than at each lookup site.
+    node = socket.gethostname().split(".", 1)[0]
     subnet = _resolve_subnet(node, cfg)
 
     rounds = int(cfg.mesh.get("rounds", 10))
+    start_round = int(cfg.mesh.get("start_round", 0))
     steps_per_round = int(cfg.mesh.get("steps_per_round", 200))
     merge = bool(cfg.mesh.get("merge", True))
     outer_lr = float(cfg.mesh.get("outer_lr", 0.7))
@@ -172,8 +180,16 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     last_train_loss = float("nan")
     final_round = -1
 
-    for round_num in range(0, rounds):
-        if round_num > 0 and merge:
+    for round_num in range(start_round, rounds):
+        # Not "round_num > start_round": a worker relaunched mid-run (e.g.
+        # after the watcher process died) starts its local round_num back at
+        # start_round, but master.pt may already reflect many prior rounds
+        # this process never saw. Loading it whenever it exists -- not just
+        # after this process's own first local round -- is what makes a
+        # relaunch a resume (and a late joiner's first round a real join)
+        # instead of silently overwriting the mesh average with a
+        # fresh-init/stale model's contribution.
+        if merge:
             if master_path.exists():
                 master_payload = torch.load(
                     master_path, map_location=device, weights_only=False

@@ -25,7 +25,7 @@ from pathlib import Path
 
 import torch
 
-from video_encoding.mesh.assignment import assign_locality_first
+from video_encoding.mesh.assignment import assign_locality_first, reassign_failed
 from video_encoding.mesh.scoring import (
     NodeInfo,
     compute_effective_weights,
@@ -34,20 +34,28 @@ from video_encoding.mesh.scoring import (
 from video_encoding.mesh.shard_map import Holder, load_shard_map
 from video_encoding.scripts.seed_mesh import NODE_GROUPS, NODE_SUBNETS
 from video_encoding.training import checkpoint as ckpt_io
+from video_encoding.watcher.cluster import query_idle_nodes
 from video_encoding.watcher.epoch_advance import (
+    candidate_replacements,
     eligible_nodes,
     pending_nodes,
+    pool_deficit,
     record_missed_round,
+    select_idle_nodes,
 )
 from video_encoding.watcher.registry import JobRecord, append_job_record
 from video_encoding.watcher.state import RunState, WatcherState
 
-# Twice the mesh's default per-round sync timeout (videomae_mesh_ssl.yaml's
-# mesh.sync_timeout_s: 1800.0) -- gives checkpoints twice as long to arrive
-# as a single worker's own poll-and-exit(1) timeout before the watcher gives
-# up on a straggler and merges a partial round (design spec §9: "this round
-# merges whatever arrived (partial average)").
-ROUND_TIMEOUT_S = 3600.0
+# Must stay well below the mesh's default per-round sync timeout
+# (videomae_mesh_ssl.yaml's mesh.sync_timeout_s: 1800.0) -- that's how long a
+# worker that already pushed its own checkpoint will wait at the barrier
+# before giving up and exiting. If this threshold were >= sync_timeout_s (it
+# was previously 3600.0, twice as long), every already-finished worker exits
+# before the watcher ever attempts the force-merge meant to save it. 900s
+# leaves a 900s margin under the worker's 1800s patience for tick cadence and
+# merge-operation overhead (design spec §9: "this round merges whatever
+# arrived (partial average)").
+ROUND_TIMEOUT_S = 900.0
 
 
 @dataclass(frozen=True)
@@ -84,6 +92,7 @@ def advance_all_runs(
     mesh_shared: Path,
     mesh_root: Path,
     now: float,
+    run_configs_path: Path | None = None,
 ) -> list[str]:
     """Advance every non-DONE run by one state-machine step.
 
@@ -102,6 +111,7 @@ def advance_all_runs(
             mesh_shared=mesh_shared,
             mesh_root=mesh_root,
             now=now,
+            run_configs_path=run_configs_path,
         )
         if action is not None:
             actions.append(action)
@@ -116,6 +126,7 @@ def advance_one_run(
     mesh_shared: Path,
     mesh_root: Path,
     now: float,
+    run_configs_path: Path | None = None,
 ) -> str | None:
     """One state transition (or no-op) for a single run_id.
 
@@ -129,12 +140,16 @@ def advance_one_run(
     """
     del mesh_root  # unused -- see docstring
     run = state.run(run_config.run_id)
+    if run.target_pool_size == 0:
+        run.target_pool_size = len(run_config.nodes)
     if run.status == "ASSIGNING":
         return _do_assigning(run_config, run, state, repo_root, mesh_shared)
     if run.status == "RUNNING":
         return _do_running(run_config, run, mesh_shared)
     if run.status == "AWAITING_CHECKPOINTS":
-        return _do_awaiting_checkpoints(run_config, run, state, mesh_shared, now)
+        return _do_awaiting_checkpoints(
+            run_config, run, state, mesh_shared, now, repo_root, run_configs_path
+        )
     if run.status == "MERGING":
         return _do_merging(run_config, run, repo_root, mesh_shared)
     if run.status == "SYNCING":
@@ -163,6 +178,56 @@ def _parse_submitted_job_id(stdout: str) -> str | None:
             tail = line.strip().split()[-1]
             return tail if tail.isdigit() else None
     return None
+
+
+def _submit_worker_job(
+    run_config: MeshRunConfig,
+    node: str,
+    repo_root: Path,
+    registry_path: Path,
+    submitted_at: str,
+    *,
+    start_round: int = 0,
+) -> str | None:
+    """Submits one sbatch job for `node`, appends its record to
+    registry_path on success. Returns the parsed job id, or None if
+    sbatch failed to run or its stdout didn't contain a job id --
+    mirrors the existing per-node loop's own best-effort handling
+    (continue past a single node's submission failure)."""
+    cmd = [
+        "sbatch",
+        "--nodes=1",
+        "--ntasks=1",
+        f"--nodelist={node}",
+        "video_encoding/slurm/mesh_train.sbatch",
+        run_config.experiment,
+        run_config.run_id,
+        f"+run_tag={run_config.run_id}",
+        f"+mesh.merge={'true' if run_config.merge else 'false'}",
+        f"+mesh.outer_lr={run_config.outer_lr}",
+        f"+mesh.outer_momentum={run_config.outer_momentum}",
+        f"+mesh.rounds={run_config.rounds}",
+        f"+mesh.start_round={start_round}",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, cwd=repo_root, capture_output=True, text=True, timeout=300
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    job_id = _parse_submitted_job_id(result.stdout) if result.returncode == 0 else None
+    if job_id is not None:
+        append_job_record(
+            registry_path,
+            JobRecord(
+                slurm_job_id=job_id,
+                experiment=run_config.experiment,
+                run_tag=run_config.run_id,
+                submitted_at=submitted_at,
+                nodelist=node,
+            ),
+        )
+    return job_id
 
 
 def _do_assigning(
@@ -205,40 +270,7 @@ def _do_assigning(
     registry_path = repo_root / ".claude" / "state" / "jobs_registry.json"
     submitted_at = datetime.now(timezone.utc).isoformat()
     for node in eligible:
-        cmd = [
-            "sbatch",
-            "--nodes=1",
-            "--ntasks=1",
-            f"--nodelist={node}",
-            "video_encoding/slurm/mesh_train.sbatch",
-            run_config.experiment,
-            run_config.run_id,
-            f"+run_tag={run_config.run_id}",
-            f"+mesh.merge={'true' if run_config.merge else 'false'}",
-            f"+mesh.outer_lr={run_config.outer_lr}",
-            f"+mesh.outer_momentum={run_config.outer_momentum}",
-            f"+mesh.rounds={run_config.rounds}",
-        ]
-        try:
-            result = subprocess.run(
-                cmd, cwd=repo_root, capture_output=True, text=True, timeout=300
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        job_id = (
-            _parse_submitted_job_id(result.stdout) if result.returncode == 0 else None
-        )
-        if job_id is not None:
-            append_job_record(
-                registry_path,
-                JobRecord(
-                    slurm_job_id=job_id,
-                    experiment=run_config.experiment,
-                    run_tag=run_config.run_id,
-                    submitted_at=submitted_at,
-                    nodelist=node,
-                ),
-            )
+        _submit_worker_job(run_config, node, repo_root, registry_path, submitted_at)
 
     run.status = "RUNNING"
     return f"{run_config.run_id}: ASSIGNING -> RUNNING ({len(eligible)} nodes)"
@@ -288,6 +320,8 @@ def _do_awaiting_checkpoints(
     state: WatcherState,
     mesh_shared: Path,
     now: float,
+    repo_root: Path,
+    run_configs_path: Path | None,
 ) -> str | None:
     pending_dir = mesh_shared / "checkpoints" / "pending"
     checked_in = pending_nodes(pending_dir, run_config.run_id)
@@ -312,12 +346,137 @@ def _do_awaiting_checkpoints(
     excluded = [
         node for node in missing if record_missed_round(state, run_config.run_id, node)
     ]
+    replenish_notes = [
+        note
+        for node in excluded
+        if (
+            note := _replenish_pool(
+                run_config, run, state, mesh_shared, repo_root, run_configs_path, node
+            )
+        )
+        is not None
+    ]
     run.status = "MERGING"
     excluded_note = f", permanently excluded {excluded}" if excluded else ""
-    return (
+    result = (
         f"{run_config.run_id}: AWAITING_CHECKPOINTS -> MERGING "
         f"(timeout, missing {missing}{excluded_note})"
     )
+    if replenish_notes:
+        result += "; " + "; ".join(replenish_notes)
+    return result
+
+
+# --- pool replenishment ------------------------------------------------
+
+
+def _append_nodes_to_run_config(path: Path, run_id: str, new_nodes: list[str]) -> None:
+    """Rewrites the run-configs JSON `load_run_configs` reads: finds the
+    entry matching run_id and extends its "nodes" list with any of
+    new_nodes not already present (idempotency guard -- a re-run of
+    this function with the same picked nodes is a no-op on the second
+    call), atomic tmp+rename."""
+    payload = json.loads(path.read_text())
+    for entry in payload:
+        if entry["run_id"] == run_id:
+            for node in new_nodes:
+                if node not in entry["nodes"]:
+                    entry["nodes"].append(node)
+            break
+    _write_json_atomic(path, payload)
+
+
+def _live_roster(run_configs_path: Path, run_id: str, fallback: list[str]) -> list[str]:
+    """Current on-disk roster for run_id, reflecting any nodes a prior
+    _replenish_pool call already appended earlier in this same tick.
+
+    `run_config.nodes` is a snapshot frozen when advance_one_run's caller
+    loaded it -- it never updates mid-tick even after
+    _append_nodes_to_run_config writes a grown roster to disk. If two
+    nodes cross the crash-loop exclusion threshold in the same tick (e.g.
+    a shared NFS blip timing out several checkpoints at once),
+    _do_awaiting_checkpoints calls _replenish_pool once per newly-excluded
+    node -- reading the live roster here (instead of the stale
+    run_config.nodes) is what stops the second call from re-picking and
+    re-submitting the same idle node the first call already claimed.
+    Falls back to `fallback` if the file or this run's entry doesn't
+    exist yet.
+    """
+    if not run_configs_path.exists():
+        return fallback
+    payload = json.loads(run_configs_path.read_text())
+    for entry in payload:
+        if entry["run_id"] == run_id:
+            return entry["nodes"]
+    return fallback
+
+
+def _replenish_pool(
+    run_config: MeshRunConfig,
+    run: RunState,
+    state: WatcherState,
+    mesh_shared: Path,
+    repo_root: Path,
+    run_configs_path: Path | None,
+    excluded_node: str,
+) -> str | None:
+    """Called right after `excluded_node` is freshly excluded (a NEW
+    exclusion this tick, not a pre-existing one from before this
+    feature existed -- see Task 5 call site). Tops the pool back up
+    toward run.target_pool_size with idle same-tier nodes and hands
+    them excluded_node's orphaned shards. Returns a status string
+    describing what happened, or None if there was nothing to do
+    (no deficit) or nothing that could be done (no run_configs_path,
+    no idle candidates)."""
+    if run_configs_path is None:
+        return None
+
+    roster = _live_roster(run_configs_path, run_config.run_id, run_config.nodes)
+    deficit = pool_deficit(run, roster, state)
+    if deficit <= 0:
+        return None
+
+    tier = NODE_GROUPS[roster[0]]
+    tier_roster = [h for h, g in NODE_GROUPS.items() if g == tier]
+    idle = query_idle_nodes()
+    candidates = candidate_replacements(
+        tier_roster, in_use=set(roster), excluded=set(state.excluded_nodes)
+    )
+    picked = select_idle_nodes(candidates, deficit, idle)
+    if not picked:
+        return (
+            f"{run_config.run_id}: replenish skipped -- no idle {tier} nodes "
+            f"available (deficit {deficit})"
+        )
+
+    _append_nodes_to_run_config(run_configs_path, run_config.run_id, picked)
+
+    registry_path = repo_root / ".claude" / "state" / "jobs_registry.json"
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    for node in picked:
+        _submit_worker_job(
+            run_config,
+            node,
+            repo_root,
+            registry_path,
+            submitted_at,
+            start_round=run.round + 1,
+        )
+
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    assignments_path = (
+        mesh_shared / "metadata" / f"shard_assignments_{run_config.run_id}.json"
+    )
+    if assignments_path.exists():
+        assignments = json.loads(assignments_path.read_text())
+        if excluded_node in assignments:
+            placement = _invert_placement(load_shard_map(shard_map_path))
+            for node in picked:
+                assignments.setdefault(node, [])
+            assignments = reassign_failed(excluded_node, assignments, placement)
+            _write_json_atomic(assignments_path, assignments)
+
+    return f"{run_config.run_id}: replenished with {picked} (deficit was {deficit})"
 
 
 # --- MERGING -----------------------------------------------------------
@@ -359,7 +518,8 @@ def _do_merging(
         "uv",
         "run",
         "python",
-        "video_encoding/scripts/run_outer_step.py",
+        "-m",
+        "video_encoding.scripts.run_outer_step",
         "--pending-dir",
         str(pending_dir),
         "--master",
@@ -381,9 +541,11 @@ def _do_merging(
         return f"{run_config.run_id}: MERGING failed ({exc}) -- retrying next tick"
 
     if result.returncode != 0:
+        stderr_lines = [line for line in result.stderr.splitlines() if line.strip()]
+        last_line = stderr_lines[-1] if stderr_lines else "(no stderr)"
         return (
-            f"{run_config.run_id}: MERGING failed (exit {result.returncode}) "
-            "-- retrying next tick"
+            f"{run_config.run_id}: MERGING failed (exit {result.returncode}: "
+            f"{last_line}) -- retrying next tick"
         )
 
     for pending_file in pending_dir.glob(f"{run_config.run_id}_*.pt"):

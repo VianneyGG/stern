@@ -32,12 +32,12 @@ def test_load_squeue_snapshot_missing_file_returns_empty(tmp_path):
 
 def test_refresh_squeue_snapshot_writes_atomically(tmp_path):
     out_path = tmp_path / "squeue.json"
-    fake_result = MagicMock(stdout=json.dumps(FIXTURE_PAYLOAD))
+    fake_result = MagicMock(stdout="36901|RUNNING|node001\n36902|PENDING|\n")
     with patch("subprocess.run", return_value=fake_result) as mock_run:
         refresh_squeue_snapshot(out_path, user="lev")
 
     mock_run.assert_called_once_with(
-        ["squeue", "-u", "lev", "--json"],
+        ["squeue", "-u", "lev", "-h", "-o", "%i|%T|%N"],
         capture_output=True,
         text=True,
         check=True,

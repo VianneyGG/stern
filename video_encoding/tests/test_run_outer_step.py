@@ -1,11 +1,60 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 import torch
 
 from video_encoding.scripts.run_outer_step import merge_round
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_cli_invocation_as_module_actually_runs(tmp_path):
+    """Real subprocess, no mocking: mesh_tick.py's _do_merging shells out to
+    this script via `uv run python -m video_encoding.scripts.run_outer_step`
+    (not a bare script path -- that puts the script's own directory on
+    sys.path[0] instead of the repo root, so the `from video_encoding...`
+    import below can never resolve). A mocked subprocess.run in
+    test_mesh_tick.py can't catch that class of bug; only actually running
+    the command can.
+    """
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "video_encoding.scripts.run_outer_step",
+            "--pending-dir",
+            str(pending_dir),
+            "--master",
+            str(master_path),
+            "--momentum",
+            str(momentum_path),
+            "--outer-lr",
+            "0.7",
+            "--outer-momentum",
+            "0.9",
+            "--weighting",
+            "data",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def _sd(v: float) -> dict[str, torch.Tensor]:

@@ -41,6 +41,10 @@ class RunState:
         "ASSIGNING"  # ASSIGNING|RUNNING|AWAITING_CHECKPOINTS|MERGING|SYNCING|DONE
     )
     missed_rounds: dict[str, int] = field(default_factory=dict)
+    target_pool_size: int = 0  # 0 = not yet observed; set once by
+    # mesh_tick.advance_one_run to len(run_config.nodes) the first tick
+    # this run is seen, so pool_deficit (epoch_advance.py) has a stable
+    # baseline even after replenishment grows run_config.nodes later.
 
 
 @dataclass

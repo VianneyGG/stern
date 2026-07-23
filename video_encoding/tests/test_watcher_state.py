@@ -62,3 +62,19 @@ def test_advance_backoff_resets_to_fast_floor_on_action():
     advance_backoff(state, now=100.0, action_taken=True)
     assert state.current_interval_s == FAST_INTERVAL_S
     assert state.next_full_check_at == 100.0 + FAST_INTERVAL_S
+
+
+def test_run_target_pool_size_defaults_to_zero():
+    state = WatcherState()
+    assert state.run("RUN1").target_pool_size == 0
+
+
+def test_run_target_pool_size_roundtrips(tmp_path):
+    path = tmp_path / "watcher_state.json"
+    state = WatcherState()
+    state.run("RUN1").target_pool_size = 16
+
+    save_state(path, state)
+    loaded = load_state(path)
+
+    assert loaded.run("RUN1").target_pool_size == 16

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from video_encoding.watcher.state import WatcherState
+from video_encoding.watcher.state import RunState, WatcherState
 
 MISSED_ROUND_THRESHOLD = 2
 
@@ -66,3 +66,33 @@ def record_missed_round(
 def eligible_nodes(state: WatcherState, candidates: list[str]) -> list[str]:
     """Candidates minus any node currently in excluded_nodes."""
     return [node for node in candidates if node not in state.excluded_nodes]
+
+
+def pool_deficit(run: RunState, roster: list[str], state: WatcherState) -> int:
+    """max(0, run.target_pool_size - len(eligible_nodes(state, roster))).
+    Never negative -- a roster that has already grown past target_pool_size
+    (e.g. after a previous replenishment already ran) reports 0, not a
+    negative want."""
+    available = len(eligible_nodes(state, roster))
+    return max(0, run.target_pool_size - available)
+
+
+def candidate_replacements(
+    tier_roster: list[str], in_use: set[str], excluded: set[str]
+) -> list[str]:
+    """tier_roster's hosts, in tier_roster's own order, minus in_use minus
+    excluded. Deterministic: same inputs always produce the same order."""
+    return [node for node in tier_roster if node not in in_use and node not in excluded]
+
+
+def select_idle_nodes(candidates: list[str], count: int, idle: set[str]) -> list[str]:
+    """First `count` of `candidates` that are also present in `idle`, in
+    candidate order. Returns fewer than `count` (never raises) when `idle`
+    has too few matches -- callers decide how to handle a partial result."""
+    result = []
+    for node in candidates:
+        if node in idle:
+            result.append(node)
+            if len(result) == count:
+                break
+    return result

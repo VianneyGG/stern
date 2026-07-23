@@ -72,6 +72,7 @@ def main() -> int:
                 ),
                 mesh_root=Path("/Data/$USER/mesh"),
                 now=now,
+                run_configs_path=STATE_DIR / "mesh_run_configs.json",
             )
         except Exception as exc:
             # A single bad mesh run config (e.g. n_shards mismatched against

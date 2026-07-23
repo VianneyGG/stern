@@ -21,6 +21,14 @@ shift 2
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
+# sbatch propagates the submitter's environment by default (--export=ALL).
+# When the watcher submits this job from cron, cron's own PATH
+# (/usr/bin:/bin) doesn't include ~/.local/bin, so an inherited-PATH-only
+# `uv run` below fails instantly with "uv: command not found" regardless of
+# who submitted the job. Make this script self-sufficient rather than
+# depending on the submitter having a correct PATH.
+export PATH="${HOME}/.local/bin:${PATH}"
+
 export MESH_RUN_ID="${RUN_ID}"
 # Deliberately OUTSIDE ~/stern: sync_login-node.sh pushes source with
 # `rsync --delete`, which would wipe round-local mesh state (assignments,

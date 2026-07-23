@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 import socket
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -248,7 +249,11 @@ def test_run_mesh_pretrain_stage_cold_start_has_no_master_checkpoint(
     tmp_path, monkeypatch
 ):
     torch.manual_seed(0)
-    hostname = socket.gethostname()
+    # Assignments are keyed by the short hostname (matches production:
+    # mesh_round.py normalizes socket.gethostname() the same way before
+    # lookup), independent of whether this machine's own hostname happens
+    # to include a domain suffix.
+    hostname = socket.gethostname().split(".", 1)[0]
 
     mesh_root = tmp_path / "mesh_root"
     shard_name = _write_shard(mesh_root, "clip0", n_frames=4)  # exactly 1 window
@@ -300,6 +305,238 @@ def test_run_mesh_pretrain_stage_cold_start_has_no_master_checkpoint(
     assert result["stage"] == "mesh_pretrain"
     assert result["final_round"] == 0
     assert math.isfinite(result["recon_loss"])
+
+
+def test_run_mesh_pretrain_stage_warm_starts_round_zero_from_existing_master(
+    tmp_path, monkeypatch
+):
+    """A worker relaunched after an interruption must not discard a
+    master.pt that already reflects prior mesh rounds. Round 0 is not
+    special-cased for "no merge partner yet" (that's cfg.mesh.merge=False,
+    covered by the cold-start test above) -- it is simply the first round
+    of *this process*, which may or may not be the first round of the run.
+    """
+    torch.manual_seed(0)
+    # Assignments are keyed by the short hostname (matches production:
+    # mesh_round.py normalizes socket.gethostname() the same way before
+    # lookup), independent of whether this machine's own hostname happens
+    # to include a domain suffix.
+    hostname = socket.gethostname().split(".", 1)[0]
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    checkpoint_root = tmp_path / "stern_checkpoints"
+
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 1,
+                "steps_per_round": 1,
+                "merge": True,
+                "outer_lr": 0.7,
+                "outer_momentum": 0.9,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+    # Simulate a master.pt already advanced past round 0 by prior mesh
+    # rounds this process never saw -- a marker value no fresh init or
+    # training step would produce by chance.
+    marker_model = VideoMAEForPreTraining(_tiny_cfg())
+    with torch.no_grad():
+        for p in marker_model.parameters():
+            p.fill_(7.0)
+    master_dir = mesh_shared / "checkpoints" / "run1"
+    master_dir.mkdir(parents=True)
+    torch.save(
+        {"model_state_dict": marker_model.state_dict()},
+        master_dir / "master.pt",
+    )
+
+    # Stub out real training/merge-wait so the only thing under test is
+    # whether round 0 picked up the marker weights before training began.
+    captured_first_param = {}
+
+    def _fake_train_one_round(model, *args, **kwargs):
+        if not captured_first_param:
+            captured_first_param["value"] = next(model.parameters()).flatten()[0].item()
+        return {
+            "loss": 0.0,
+            "samples": 1,
+            "samples_per_s_per_gpu": 1.0,
+        }
+
+    monkeypatch.setattr(mesh_round, "train_one_round", _fake_train_one_round)
+    monkeypatch.setattr(
+        mesh_round,
+        "push_checkpoint_and_wait",
+        lambda *args, **kwargs: None,
+    )
+
+    run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+
+    assert captured_first_param["value"] == pytest.approx(7.0)
+
+
+def test_late_joiner_loads_master_before_first_local_round(tmp_path, monkeypatch):
+    torch.manual_seed(0)
+    hostname = socket.gethostname().split(".", 1)[0]
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    # Pre-seed master.pt (the merge that already happened for round 0/1 on
+    # the rest of the mesh) and the round-2 sync flag, so
+    # push_checkpoint_and_wait doesn't block this test.
+    from video_encoding.training import checkpoint as ckpt_io
+
+    master_path = mesh_shared / "checkpoints" / "run1" / "master.pt"
+    master_path.parent.mkdir(parents=True)
+    seed_model = VideoMAEForPreTraining(_tiny_cfg())
+    ckpt_io.save(master_path, {"model_state_dict": seed_model.state_dict()})
+    flags_dir = mesh_shared / "checkpoints" / "flags"
+    flags_dir.mkdir(parents=True)
+    (flags_dir / "sync_complete_run1_2.flag").touch()
+
+    calls = []
+    real_load = mesh_round.torch.load
+
+    def spy_load(path, *a, **kw):
+        calls.append(Path(path))
+        return real_load(path, *a, **kw)
+
+    monkeypatch.setattr(mesh_round.torch, "load", spy_load)
+
+    checkpoint_root = tmp_path / "stern_checkpoints"
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 3,
+                "start_round": 2,
+                "steps_per_round": 1,
+                "merge": True,
+                "outer_lr": 0.7,
+                "outer_momentum": 0.9,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+    result = run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+
+    assert result["final_round"] == 2
+    assert calls.count(master_path) == 1
+
+
+def test_run_mesh_pretrain_stage_strips_fqdn_before_shard_lookup(tmp_path, monkeypatch):
+    """shard_assignments_*.json (written by seed_mesh.py/assignment.py) is
+    keyed by short hostnames ('node008'), matching NODE_SUBNETS and the
+    per-node checkpoint naming convention. socket.gethostname() returns
+    whatever the node's NSS/DNS config reports, which can be the FQDN
+    ('node008.polytechnique.fr') depending on cluster configuration --
+    observed in the wild on 2026-07-22 when every mesh worker crashed with
+    KeyError after a cluster-wide config change made gethostname() start
+    returning FQDNs. The lookup must be robust to either form.
+    """
+    torch.manual_seed(0)
+    monkeypatch.setattr(socket, "gethostname", lambda: "node008.polytechnique.fr")
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    # Keyed by the short hostname, as seed_mesh.py actually writes it.
+    assignments_path.write_text(json.dumps({"node008": [shard_name]}))
+
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    checkpoint_root = tmp_path / "stern_checkpoints"
+
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 1,
+                "steps_per_round": 1,
+                "merge": False,
+                "outer_lr": 0.7,
+                "outer_momentum": 0.9,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+    result = run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+
+    assert result["stage"] == "mesh_pretrain"
+    assert result["final_round"] == 0
 
 
 def test_mesh_dispatch_branch_routes_on_env_var(monkeypatch):

@@ -3,6 +3,11 @@
 uv.toml
 .hf_cache/
 .claude/worktrees/
+# Remote-only watcher state (job registry, watcher.log, watcher_state.json).
+# NOT excluding this deleted it wholesale via rsync --delete on 2026-07-22
+# (same failure mode as the slurm-logs note below) since it doesn't exist
+# in the local checkout.
+.claude/state/
 human/
 .pytest_cache/
 __pycache__/

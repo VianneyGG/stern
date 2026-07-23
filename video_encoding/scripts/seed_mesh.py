@@ -320,6 +320,10 @@ def _symlink_source_node(
         f'ln -sf {shlex.quote(remote_val_dir)}/"$f" {shlex.quote(val_dir)}/"$f"; '
         "done"
     )
+    # val/ has its own manifest.json (a distinct clip_key -> shard index built
+    # by build_wds_shards.py for the val split, not interchangeable with the
+    # train manifest symlinked above) -- MeshShardIterableDataset(mesh_root=
+    # val_root) loads it unconditionally, so it must be linked here too.
     result = subprocess.run(
         [
             "ssh",
@@ -330,7 +334,7 @@ def _symlink_source_node(
             source_node,
             remote_cmd_val,
         ],
-        input="\n".join(val_shards) + "\n",
+        input="\n".join(val_shards + ["manifest.json"]) + "\n",
         text=True,
         capture_output=True,
         timeout=120.0,
@@ -444,6 +448,21 @@ def main() -> int:
         )
         return 1
 
+    # val/ has its own manifest.json (built separately for the val shard set,
+    # not interchangeable with the train one above) -- evaluate_val_loss's
+    # MeshShardIterableDataset(mesh_root=mesh_root/"val") loads it
+    # unconditionally on every node, so it must exist on source before we
+    # plan any replication.
+    val_manifest_path = f"{args.shards_dir.rstrip('/')}/val/manifest.json"
+    if not _remote_file_exists(args.source_node, val_manifest_path):
+        print(
+            f"seed_mesh: val manifest.json not found at {val_manifest_path!r} "
+            f"on {args.source_node!r} -- run build_wds_shards.py for the val "
+            "split first",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         placement = plan_placement(
             nodes,
@@ -491,13 +510,13 @@ def main() -> int:
         if node.hostname == args.source_node:
             continue
         print(
-            f"seed_mesh: replicating {len(val_shards)} val shard(s) "
-            f"{args.source_node} -> {node.hostname}"
+            f"seed_mesh: replicating {len(val_shards)} val shard(s) + "
+            f"val manifest.json {args.source_node} -> {node.hostname}"
         )
         _execute_rsync_pull(
             node.hostname,
             args.source_node,
-            val_shards,
+            val_shards + ["manifest.json"],
             mesh_dir=MESH_DIR,
             remote_source_dir=f"{args.shards_dir.rstrip('/')}/val",
             subdir=_VAL_SUBDIR,

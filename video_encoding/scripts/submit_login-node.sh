@@ -81,8 +81,13 @@ fi
 # installing/verifying the crontab line is the correct launch mechanism --
 # not a PID file or screen/tmux session. grep-guarded so re-running
 # submit_login-node.sh never installs a duplicate line.
-if ! crontab -l 2>/dev/null | grep -q "watch_training.py"; then
-  (crontab -l 2>/dev/null; echo "* * * * * cd ${REMOTE_DIR} && uv run python video_encoding/scripts/watch_training.py") | crontab -
+if ! crontab -l 2>/dev/null | grep -q "watch_training"; then
+  # cron's own PATH (/usr/bin:/bin on this cluster) doesn't include
+  # ~/.local/bin, where uv lives -- an unqualified "uv" here fails silently
+  # every tick with no watcher.log entry at all. \$HOME/.local/bin/uv is
+  # robust since cron always sets HOME for the crontab owner. cron_stderr.log
+  # captures anything that fails before our own logging can run.
+  (crontab -l 2>/dev/null; echo "* * * * * cd ${REMOTE_DIR} && \$HOME/.local/bin/uv run python -m video_encoding.scripts.watch_training >> ${REMOTE_DIR}/.claude/state/cron_stderr.log 2>&1") | crontab -
   echo "Installed training watcher crontab entry."
 fi
 REMOTE

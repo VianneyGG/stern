@@ -15,7 +15,14 @@ from typing import Any
 
 
 def refresh_squeue_snapshot(out_path: Path, *, user: str) -> None:
-    """Run `squeue -u <user> --json`, write atomically to `out_path`.
+    """Run `squeue -u <user>`, write a squeue-`--json`-shaped snapshot to `out_path`.
+
+    This cluster's Slurm build has no JSON serializer plugin (`squeue --json`
+    fails with `serializer_required: could not find plugin for
+    application/json`), so we parse squeue's plain `-o` format instead and
+    reassemble the same `{"jobs": [{"job_id", "job_state", "nodes"}, ...]}`
+    shape `load_squeue_snapshot` expects -- that on-disk contract stays
+    unchanged even though the source command differs.
 
     Tmp-write + rename mirrors poll_squeue.sh / checkpoint.save -- a crash
     mid-write must never leave a truncated squeue.json for the next tick.
@@ -24,13 +31,20 @@ def refresh_squeue_snapshot(out_path: Path, *, user: str) -> None:
     """
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     result = subprocess.run(
-        ["squeue", "-u", user, "--json"],
+        ["squeue", "-u", user, "-h", "-o", "%i|%T|%N"],
         capture_output=True,
         text=True,
         check=True,
         timeout=30,
     )
-    tmp.write_text(result.stdout)
+    jobs = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        job_id, state, nodes = line.split("|", 2)
+        jobs.append({"job_id": int(job_id), "job_state": [state], "nodes": nodes})
+    tmp.write_text(json.dumps({"jobs": jobs}))
     tmp.replace(out_path)
 
 
