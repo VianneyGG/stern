@@ -18,6 +18,7 @@ covers them for free; this module only tracks round progress.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -94,26 +95,35 @@ def advance_all_runs(
     now: float,
     run_configs_path: Path | None = None,
 ) -> list[str]:
-    """Advance every non-DONE run by one state-machine step.
+    """Advance every non-DONE run as far as it will go this tick.
 
     Called every cron tick (unconditional -- not gated by run_full_check's
     health-check backoff timer): worker jobs push checkpoints and wait on
     sync flags on their own schedule, independent of that cadence.
+
+    Cron itself only fires once/minute, so without the inner while-loop a
+    run sitting in a state whose condition is already satisfied (all
+    checkpoints already landed, sync flag already written) would still wait
+    for the *next* tick to notice -- pure dispatch latency, not real work
+    (observed: ~60-70s per such transition in production watcher.log).
+    advance_one_run's own per-status handlers are unchanged; this just
+    keeps calling the same run_id until one returns None (genuinely
+    blocked, e.g. still waiting on checkpoints) or the run reaches DONE.
     """
     actions: list[str] = []
     for run_config in run_configs:
-        if state.run(run_config.run_id).status == "DONE":
-            continue
-        action = advance_one_run(
-            run_config,
-            state=state,
-            repo_root=repo_root,
-            mesh_shared=mesh_shared,
-            mesh_root=mesh_root,
-            now=now,
-            run_configs_path=run_configs_path,
-        )
-        if action is not None:
+        while state.run(run_config.run_id).status != "DONE":
+            action = advance_one_run(
+                run_config,
+                state=state,
+                repo_root=repo_root,
+                mesh_shared=mesh_shared,
+                mesh_root=mesh_root,
+                now=now,
+                run_configs_path=run_configs_path,
+            )
+            if action is None:
+                break
             actions.append(action)
     return actions
 
@@ -203,10 +213,15 @@ def _submit_worker_job(
         run_config.experiment,
         run_config.run_id,
         f"+run_tag={run_config.run_id}",
-        f"+mesh.merge={'true' if run_config.merge else 'false'}",
-        f"+mesh.outer_lr={run_config.outer_lr}",
-        f"+mesh.outer_momentum={run_config.outer_momentum}",
-        f"+mesh.rounds={run_config.rounds}",
+        # No '+' prefix on these four: conf/experiment/videomae_mesh_ssl.yaml
+        # already defines mesh.merge/outer_lr/outer_momentum/rounds, and '+'
+        # means "add a NEW key" -- Hydra raises ConfigCompositionException
+        # ("Could not append to config") if the key already exists. Only
+        # mesh.start_round is genuinely new, so it keeps the '+'.
+        f"mesh.merge={'true' if run_config.merge else 'false'}",
+        f"mesh.outer_lr={run_config.outer_lr}",
+        f"mesh.outer_momentum={run_config.outer_momentum}",
+        f"mesh.rounds={run_config.rounds}",
         f"+mesh.start_round={start_round}",
     ]
     try:
@@ -245,6 +260,8 @@ def _do_assigning(
         # is never auto-reversed).
         return f"{run_config.run_id}: ASSIGNING skipped -- no eligible nodes"
 
+    deleted = _clean_stale_run_artifacts(run_config.run_id, mesh_shared)
+
     shard_map = load_shard_map(mesh_shared / "metadata" / "shard_map.json")
     placement = _invert_placement(shard_map)
     all_shards = list(shard_map)
@@ -273,7 +290,10 @@ def _do_assigning(
         _submit_worker_job(run_config, node, repo_root, registry_path, submitted_at)
 
     run.status = "RUNNING"
-    return f"{run_config.run_id}: ASSIGNING -> RUNNING ({len(eligible)} nodes)"
+    action = f"{run_config.run_id}: ASSIGNING -> RUNNING ({len(eligible)} nodes)"
+    if deleted:
+        action += f"; cleaned {len(deleted)} stale artifact(s) from a prior attempt"
+    return action
 
 
 # --- RUNNING -----------------------------------------------------------
@@ -500,8 +520,31 @@ def _bootstrap_master(pending_dir: Path, run_id: str, master_path: Path) -> None
     if not candidates:
         return
     payload = torch.load(candidates[0], map_location="cpu", weights_only=False)
+    # Pending checkpoints are pushed in fp16 (mesh_round.py's
+    # push_checkpoint_and_wait, to halve NFS traffic) -- master.pt must
+    # start in fp32 or every later merge step (run_outer_step.py) silently
+    # accumulates the outer-optimizer momentum at half precision forever.
+    model_state_dict = {
+        k: (v.float() if torch.is_floating_point(v) else v)
+        for k, v in payload["model_state_dict"].items()
+    }
     master_path.parent.mkdir(parents=True, exist_ok=True)
-    ckpt_io.save(master_path, {"model_state_dict": payload["model_state_dict"]})
+    ckpt_io.save(master_path, {"model_state_dict": model_state_dict})
+
+
+def _uv_bin() -> str:
+    """Absolute path to uv, for subprocesses launched from the watcher.
+
+    The watcher's own cron entry invokes ${HOME}/.local/bin/uv by absolute
+    path, but `uv run` only prepends the venv's bin dir to PATH -- it does
+    not add ~/.local/bin. A bare "uv" here therefore resolves fine from an
+    interactive shell and fails with FileNotFoundError on every tick that
+    runs from cron, stalling the merge indefinitely (observed 2026-07-27:
+    both mesh pools retried MERGING every tick until this was fixed).
+    run_mesh_worker.sh guards the same gap by exporting PATH; the watcher
+    resolves the binary instead of trusting its inherited environment.
+    """
+    return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
 
 
 def _do_merging(
@@ -515,7 +558,7 @@ def _do_merging(
     if not master_path.exists():
         _bootstrap_master(pending_dir, run_config.run_id, master_path)
     cmd = [
-        "uv",
+        _uv_bin(),
         "run",
         "python",
         "-m",
@@ -557,6 +600,77 @@ def _do_merging(
 
 # --- SYNCING -------------------------------------------------------------
 
+node089_HOST = "node089"
+node089_RESULTS_ROOT = "/Data/$USER/stern_mesh_results"
+
+
+def _transfer_results_to_node089(run_config: MeshRunConfig, mesh_shared: Path) -> str:
+    """Best-effort: rsync this run's checkpoint dir to node089's local NVMe,
+    then delete the NFS copy on success to free quota.
+
+    Never raises -- a failed transfer just leaves the run's results on NFS
+    (safe fallback: DONE runs are never re-advanced by advance_all_runs, so
+    there is no automatic retry, and losing the only surviving copy of a
+    finished run is far worse than leaving it on NFS a while longer).
+    """
+    local_dir = mesh_shared / "checkpoints" / run_config.run_id
+    if not local_dir.exists() or not any(local_dir.iterdir()):
+        return f"{run_config.run_id}: transfer skipped -- no local checkpoint dir"
+
+    remote_dir = f"{node089_RESULTS_ROOT}/{run_config.run_id}"
+    try:
+        mkdir_result = subprocess.run(
+            ["ssh", node089_HOST, "mkdir", "-p", remote_dir],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if mkdir_result.returncode != 0:
+            return (
+                f"{run_config.run_id}: transfer to node089 FAILED "
+                f"(mkdir: {mkdir_result.stderr.strip()}) -- results kept on NFS"
+            )
+
+        rsync_result = subprocess.run(
+            [
+                "rsync",
+                "-az",
+                "--checksum",
+                f"{local_dir}/",
+                f"{node089_HOST}:{remote_dir}/",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if rsync_result.returncode != 0:
+            return (
+                f"{run_config.run_id}: transfer to node089 FAILED "
+                f"(rsync exit {rsync_result.returncode}) -- results kept on NFS"
+            )
+
+        # rsync exiting 0 doesn't guarantee the destination is intact (e.g.
+        # node089 ran out of disk mid-transfer) -- the next step deletes the
+        # only other copy, so verify before committing to that.
+        check_result = subprocess.run(
+            ["ssh", node089_HOST, "test", "-s", f"{remote_dir}/master.pt"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if check_result.returncode != 0:
+            return (
+                f"{run_config.run_id}: transfer to node089 FAILED "
+                f"(post-transfer check) -- results kept on NFS"
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{run_config.run_id}: transfer to node089 FAILED ({exc}) -- results kept on NFS"
+
+    shutil.rmtree(local_dir)
+    return (
+        f"{run_config.run_id}: results transferred to node089:{remote_dir}, freed NFS"
+    )
+
 
 def _do_syncing(run_config: MeshRunConfig, run: RunState, mesh_shared: Path) -> str:
     flag_path = (
@@ -570,9 +684,10 @@ def _do_syncing(run_config: MeshRunConfig, run: RunState, mesh_shared: Path) -> 
 
     if run.round >= run_config.rounds:
         run.status = "DONE"
+        transfer_note = _transfer_results_to_node089(run_config, mesh_shared)
         return (
             f"{run_config.run_id}: SYNCING -> DONE "
-            f"(round {run.round}/{run_config.rounds})"
+            f"(round {run.round}/{run_config.rounds}); {transfer_note}"
         )
     # Not ASSIGNING: Task 2's worker job is a single long-lived SLURM
     # allocation that loops over every round internally, polling this exact
@@ -606,3 +721,31 @@ def _atomic_touch(path: Path) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text("")
     tmp.replace(path)
+
+
+def _clean_stale_run_artifacts(run_id: str, mesh_shared: Path) -> list[Path]:
+    """Delete sync flags and pending checkpoints left over from a prior
+    attempt at this run_id (e.g. after an aborted relaunch).
+
+    Left in place, these silently short-circuit the round-sync logic --
+    workers see a stale sync_complete flag and skip loading the merged
+    master checkpoint. Hyphen-suffixed collisions (cleaning "pool-fish"
+    must not touch "pool-fish-5r"'s flags) are already prevented by the
+    glob's literal "_" delimiter, which has no counterpart at that
+    position in the sibling run's filename. The flags glob additionally
+    uses a digit character class (not a bare trailing `*`) so
+    underscore-suffixed collisions are also rejected -- cleaning "pool"
+    must not delete "pool_extra"'s flags, which a bare `*` would wrongly
+    match. Missing flags/ or pending/ directories are not an error --
+    Path.glob on a non-existent directory returns no matches.
+    """
+    flags_dir = mesh_shared / "checkpoints" / "flags"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    deleted: list[Path] = []
+    for path in flags_dir.glob(f"sync_complete_{run_id}_[0-9]*.flag"):
+        path.unlink()
+        deleted.append(path)
+    for path in pending_dir.glob(f"{run_id}_*.pt"):
+        path.unlink()
+        deleted.append(path)
+    return deleted

@@ -65,6 +65,27 @@ _SYNC_POLL_INTERVAL_S = 5.0
 # train_one_round/evaluate_val_loss were specified with.
 _MESH_BATCH_SIZE = 1
 
+# Keys present in the full round payload (checkpoint.base_payload()) that are
+# dropped before the payload is pushed to the shared NFS pending/ dir.
+# run_outer_step.py::_load_worker_checkpoints only ever reads
+# model_state_dict/n_samples/val_loss from a pending file, and AdamW's
+# exp_avg+exp_avg_sq buffers roughly double payload size -- shipping them to
+# NFS is pure waste, read by nobody, held until the next merge tick or
+# ROUND_TIMEOUT_S, then unlinked. The LOCAL checkpoint (checkpoint_root/
+# {run_id}.pt) keeps these keys unchanged; only the shared push drops them.
+_SHARED_PAYLOAD_DROP_KEYS = ("optimizer_state_dict", "optimizer_name")
+
+
+def _fp16_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Casts every floating-point tensor to fp16, leaving any non-float
+    buffer untouched. Halves the ~365MB/round NFS write in
+    push_checkpoint_and_wait; run_outer_step.py upcasts back to fp32
+    before any merge arithmetic runs on it."""
+    return {
+        k: (v.half() if torch.is_floating_point(v) else v)
+        for k, v in state_dict.items()
+    }
+
 
 def _resolve_subnet(hostname: str, cfg: DictConfig) -> str:
     """This node's real subnet, for mesh/shard_map.py's same-subnet peer
@@ -130,6 +151,7 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         num_frames=num_frames,
         image_size=image_size,
         overlap=overlap,
+        seed=int(cfg.train.get("seed", 42)),
     )
 
     # Val shards are replicated in full to every node under mesh_root/val/
@@ -228,6 +250,11 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
                     round_num,
                 )
 
+        # Without this, a fresh DataLoader built inside train_one_round every
+        # round replayed the dataset's fixed insertion order from the top,
+        # so max_steps=steps_per_round truncated at the identical windows
+        # every round regardless of round_num.
+        train_dataset.set_round(round_num)
         train_stats = train_one_round(
             model,
             optimizer,
@@ -270,8 +297,11 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         local_path = checkpoint_root / f"{run_id}.pt"
         ckpt_io.save(local_path, payload)
 
+        shared_payload = {
+            k: v for k, v in payload.items() if k not in _SHARED_PAYLOAD_DROP_KEYS
+        }
         push_checkpoint_and_wait(
-            payload,
+            shared_payload,
             mesh_shared=mesh_shared,
             run_id=run_id,
             node=node,
@@ -395,10 +425,13 @@ def push_checkpoint_and_wait(
 ) -> None:
     """Push `payload` to the shared pending/ dir, then (if merging) wait.
 
-    Writes to mesh_shared/checkpoints/pending/{run_id}_{node}.pt. If `merge`
-    is False (the ab-single_node reference arm), returns immediately -- no
-    wait, the caller proceeds to the next round locally. If `merge` is True,
-    polls for mesh_shared/checkpoints/flags/sync_complete_{run_id}_{round_num}.flag
+    Writes to mesh_shared/checkpoints/pending/{run_id}_{node}.pt, with
+    `model_state_dict` cast to fp16 (this shared copy only -- the caller's
+    own local checkpoint save happens before this call and keeps fp32). If
+    `merge` is False (the ab-single_node reference arm), returns immediately
+    -- no wait, the caller proceeds to the next round locally. If `merge` is
+    True, polls for
+    mesh_shared/checkpoints/flags/sync_complete_{run_id}_{round_num}.flag
     every 5s up to sync_timeout_s; on timeout, logs an ERROR naming
     run_id/round_num/node and calls sys.exit(1) -- NOT escalate.py, which
     operates on watcher-process state, not a worker job's own state. The
@@ -408,7 +441,9 @@ def push_checkpoint_and_wait(
     mesh_shared = Path(mesh_shared)
     pending_path = mesh_shared / "checkpoints" / "pending" / f"{run_id}_{node}.pt"
     pending_path.parent.mkdir(parents=True, exist_ok=True)
-    ckpt_io.save(pending_path, payload)
+    shared_payload = dict(payload)
+    shared_payload["model_state_dict"] = _fp16_state_dict(payload["model_state_dict"])
+    ckpt_io.save(pending_path, shared_payload)
 
     if not merge:
         return

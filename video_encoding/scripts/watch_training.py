@@ -93,6 +93,7 @@ def main() -> int:
         results_root=RESULTS_DIR,
         now=now,
         state=state,
+        mesh_run_ids=frozenset(c.run_id for c in run_configs),
     )
     save_state(state_path, state)
     _log(

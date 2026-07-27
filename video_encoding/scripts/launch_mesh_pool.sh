@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# video_encoding/scripts/launch_mesh_pool.sh
+# Bring up one tier's 16-node mesh pool (+6 idle backup nodes left for
+# auto-replenishment) once enough of the tier is idle. Run ON login-node
+# (requires sinfo, and seed_mesh.py's --shard-map output must land on the
+# shared NFS home the workers actually read from).
+#
+# Usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds]
+#   [rounds]  number of DiLoCo merge rounds for the pool; default 25
+#
+# Does NOT rebuild the generic shard_map.json workers read by default
+# (run_mesh_worker.sh's MESH_SHARD_MAP fallback) -- run
+# recover_shard_map.py once, across every tier's active node list
+# combined, after all pools you're launching this round have registered.
+set -euo pipefail
+
+TIER="${1:?usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds]}"
+RUN_ID="${2:?usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds]}"
+ROUNDS="${3:-25}"
+
+TIER_FISH="node001,node002,node003,node004,node005,node006,node007,node008,node009,node010,node011,node012,node013,node014,node015,node016,node017,node018,node019,node020,node021,node022,node023"
+TIER_BIRDS="node024,node025,node026,node027,node028,node029,node030,node031,node032,node033,node034,node035,node036,node037,node038,node039,node040,node041,node042,node043,node044,node045,node046"
+TIER_CARS="node047,node048,node049,node050,node051,node052,node053,node054,node055,node056,node057,node058,node059,node060,node061,node062,node063,node064,node065,node066,node067,node068,node069"
+
+case "${TIER}" in
+  fish) NODELIST="${TIER_FISH}" ;;
+  birds) NODELIST="${TIER_BIRDS}" ;;
+  cars) NODELIST="${TIER_CARS}" ;;
+  *) echo "ERROR: unknown tier '${TIER}' -- expected fish|birds|cars" >&2; exit 1 ;;
+esac
+
+echo "launch_mesh_pool: checking watcher status..."
+if [[ -z "$(squeue --me -h 2>/dev/null)" ]]; then
+  if ! crontab -l 2>/dev/null | grep -qF "watch_training"; then
+    if (crontab -l 2>/dev/null; echo "* * * * * cd ${HOME}/stern && ${HOME}/.local/bin/uv run python -m video_encoding.scripts.watch_training") | crontab -; then
+      echo "launch_mesh_pool: installed watcher cron entry (squeue --me was empty)"
+    else
+      echo "launch_mesh_pool: WARNING -- failed to install watcher cron entry, continuing anyway" >&2
+    fi
+  else
+    echo "launch_mesh_pool: watcher cron entry already present"
+  fi
+else
+  echo "launch_mesh_pool: squeue --me non-empty -- assuming watcher already active, skipping cron install"
+fi
+
+NEED=22  # 16 active + 6 backup
+
+echo "launch_mesh_pool: polling ${TIER} for ${NEED} idle nodes (60s interval)..."
+IFS=',' read -r -a TIER_NODES <<< "${NODELIST}"
+while true; do
+  IDLE=$(sinfo -N -o "%N %T" --state=idle 2>/dev/null | awk '$2=="idle"{print $1}')
+  READY=()
+  for node in "${TIER_NODES[@]}"; do
+    if echo "${IDLE}" | grep -qx "${node}"; then
+      READY+=("${node}")
+      [[ "${#READY[@]}" -ge "${NEED}" ]] && break
+    fi
+  done
+  echo "launch_mesh_pool: ${TIER} idle=${#READY[@]}/${NEED} ($(date -u +%FT%TZ))"
+  [[ "${#READY[@]}" -ge "${NEED}" ]] && break
+  sleep 60
+done
+
+ACTIVE=("${READY[@]:0:16}")
+BACKUP=("${READY[@]:16:6}")
+ACTIVE_CSV=$(IFS=,; echo "${ACTIVE[*]}")
+echo "launch_mesh_pool: ${TIER} active=[${ACTIVE_CSV}]"
+echo "launch_mesh_pool: ${TIER} backup (left idle)=[$(IFS=,; echo "${BACKUP[*]}")]"
+
+SOURCE_NODE="${ACTIVE[0]}"
+echo "launch_mesh_pool: reseeding ${SOURCE_NODE} from node089..."
+ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "${SOURCE_NODE}" \
+  "mkdir -p /Data/$USER/voxceleb2_shards && \
+   rsync -az node089:/Data/$USER/voxceleb2_shards/ /Data/$USER/voxceleb2_shards/"
+
+echo "launch_mesh_pool: seeding mesh across ${TIER} pool..."
+uv run python -m video_encoding.scripts.seed_mesh \
+  --nodes "${ACTIVE_CSV}" \
+  --source-node "${SOURCE_NODE}" \
+  --shards-dir /Data/$USER/voxceleb2_shards \
+  --shard-map "${HOME}/stern_mesh/metadata/shard_map_${TIER}16.json" \
+  --dataset-gb 223 \
+  --replication 2
+
+echo "launch_mesh_pool: registering run config ${RUN_ID}..."
+python3 - "${RUN_ID}" "${ACTIVE_CSV}" "${ROUNDS}" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+run_id, active_csv, rounds = sys.argv[1], sys.argv[2], int(sys.argv[3])
+nodes = active_csv.split(",")
+
+path = Path(".claude/state/mesh_run_configs.json")
+cfgs = json.loads(path.read_text()) if path.exists() else []
+cfgs = [c for c in cfgs if c["run_id"] != run_id]
+cfgs.append(
+    {
+        "run_id": run_id,
+        "experiment": "videomae_mesh_ssl",
+        "nodes": nodes,
+        "n_shards": 260,
+        "outer_lr": 0.7,
+        "outer_momentum": 0.9,
+        "weighting": "data",
+        "rounds": rounds,
+        "merge": True,
+    }
+)
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(cfgs, indent=2))
+tmp.replace(path)
+print(f"launch_mesh_pool: {run_id} registered with {len(nodes)} nodes")
+PYEOF
+
+echo "${ACTIVE_CSV}" > ".claude/state/mesh_pool_active_${TIER}.txt"
+echo "launch_mesh_pool: ${TIER} pool launched -- watcher cron will pick up ${RUN_ID} within a minute"

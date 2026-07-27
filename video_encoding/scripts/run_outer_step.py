@@ -38,6 +38,18 @@ from video_encoding.mesh.outer_step import (
 WEIGHTING_CHOICES = ("data", "inverse_loss")
 
 
+def _to_fp32_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Upcasts every floating-point tensor to fp32, leaving any non-float
+    buffer untouched. mesh_round.py's push_checkpoint_and_wait casts
+    model_state_dict to fp16 before writing to pending/ to halve NFS
+    traffic; the pseudo-gradient/momentum arithmetic below needs fp32
+    (a no-op if a checkpoint already arrives in fp32, e.g. in tests)."""
+    return {
+        k: (v.float() if torch.is_floating_point(v) else v)
+        for k, v in state_dict.items()
+    }
+
+
 def _load_worker_checkpoints(pending_dir: Path) -> dict[str, dict[str, Any]]:
     """Load every `*.pt` in `pending_dir`, keyed by filename stem.
 
@@ -63,6 +75,8 @@ def _load_worker_checkpoints(pending_dir: Path) -> dict[str, dict[str, Any]]:
                 f"merge_round: checkpoint '{f.name}' is missing required key "
                 "'model_state_dict'"
             )
+        payload = dict(payload)
+        payload["model_state_dict"] = _to_fp32_state_dict(payload["model_state_dict"])
         checkpoints[f.stem] = payload
     return checkpoints
 

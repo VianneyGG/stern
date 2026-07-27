@@ -9,9 +9,19 @@ experiment:
 
 mesh:
   rounds: 10
-  steps_per_round: 200        # spec S8: H, conservative starting point vs DiLoCo's H=500
+  # Micro-batches per round (mesh_round.py's max_steps), NOT optimizer steps
+  # -- with accum_steps=64 below this is 9600/64=150 optimizer steps/round
+  # over fresh (post-shuffle) windows, vs the old 200/1=200 steps over the
+  # same 200 windows replayed every round.
+  steps_per_round: 9600
   merge: true
   outer_lr: 0.7
   outer_momentum: 0.9
   sync_timeout_s: 1800.0
   subnet: "/254"               # fish tier default (pick_nodes.sh); only affects P2P fetch preference, not correctness
+
+train:
+  # eff_batch = _MESH_BATCH_SIZE(1) * accum_steps = 64, landing on the
+  # Phase-2 sweep's recommended eff_batch=128-256 lower shoulder;
+  # _scaled_lr derives lr = base_lr * 64/256 * lr_mult automatically.
+  accum_steps: 64

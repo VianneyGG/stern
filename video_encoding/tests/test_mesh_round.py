@@ -123,6 +123,35 @@ def test_train_one_round_respects_steps_per_round(tmp_path):
     assert stats["steps"] == 5
 
 
+def test_set_round_changes_window_order_with_real_shard(tmp_path):
+    """Real shard/decode path (unlike test_mesh_shard_dataset.py's
+    resolution-order-only test): each window's frame values are distinct
+    (np.full(..., i % 256) per frame index in _write_shard), so a window's
+    pixel sum is a reliable identity signature for order comparison."""
+    dataset = _mesh_dataset(tmp_path / "mesh", "clip0", n_frames=53, overlap=0.75)
+
+    dataset.set_round(0)
+    round0 = [t.sum().item() for t in iter(dataset)]
+
+    dataset.set_round(1)
+    round1 = [t.sum().item() for t in iter(dataset)]
+
+    assert sorted(round0) == pytest.approx(sorted(round1))  # same windows...
+    assert round0 != pytest.approx(round1)  # ...different order
+
+
+def test_set_round_is_deterministic_with_real_shard(tmp_path):
+    ds_a = _mesh_dataset(tmp_path / "mesh_a", "clip0", n_frames=53, overlap=0.75)
+    ds_b = _mesh_dataset(tmp_path / "mesh_b", "clip0", n_frames=53, overlap=0.75)
+    ds_a.set_round(3)
+    ds_b.set_round(3)
+
+    seq_a = [t.sum().item() for t in iter(ds_a)]
+    seq_b = [t.sum().item() for t in iter(ds_b)]
+
+    assert seq_a == pytest.approx(seq_b)
+
+
 def test_progress_desc_does_not_change_returned_stats():
     device = torch.device("cpu")
 
@@ -245,6 +274,42 @@ def test_push_checkpoint_and_wait_succeeds_when_flag_appears(tmp_path, monkeypat
     )
 
 
+def test_push_checkpoint_and_wait_casts_shared_payload_to_fp16(tmp_path):
+    payload = {
+        "model_state_dict": {"w": torch.ones(2, 2), "b": torch.ones(2)},
+        "n_samples": 1,
+    }
+
+    push_checkpoint_and_wait(
+        payload,
+        mesh_shared=tmp_path,
+        run_id="r1",
+        node="nodeA",
+        round_num=0,
+        merge=False,
+    )
+
+    shared = torch.load(
+        tmp_path / "checkpoints" / "pending" / "r1_nodeA.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert shared["model_state_dict"]["w"].dtype == torch.float16
+    assert shared["model_state_dict"]["b"].dtype == torch.float16
+    # Caller's own dict must be untouched: local checkpoint saves (which
+    # happen before this call in run_mesh_pretrain_stage) must stay fp32.
+    assert payload["model_state_dict"]["w"].dtype == torch.float32
+
+
+def test_fp16_state_dict_leaves_non_float_buffers_untouched():
+    state_dict = {"w": torch.ones(2), "step_count": torch.tensor(5, dtype=torch.int64)}
+
+    cast = mesh_round._fp16_state_dict(state_dict)
+
+    assert cast["w"].dtype == torch.float16
+    assert cast["step_count"].dtype == torch.int64
+
+
 def test_run_mesh_pretrain_stage_cold_start_has_no_master_checkpoint(
     tmp_path, monkeypatch
 ):
@@ -305,6 +370,90 @@ def test_run_mesh_pretrain_stage_cold_start_has_no_master_checkpoint(
     assert result["stage"] == "mesh_pretrain"
     assert result["final_round"] == 0
     assert math.isfinite(result["recon_loss"])
+
+
+def test_shared_pending_payload_drops_optimizer_state_local_keeps_it(
+    tmp_path, monkeypatch
+):
+    torch.manual_seed(0)
+    hostname = socket.gethostname().split(".", 1)[0]
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)  # exactly 1 window
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    checkpoint_root = tmp_path / "stern_checkpoints"
+
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 1,
+                "steps_per_round": 1,
+                "merge": False,
+                "outer_lr": 0.7,
+                "outer_momentum": 0.9,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+    run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+
+    local_payload = torch.load(
+        checkpoint_root / "run1.pt", map_location="cpu", weights_only=False
+    )
+    assert "optimizer_state_dict" in local_payload
+    assert "optimizer_name" in local_payload
+
+    shared_payload = torch.load(
+        mesh_shared / "checkpoints" / "pending" / f"run1_{hostname}.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert "optimizer_state_dict" not in shared_payload
+    assert "optimizer_name" not in shared_payload
+    assert shared_payload.keys() >= {
+        "model_state_dict",
+        "n_samples",
+        "val_loss",
+        "round",
+        "samples_per_s",
+        "outer_lr",
+        "outer_momentum",
+        "epoch",
+        "best_val_metric",
+        "model_name",
+    }
+
+
+def test_shared_payload_drop_keys_is_exactly_optimizer_state():
+    assert mesh_round._SHARED_PAYLOAD_DROP_KEYS == (
+        "optimizer_state_dict",
+        "optimizer_name",
+    )
 
 
 def test_run_mesh_pretrain_stage_warm_starts_round_zero_from_existing_master(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -10,6 +11,7 @@ from video_encoding.mesh.shard_map import Holder, save_shard_map
 from video_encoding.watcher.epoch_advance import exclude_node
 from video_encoding.watcher.mesh_tick import (
     MeshRunConfig,
+    _clean_stale_run_artifacts,
     _replenish_pool,
     _submit_worker_job,
     advance_all_runs,
@@ -93,6 +95,70 @@ def test_assigning_writes_assignments_file_and_submits_jobs(tmp_path):
 
     assert state.run("RUN1").status == "RUNNING"
     assert "RUNNING" in action
+
+
+def test_clean_stale_run_artifacts_removes_matching_flags_and_pending(tmp_path):
+    mesh_shared = tmp_path / "mesh_shared"
+    flags_dir = mesh_shared / "checkpoints" / "flags"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    flags_dir.mkdir(parents=True)
+    pending_dir.mkdir(parents=True)
+    (flags_dir / "sync_complete_pool-fish-5r_0.flag").touch()
+    (flags_dir / "sync_complete_pool-fish-5r_1.flag").touch()
+    (pending_dir / "pool-fish-5r_node001.pt").touch()
+
+    deleted = _clean_stale_run_artifacts("pool-fish-5r", mesh_shared)
+
+    assert not (flags_dir / "sync_complete_pool-fish-5r_0.flag").exists()
+    assert not (flags_dir / "sync_complete_pool-fish-5r_1.flag").exists()
+    assert not (pending_dir / "pool-fish-5r_node001.pt").exists()
+    assert len(deleted) == 3
+
+
+def test_clean_stale_run_artifacts_does_not_touch_other_run_ids(tmp_path):
+    mesh_shared = tmp_path / "mesh_shared"
+    flags_dir = mesh_shared / "checkpoints" / "flags"
+    flags_dir.mkdir(parents=True)
+    # Hyphen-prefix collision case: cleaning "pool-fish" must not delete
+    # "pool-fish-5r"'s flag -- this is the exact shape of names this repo uses.
+    (flags_dir / "sync_complete_pool-fish-5r_0.flag").touch()
+    (flags_dir / "sync_complete_pool-fish_0.flag").touch()
+
+    deleted = _clean_stale_run_artifacts("pool-fish", mesh_shared)
+
+    assert (flags_dir / "sync_complete_pool-fish-5r_0.flag").exists()
+    assert not (flags_dir / "sync_complete_pool-fish_0.flag").exists()
+    assert deleted == [flags_dir / "sync_complete_pool-fish_0.flag"]
+
+
+def test_clean_stale_run_artifacts_does_not_touch_underscore_suffixed_sibling(
+    tmp_path,
+):
+    mesh_shared = tmp_path / "mesh_shared"
+    flags_dir = mesh_shared / "checkpoints" / "flags"
+    flags_dir.mkdir(parents=True)
+    # This is what the digit character class in the glob actually guards
+    # against: a bare trailing `*` would match "pool_extra"'s flag too,
+    # since "extra_0" satisfies `*` right after the literal "pool_"
+    # delimiter. The hyphen-suffix pair above doesn't exercise this --
+    # the literal "_" there already rejects the "-5r" sibling regardless
+    # of what follows it in the pattern.
+    (flags_dir / "sync_complete_pool_0.flag").touch()
+    (flags_dir / "sync_complete_pool_extra_0.flag").touch()
+
+    deleted = _clean_stale_run_artifacts("pool", mesh_shared)
+
+    assert not (flags_dir / "sync_complete_pool_0.flag").exists()
+    assert (flags_dir / "sync_complete_pool_extra_0.flag").exists()
+    assert deleted == [flags_dir / "sync_complete_pool_0.flag"]
+
+
+def test_clean_stale_run_artifacts_is_noop_when_nothing_stale(tmp_path):
+    mesh_shared = tmp_path / "mesh_shared"  # flags/ and pending/ don't exist at all
+
+    deleted = _clean_stale_run_artifacts("brand-new-run", mesh_shared)
+
+    assert deleted == []
 
 
 def test_running_transitions_on_first_pending_checkpoint(tmp_path):
@@ -200,8 +266,12 @@ def test_merging_calls_run_outer_step_with_correct_args(tmp_path):
     # sys.path[0], not the repo root, so run_outer_step.py's
     # `from video_encoding... import` can never resolve and every merge
     # fails with ModuleNotFoundError regardless of args below.
-    assert cmd[:5] == [
-        "uv",
+    # uv must be an ABSOLUTE path, not the bare name: the watcher ticks from
+    # cron, whose PATH (/usr/bin:/bin) excludes ~/.local/bin, so a bare "uv"
+    # raises FileNotFoundError on every tick and stalls the merge forever.
+    assert Path(cmd[0]).is_absolute()
+    assert Path(cmd[0]).name == "uv"
+    assert cmd[1:5] == [
         "run",
         "python",
         "-m",
@@ -251,6 +321,40 @@ def test_merging_bootstraps_master_from_pending_when_missing(tmp_path):
     assert master_path.exists()
     payload = torch.load(master_path, map_location="cpu", weights_only=False)
     assert "model_state_dict" in payload
+
+
+def test_merging_bootstraps_master_upcasts_fp16_pending_to_fp32(tmp_path):
+    """Pending checkpoints arrive in fp16 (mesh_round.py's
+    push_checkpoint_and_wait casts model_state_dict before the NFS push) --
+    _bootstrap_master must upcast before seeding master.pt, or every later
+    merge step (run_outer_step.py) accumulates the outer-optimizer momentum
+    at half precision forever."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    torch.save(
+        {"model_state_dict": {"w": torch.ones(2).half()}, "n_samples": 100},
+        pending_dir / "RUN1_node001.pt",
+    )
+
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "MERGING"
+
+    master_path = mesh_shared / "checkpoints" / "RUN1" / "master.pt"
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch("video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake):
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    payload = torch.load(master_path, map_location="cpu", weights_only=False)
+    assert payload["model_state_dict"]["w"].dtype == torch.float32
 
 
 def test_merging_does_not_overwrite_existing_master(tmp_path):
@@ -417,6 +521,150 @@ def test_syncing_reaches_done_at_final_round(tmp_path):
     assert state.run("RUN1").status == "DONE"
 
 
+def test_syncing_transfers_results_to_node089_on_done(tmp_path):
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config(rounds=3)
+    local_dir = mesh_shared / "checkpoints" / "RUN1"
+    local_dir.mkdir(parents=True)
+    (local_dir / "master.pt").write_bytes(b"fake checkpoint")
+
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 2  # entering the final round's sync
+
+    ok = MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run",
+        side_effect=lambda *a, **k: ok,
+    ) as mock_run:
+        action = advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert not local_dir.exists()
+    assert "transferred" in action
+    assert state.run("RUN1").status == "DONE"
+
+    commands = [c[0][0] for c in mock_run.call_args_list]
+    assert [
+        "ssh",
+        "node089",
+        "mkdir",
+        "-p",
+        "/Data/$USER/stern_mesh_results/RUN1",
+    ] in commands
+    assert [
+        "rsync",
+        "-az",
+        "--checksum",
+        f"{local_dir}/",
+        "node089:/Data/$USER/stern_mesh_results/RUN1/",
+    ] in commands
+    assert [
+        "ssh",
+        "node089",
+        "test",
+        "-s",
+        "/Data/$USER/stern_mesh_results/RUN1/master.pt",
+    ] in commands
+
+
+def test_syncing_done_keeps_local_checkpoints_if_transfer_fails(tmp_path):
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config(rounds=3)
+    local_dir = mesh_shared / "checkpoints" / "RUN1"
+    local_dir.mkdir(parents=True)
+    (local_dir / "master.pt").write_bytes(b"fake checkpoint")
+
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 2
+
+    ok = MagicMock(returncode=0, stdout="", stderr="")
+    rsync_fail = MagicMock(returncode=1, stdout="", stderr="disk full")
+
+    def _fake_run(cmd, *args, **kwargs):
+        return rsync_fail if cmd[0] == "rsync" else ok
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
+    ):
+        action = advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert local_dir.exists()
+    assert "FAILED" in action
+    assert state.run("RUN1").status == "DONE"
+
+
+def test_syncing_done_keeps_local_checkpoints_if_post_transfer_check_fails(tmp_path):
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config(rounds=3)
+    local_dir = mesh_shared / "checkpoints" / "RUN1"
+    local_dir.mkdir(parents=True)
+    (local_dir / "master.pt").write_bytes(b"fake checkpoint")
+
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 2
+
+    ok = MagicMock(returncode=0, stdout="", stderr="")
+    check_fail = MagicMock(returncode=1, stdout="", stderr="")
+
+    def _fake_run(cmd, *args, **kwargs):
+        return check_fail if cmd[0] == "ssh" and cmd[2] == "test" else ok
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
+    ):
+        action = advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert local_dir.exists()
+    assert "FAILED" in action
+
+
+def test_syncing_transfer_skipped_when_no_local_checkpoints(tmp_path):
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config(rounds=3)
+
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 2
+
+    with patch("video_encoding.watcher.mesh_tick.subprocess.run") as mock_run:
+        action = advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    mock_run.assert_not_called()
+    assert "skipped" in action
+    assert state.run("RUN1").status == "DONE"
+
+
 def test_advance_all_runs_skips_done_runs(tmp_path):
     mesh_shared = tmp_path / "mesh_shared"
     pending_dir = mesh_shared / "checkpoints" / "pending"
@@ -445,6 +693,71 @@ def test_advance_all_runs_skips_done_runs(tmp_path):
     assert state.run("RUN2").status == "AWAITING_CHECKPOINTS"
     assert len(actions) == 1
     assert "RUN2" in actions[0]
+
+
+def test_advance_all_runs_cascades_through_multiple_ready_transitions(tmp_path):
+    """Cron fires once/minute; without cascading, a run whose next several
+    transitions are all already satisfied (sync flag ready to write,
+    next round's checkpoints already landed) would still burn one tick per
+    transition -- ~60-70s of pure dispatch latency each, observed in
+    production watcher.log. Seeds a run one flag-write away from DONE with
+    the (unrealistic in production, but valid here) next round's
+    checkpoints already sitting in pending/, so a single advance_all_runs
+    call must walk SYNCING -> RUNNING -> AWAITING_CHECKPOINTS -> MERGING ->
+    SYNCING -> DONE without waiting for five separate ticks.
+    """
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    for node in _NODES:
+        _write_pending_checkpoint(pending_dir / f"RUN1_{node}.pt")
+
+    run_config = _run_config(rounds=2)
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 0
+    state.run("RUN1").target_pool_size = 3
+
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch("video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake):
+        actions = advance_all_runs(
+            [run_config],
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert state.run("RUN1").status == "DONE"
+    assert len(actions) >= 5
+
+
+def test_advance_all_runs_stops_at_first_blocking_state(tmp_path):
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    for node in ("node001", "node002"):  # node003 never checked in
+        _write_pending_checkpoint(pending_dir / f"RUN1_{node}.pt")
+
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "AWAITING_CHECKPOINTS"
+    state.run("RUN1").target_pool_size = 3
+
+    with patch("video_encoding.watcher.mesh_tick.subprocess.run") as mock_run:
+        actions = advance_all_runs(
+            [run_config],
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,  # freshly-written files, nowhere near ROUND_TIMEOUT_S
+        )
+
+    mock_run.assert_not_called()
+    assert actions == []
+    assert state.run("RUN1").status == "AWAITING_CHECKPOINTS"
 
 
 def test_submit_worker_job_includes_start_round_zero_by_default(tmp_path):
@@ -479,6 +792,40 @@ def test_submit_worker_job_passes_nonzero_start_round(tmp_path):
         )
     submitted_cmd = mock_run.call_args[0][0]
     assert "+mesh.start_round=5" in submitted_cmd
+
+
+def test_submit_worker_job_overrides_compose_against_real_experiment_config(tmp_path):
+    """Regression: production mesh workers crashed on launch with Hydra's
+    "Could not append to config. An item is already at 'mesh.merge'" --
+    _submit_worker_job used '+mesh.merge=...' ('+' = add a NEW key) for
+    mesh.merge/outer_lr/outer_momentum/rounds, all of which
+    conf/experiment/videomae_mesh_ssl.yaml already defines. Compose the
+    real config with the exact override strings this function emits so this
+    class of bug is caught before it reaches sbatch."""
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    run_config = _run_config()
+    registry_path = tmp_path / "jobs_registry.json"
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 555\n")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        _submit_worker_job(
+            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+        )
+    submitted_cmd = mock_run.call_args[0][0]
+    hydra_overrides = [a for a in submitted_cmd if a.startswith("+")]
+
+    conf_dir = Path(__file__).resolve().parents[1] / "conf"
+    with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
+        cfg = compose(
+            config_name="config",
+            overrides=[f"experiment={run_config.experiment}", *hydra_overrides],
+        )
+    assert cfg.mesh.merge is True
+    assert cfg.mesh.start_round == 0
 
 
 def test_replenish_pool_noop_when_deficit_zero(tmp_path):

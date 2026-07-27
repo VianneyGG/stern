@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import random
 import threading
 from pathlib import Path
 from typing import Iterator
@@ -106,6 +107,7 @@ class MeshShardIterableDataset(IterableDataset):
         num_frames: int,
         image_size: int,
         overlap: float,
+        seed: int = 0,
     ):
         self._shard_names = list(shard_names)
         self._mesh_root = Path(mesh_root)
@@ -114,6 +116,17 @@ class MeshShardIterableDataset(IterableDataset):
         self._num_frames = num_frames
         self._image_size = image_size
         self._overlap = overlap
+        self._seed = seed
+        self._round = 0
+
+    def set_round(self, round_num: int) -> None:
+        """Selects the deterministic shard/window permutation the next
+        __iter__ call uses. Without this, a fresh DataLoader built each
+        mesh round (mesh_round.py's train_one_round) replayed the exact
+        same first `steps_per_round` windows every round -- the node's
+        shard/clip/window order is otherwise fixed insertion order, and
+        max_steps truncation always cuts at the same point."""
+        self._round = round_num
 
     def _worker_shards(self) -> list[str]:
         worker_info = get_worker_info()
@@ -142,6 +155,22 @@ class MeshShardIterableDataset(IterableDataset):
         if not shard_names:
             return
 
+        # Keyed on (seed, round, worker_id) so a relaunched worker process
+        # reproduces the exact order its round_num implies (mesh_round.py's
+        # cold-start/resume contract), rather than depending on process
+        # state that a crash would lose. `_worker_shards` may return
+        # `self._shard_names` itself (no worker split) -- copy before
+        # shuffling so repeated __iter__ calls don't compound permutations
+        # on the stored list.
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        # random.Random's seed only accepts int/float/str/bytes/None, not a
+        # tuple -- a delimited string keeps the three components distinct
+        # (no collision between e.g. (1, 23) and (12, 3)).
+        rng = random.Random(f"{self._seed}:{self._round}:{worker_id}")
+        shard_names = list(shard_names)
+        rng.shuffle(shard_names)
+
         # Loaded once from mesh_root/manifest.json -- a single index over
         # the whole shard set. A shard fetched into mesh_root/cache/ has no
         # manifest.json of its own, so this must never be re-derived from a
@@ -169,23 +198,30 @@ class MeshShardIterableDataset(IterableDataset):
                 continue
 
             try:
-                clip_entries = [
-                    (clip_key, entry)
+                # Built as a flat list (not the nested generator this
+                # replaces) because the shuffle below needs the full
+                # per-shard window set materialized first -- one shard's
+                # windows (~2k for the measured 260-shard corpus) is a
+                # trivial in-memory list, and this never buffers across
+                # shards so the bounded-disk eviction contract is untouched.
+                windows = [
+                    (clip_key, start)
                     for clip_key, entry in shard_index.items()
                     if entry["shard"] == shard_name
-                ]
-                for clip_key, entry in clip_entries:
                     for start in window_starts(
                         entry["num_frames"], self._num_frames, self._overlap
-                    ):
-                        idx = list(range(start, start + self._num_frames))
-                        frames = read_shard_frames_at(
-                            path, clip_key, idx, size=self._image_size
-                        )
-                        pixel_values = preprocess_window(
-                            frames, self._num_frames, self._image_size
-                        )
-                        yield pixel_values.squeeze(0)
+                    )
+                ]
+                rng.shuffle(windows)
+                for clip_key, start in windows:
+                    idx = list(range(start, start + self._num_frames))
+                    frames = read_shard_frames_at(
+                        path, clip_key, idx, size=self._image_size
+                    )
+                    pixel_values = preprocess_window(
+                        frames, self._num_frames, self._image_size
+                    )
+                    yield pixel_values.squeeze(0)
             finally:
                 evict_if_fetched(path, self._mesh_root)
 

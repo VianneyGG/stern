@@ -160,6 +160,64 @@ def test_run_full_check_escalates_stalled_job(tmp_path):
     assert result.action_taken is True
 
 
+def test_run_full_check_skips_remediation_for_mesh_job(tmp_path):
+    record = JobRecord(
+        "100",
+        "videomae_mesh_ssl",
+        "videomae_mesh_ssl-pool-fish",
+        "2026-07-15T09:00:00Z",
+        "node001",
+    )
+    state_dir, results_root = _setup(tmp_path, registry_records=[record])
+    state = WatcherState()
+
+    with (
+        patch("video_encoding.watcher.tick.collect_disk_usage_pct", return_value={}),
+        patch("video_encoding.watcher.tick.remediate_dead_job") as mock_remediate,
+        patch("video_encoding.watcher.tick.run_escalation") as mock_escalate,
+    ):
+        result = run_full_check(
+            repo_root=tmp_path,
+            state_dir=state_dir,
+            results_root=results_root,
+            now=2000.0,
+            state=state,
+            mesh_run_ids=frozenset({"videomae_mesh_ssl-pool-fish"}),
+        )
+
+    mock_remediate.assert_not_called()
+    mock_escalate.assert_not_called()
+    assert result.num_flags == 0
+    assert result.actions == []
+    assert "100" not in state.jobs
+
+
+def test_run_full_check_still_remediates_non_mesh_job_when_mesh_run_ids_present(
+    tmp_path,
+):
+    record = JobRecord("100", "exp_a", "tagA", "2026-07-15T09:00:00Z", "node001")
+    state_dir, results_root = _setup(tmp_path, registry_records=[record])
+    state = WatcherState()
+
+    with (
+        patch("video_encoding.watcher.tick.collect_disk_usage_pct", return_value={}),
+        patch(
+            "video_encoding.watcher.tick.remediate_dead_job", return_value="101"
+        ) as mock_remediate,
+    ):
+        result = run_full_check(
+            repo_root=tmp_path,
+            state_dir=state_dir,
+            results_root=results_root,
+            now=2000.0,
+            state=state,
+            mesh_run_ids=frozenset({"videomae_mesh_ssl-pool-fish"}),
+        )
+
+    mock_remediate.assert_called_once_with(record, repo_root=tmp_path)
+    assert "resubmit 100 -> 101" in result.actions[0]
+
+
 def test_run_full_check_respects_escalation_cooldown(tmp_path):
     record = JobRecord("100", "exp_a", "tagA", "2026-07-15T09:00:00Z", "node001")
     state_dir, results_root = _setup(tmp_path, registry_records=[record])

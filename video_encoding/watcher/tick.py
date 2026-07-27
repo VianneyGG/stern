@@ -42,14 +42,33 @@ def run_full_check(
     results_root: Path,
     now: float,
     state: WatcherState,
+    mesh_run_ids: frozenset[str] = frozenset(),
 ) -> TickResult:
     registry = load_registry(state_dir / "jobs_registry.json")
     squeue = load_squeue_snapshot(state_dir / "squeue.json")
     mtimes = result_json_mtimes(registry, results_root)
     registry_by_id = {r.slurm_job_id: r for r in registry}
 
-    dead_flags = detect_dead(registry, squeue, mtimes, state.jobs, now=now)
-    stalled_flags = detect_stalled(squeue, mtimes, registry, now=now)
+    # Mesh worker jobs are registered here too (mesh_tick._submit_worker_job
+    # shares this registry) but must never reach remediate_dead_job below --
+    # it hardcodes train.sbatch (the single-stage script), which crashes
+    # immediately against a mesh run_id/experiment. mesh_tick.py's own
+    # missed_rounds/_replenish_pool machinery already owns recovery for
+    # these nodes; skip them here entirely rather than double-handle.
+    def _is_mesh_job(subject: str) -> bool:
+        record = registry_by_id.get(subject)
+        return record is not None and record.run_tag in mesh_run_ids
+
+    dead_flags = [
+        f
+        for f in detect_dead(registry, squeue, mtimes, state.jobs, now=now)
+        if not _is_mesh_job(f.subject)
+    ]
+    stalled_flags = [
+        f
+        for f in detect_stalled(squeue, mtimes, registry, now=now)
+        if not _is_mesh_job(f.subject)
+    ]
     running_nodes = sorted(
         {
             info["nodelist"]

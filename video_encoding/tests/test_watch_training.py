@@ -127,6 +127,7 @@ def test_main_survives_mesh_advancement_exception(tmp_path, monkeypatch):
 
     assert rc == 0
     mock_full_check.assert_called_once()
+    assert mock_full_check.call_args.kwargs["mesh_run_ids"] == frozenset({"RUN1"})
     log_text = (state_dir / "watcher.log").read_text()
     assert "mesh advancement FAILED" in log_text
 

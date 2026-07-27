@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from video_encoding.scripts.run_outer_step import merge_round
+from video_encoding.scripts.run_outer_step import _load_worker_checkpoints, merge_round
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -188,6 +188,22 @@ def test_empty_pending_dir_raises(tmp_path):
             momentum=0.9,
             weighting="data",
         )
+
+
+def test_load_worker_checkpoints_upcasts_fp16_to_fp32(tmp_path):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    torch.save(
+        {
+            "model_state_dict": {"w": torch.ones(2, 2).half()},
+            "n_samples": 100,
+        },
+        pending_dir / "run1_a.pt",
+    )
+
+    checkpoints = _load_worker_checkpoints(pending_dir)
+
+    assert checkpoints["run1_a"]["model_state_dict"]["w"].dtype == torch.float32
 
 
 def test_inverse_loss_weighting_is_available_as_an_option(tmp_path):
