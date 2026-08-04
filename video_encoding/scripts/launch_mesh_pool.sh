@@ -5,8 +5,10 @@
 # (requires sinfo, and seed_mesh.py's --shard-map output must land on the
 # shared NFS home the workers actually read from).
 #
-# Usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds]
-#   [rounds]  number of DiLoCo merge rounds for the pool; default 25
+# Usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds] [outer_lr] [outer_momentum]
+#   [rounds]          number of DiLoCo merge rounds for the pool; default 25
+#   [outer_lr]         DiLoCo outer-optimizer LR; default 0.7 (literature)
+#   [outer_momentum]   DiLoCo outer-optimizer momentum; default 0.9 (literature)
 #
 # Does NOT rebuild the generic shard_map.json workers read by default
 # (run_mesh_worker.sh's MESH_SHARD_MAP fallback) -- run
@@ -14,9 +16,11 @@
 # combined, after all pools you're launching this round have registered.
 set -euo pipefail
 
-TIER="${1:?usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds]}"
-RUN_ID="${2:?usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds]}"
+TIER="${1:?usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds] [outer_lr] [outer_momentum]}"
+RUN_ID="${2:?usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds] [outer_lr] [outer_momentum]}"
 ROUNDS="${3:-25}"
+OUTER_LR="${4:-0.7}"
+OUTER_MOMENTUM="${5:-0.9}"
 
 TIER_FISH="node001,node002,node003,node004,node005,node006,node007,node008,node009,node010,node011,node012,node013,node014,node015,node016,node017,node018,node019,node020,node021,node022,node023"
 TIER_BIRDS="node024,node025,node026,node027,node028,node029,node030,node031,node032,node033,node034,node035,node036,node037,node038,node039,node040,node041,node042,node043,node044,node045,node046"
@@ -32,7 +36,11 @@ esac
 echo "launch_mesh_pool: checking watcher status..."
 if [[ -z "$(squeue --me -h 2>/dev/null)" ]]; then
   if ! crontab -l 2>/dev/null | grep -qF "watch_training"; then
-    if (crontab -l 2>/dev/null; echo "* * * * * cd ${HOME}/stern && ${HOME}/.local/bin/uv run python -m video_encoding.scripts.watch_training") | crontab -; then
+    # --no-sync: this fires once a minute and `uv sync` reinstalls into the
+    # NFS-hosted venv on every invocation (uv sync --dry-run reports an
+    # uninstall+install even against an up-to-date lockfile) -- ~1440
+    # redundant rewrites of a shared 9.4 GB venv per day without it.
+    if (crontab -l 2>/dev/null; echo "* * * * * cd ${HOME}/stern && ${HOME}/.local/bin/uv run --no-sync python -m video_encoding.scripts.watch_training") | crontab -; then
       echo "launch_mesh_pool: installed watcher cron entry (squeue --me was empty)"
     else
       echo "launch_mesh_pool: WARNING -- failed to install watcher cron entry, continuing anyway" >&2
@@ -65,8 +73,15 @@ done
 ACTIVE=("${READY[@]:0:16}")
 BACKUP=("${READY[@]:16:6}")
 ACTIVE_CSV=$(IFS=,; echo "${ACTIVE[*]}")
+READY_CSV=$(IFS=,; echo "${READY[*]}")
 echo "launch_mesh_pool: ${TIER} active=[${ACTIVE_CSV}]"
-echo "launch_mesh_pool: ${TIER} backup (left idle)=[$(IFS=,; echo "${BACKUP[*]}")]"
+echo "launch_mesh_pool: ${TIER} backup (seeded, not active)=[$(IFS=,; echo "${BACKUP[*]}")]"
+
+# All 22 (active + backup), one hostname per line -- lets the watcher
+# replenish a dead active node from a backup that already has a seeded
+# /Data/$USER/mesh payload, instead of the replacement dying on
+# read_my_shards' KeyError with an empty local shard dir.
+printf '%s\n' "${READY[@]}" > ".claude/state/mesh_pool_ready_${TIER}.txt"
 
 SOURCE_NODE="${ACTIVE[0]}"
 echo "launch_mesh_pool: reseeding ${SOURCE_NODE} from node089..."
@@ -74,45 +89,19 @@ ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "${SOURCE_NODE}" \
   "mkdir -p /Data/$USER/voxceleb2_shards && \
    rsync -az node089:/Data/$USER/voxceleb2_shards/ /Data/$USER/voxceleb2_shards/"
 
-echo "launch_mesh_pool: seeding mesh across ${TIER} pool..."
+echo "launch_mesh_pool: seeding mesh across ${TIER} pool (22 = 16 active + 6 backup)..."
 uv run python -m video_encoding.scripts.seed_mesh \
-  --nodes "${ACTIVE_CSV}" \
+  --nodes "${READY_CSV}" \
+  --active-nodes "${ACTIVE_CSV}" \
   --source-node "${SOURCE_NODE}" \
   --shards-dir /Data/$USER/voxceleb2_shards \
   --shard-map "${HOME}/stern_mesh/metadata/shard_map_${TIER}16.json" \
   --dataset-gb 223 \
   --replication 2
 
-echo "launch_mesh_pool: registering run config ${RUN_ID}..."
-python3 - "${RUN_ID}" "${ACTIVE_CSV}" "${ROUNDS}" <<'PYEOF'
-import json
-import sys
-from pathlib import Path
-
-run_id, active_csv, rounds = sys.argv[1], sys.argv[2], int(sys.argv[3])
-nodes = active_csv.split(",")
-
-path = Path(".claude/state/mesh_run_configs.json")
-cfgs = json.loads(path.read_text()) if path.exists() else []
-cfgs = [c for c in cfgs if c["run_id"] != run_id]
-cfgs.append(
-    {
-        "run_id": run_id,
-        "experiment": "videomae_mesh_ssl",
-        "nodes": nodes,
-        "n_shards": 260,
-        "outer_lr": 0.7,
-        "outer_momentum": 0.9,
-        "weighting": "data",
-        "rounds": rounds,
-        "merge": True,
-    }
-)
-tmp = path.with_suffix(path.suffix + ".tmp")
-tmp.write_text(json.dumps(cfgs, indent=2))
-tmp.replace(path)
-print(f"launch_mesh_pool: {run_id} registered with {len(nodes)} nodes")
-PYEOF
+echo "launch_mesh_pool: registering run config ${RUN_ID} (outer_lr=${OUTER_LR} outer_momentum=${OUTER_MOMENTUM})..."
+"$(dirname "${BASH_SOURCE[0]}")/register_mesh_run.sh" \
+  "${RUN_ID}" "${ACTIVE_CSV}" "${ROUNDS}" "${OUTER_LR}" "${OUTER_MOMENTUM}"
 
 echo "${ACTIVE_CSV}" > ".claude/state/mesh_pool_active_${TIER}.txt"
 echo "launch_mesh_pool: ${TIER} pool launched -- watcher cron will pick up ${RUN_ID} within a minute"

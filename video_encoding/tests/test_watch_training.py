@@ -132,6 +132,83 @@ def test_main_survives_mesh_advancement_exception(tmp_path, monkeypatch):
     assert "mesh advancement FAILED" in log_text
 
 
+def test_main_exempts_mesh_runs_no_longer_in_config_from_remediation(
+    tmp_path, monkeypatch
+):
+    """A mesh run that finished (or was dropped from mesh_run_configs.json)
+    still has dead worker jobs in jobs_registry.json. If the exemption set
+    only covers the live config, those jobs reach remediate_dead_job, which
+    hardcodes train.sbatch -- that is how 39 junk stern-train jobs appeared on
+    2026-07-27, queued ahead of the mesh workers _replenish_pool needed."""
+    import video_encoding.scripts.watch_training as watch_mod
+    from video_encoding.watcher.tick import TickResult
+
+    monkeypatch.setattr(watch_mod, "REPO_ROOT", tmp_path)
+    state_dir = tmp_path / ".claude" / "state"
+    monkeypatch.setattr(watch_mod, "STATE_DIR", state_dir)
+    monkeypatch.setattr(watch_mod, "RESULTS_DIR", tmp_path / ".claude" / "results")
+    monkeypatch.setattr(watch_mod, "LOG_PATH", state_dir / "watcher.log")
+    monkeypatch.setattr(watch_mod, "LOCK_PATH", state_dir / "watch_training.lock")
+
+    state_dir.mkdir(parents=True)
+    # LIVE is configured; FINISHED is not -- it survives only in state.runs,
+    # exactly like cand2a-8h / videomae_mesh_ssl-diloco-cand2b on the cluster.
+    (state_dir / "watcher_state.json").write_text(
+        json.dumps(
+            {
+                "next_full_check_at": 0.0,
+                "current_interval_s": 1800.0,
+                "jobs": {},
+                "escalation_day": None,
+                "escalation_count_today": 0,
+                "runs": {
+                    "FINISHED": {
+                        "run_id": "FINISHED",
+                        "round": 5,
+                        "status": "DONE",
+                        "missed_rounds": {},
+                        "target_pool_size": 16,
+                    }
+                },
+            }
+        )
+    )
+    (state_dir / "mesh_run_configs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "LIVE",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": ["node001"],
+                    "n_shards": 9,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+
+    with (
+        patch("video_encoding.scripts.watch_training.refresh_squeue_snapshot"),
+        patch(
+            "video_encoding.scripts.watch_training.advance_all_runs", return_value=[]
+        ),
+        patch(
+            "video_encoding.scripts.watch_training.run_full_check",
+            return_value=TickResult(num_flags=0, actions=[], action_taken=False),
+        ) as mock_full_check,
+    ):
+        rc = watch_mod.main()
+
+    assert rc == 0
+    assert mock_full_check.call_args.kwargs["mesh_run_ids"] == frozenset(
+        {"LIVE", "FINISHED"}
+    )
+
+
 def test_main_skips_when_lock_held(tmp_path, monkeypatch):
     import video_encoding.scripts.watch_training as watch_mod
 

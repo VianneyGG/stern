@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from video_encoding.mesh.shard_map import Holder, save_shard_map
@@ -18,6 +19,15 @@ from video_encoding.watcher.mesh_tick import (
     advance_one_run,
 )
 from video_encoding.watcher.state import WatcherState
+
+
+@pytest.fixture(autouse=True)
+def _local_merge_root(tmp_path_factory, monkeypatch):
+    """_do_merging writes the momentum/residual buffers to watcher-local
+    disk, which defaults to /Data -- unwritable here (and not somewhere a
+    test should be writing anyway)."""
+    monkeypatch.setenv("MESH_LOCAL_ROOT", str(tmp_path_factory.mktemp("mesh_local")))
+
 
 # All three fish-tier, equally weighted (SCORE_TABLE["fish"]=100) so a
 # 9-shard split lands exactly 3/3/3 with no rounding drift.
@@ -85,6 +95,7 @@ def test_assigning_writes_assignments_file_and_submits_jobs(tmp_path):
     assignments = json.loads(assignments_path.read_text())
     assert set(assignments.keys()) == set(_NODES)
     assert sum(len(v) for v in assignments.values()) == 9
+    assert state.run("RUN1").round_started_at == 1000.0
 
     # +run_tag must disambiguate the result-JSON filename
     # (tb_logger.result_json_filename) between mesh_tick-driven runs that
@@ -239,6 +250,65 @@ def test_awaiting_checkpoints_proceeds_on_timeout_with_partial_set(tmp_path):
     assert action is not None
 
 
+def test_running_is_a_noop_with_zero_checkpoints_before_timeout(tmp_path):
+    """No pending files at all yet is not itself a timeout condition for
+    RUNNING -- it just means no one has finished the round. That's the
+    _do_awaiting_checkpoints timeout's job once the round enters it."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+
+    run_config = _run_config()
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.status = "RUNNING"
+    run.round_started_at = 1000.0
+
+    action = advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=1500.0,  # 500s in, well under ROUND_TIMEOUT_S
+    )
+
+    assert state.run("RUN1").status == "RUNNING"
+    assert action is None
+
+
+def test_awaiting_checkpoints_times_out_when_zero_checkpoints_ever_arrive(tmp_path):
+    """Regression test: a pool that dies before a single node checks in for
+    the round used to make _round_elapsed_s return 0.0 forever (no pending
+    files -> no mtimes to measure from), so ROUND_TIMEOUT_S could never
+    trip and this state was a permanent stall. round_started_at gives it a
+    real elapsed time to measure against instead."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(
+        parents=True
+    )  # empty -- no one checked in
+
+    run_config = _run_config()
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.status = "AWAITING_CHECKPOINTS"
+    run.round_started_at = 1000.0
+
+    action = advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=1000.0 + 901.0,  # just past ROUND_TIMEOUT_S (900s)
+    )
+
+    assert state.run("RUN1").status == "MERGING"
+    assert state.run("RUN1").timeout_forced is True
+    for node in _NODES:
+        assert state.run("RUN1").missed_rounds.get(node) == 1
+    assert action is not None
+
+
 def test_merging_calls_run_outer_step_with_correct_args(tmp_path):
     mesh_shared = tmp_path / "mesh_shared"
     (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
@@ -271,12 +341,18 @@ def test_merging_calls_run_outer_step_with_correct_args(tmp_path):
     # raises FileNotFoundError on every tick and stalls the merge forever.
     assert Path(cmd[0]).is_absolute()
     assert Path(cmd[0]).name == "uv"
-    assert cmd[1:5] == [
+    # --no-sync: this cron runs once a minute and `uv sync` reinstalls into
+    # the 9.4 GB NFS-hosted venv unconditionally, even on an up-to-date lock.
+    assert cmd[1:6] == [
         "run",
+        "--no-sync",
         "python",
         "-m",
         "video_encoding.scripts.run_outer_step",
     ]
+    # pending/ is shared by every concurrent run -- an unscoped merge averages
+    # sibling runs and finished runs' leftovers into this run's master.
+    assert cmd[cmd.index("--run-id") + 1] == "RUN1"
     assert "--master" in cmd
     master_idx = cmd.index("--master")
     assert cmd[master_idx + 1] == str(
@@ -288,6 +364,149 @@ def test_merging_calls_run_outer_step_with_correct_args(tmp_path):
     assert cmd[outer_momentum_idx + 1] == "0.9"
     weighting_idx = cmd.index("--weighting")
     assert cmd[weighting_idx + 1] == "data"
+
+
+def test_merging_passes_metrics_out_pointing_at_results_mesh_run_id(tmp_path):
+    """0c: without --metrics-out, per-round merge data (contributor set,
+    alpha weights) exists only in this subprocess's stdout -- unworkable
+    across an 8-run sweep."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "MERGING"
+
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=repo_root,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    cmd = mock_run.call_args[0][0]
+    assert "--metrics-out" in cmd
+    metrics_out_idx = cmd.index("--metrics-out")
+    assert cmd[metrics_out_idx + 1] == str(
+        repo_root / ".claude" / "results" / "mesh" / "RUN1_rounds.jsonl"
+    )
+
+
+def test_merging_passes_timeout_forced_when_run_state_flag_is_set(tmp_path):
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "MERGING"
+    state.run("RUN1").timeout_forced = True
+
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert "--timeout-forced" in mock_run.call_args[0][0]
+
+
+def test_merging_omits_timeout_forced_on_the_normal_full_arrival_path(tmp_path):
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "MERGING"
+    assert state.run("RUN1").timeout_forced is False  # dataclass default
+
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert "--timeout-forced" not in mock_run.call_args[0][0]
+
+
+def test_awaiting_checkpoints_timeout_branch_sets_timeout_forced_flag(tmp_path):
+    """The forced-merge branch (partial quorum, ROUND_TIMEOUT_S elapsed) must
+    mark the round so _do_merging can tell run_outer_step.py this merge is
+    not a full check-in."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    old_mtime = 1000.0
+    for node in ("node001", "node002"):
+        path = pending_dir / f"RUN1_{node}.pt"
+        path.write_text("x")
+        os.utime(path, (old_mtime, old_mtime))
+
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "AWAITING_CHECKPOINTS"
+
+    advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=old_mtime + 4000.0,  # well past ROUND_TIMEOUT_S (3600s)
+    )
+
+    assert state.run("RUN1").status == "MERGING"
+    assert state.run("RUN1").timeout_forced is True
+
+
+def test_awaiting_checkpoints_full_arrival_clears_a_stale_timeout_forced_flag(
+    tmp_path,
+):
+    """A run that timeout-forced round N must not leak that flag into round
+    N+1's merge if round N+1 arrives in full."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    for node in _NODES:
+        (pending_dir / f"RUN1_{node}.pt").write_text("x")
+
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "AWAITING_CHECKPOINTS"
+    state.run("RUN1").timeout_forced = True  # left over from a prior round
+
+    advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=1000.0,
+    )
+
+    assert state.run("RUN1").status == "MERGING"
+    assert state.run("RUN1").timeout_forced is False
 
 
 def test_merging_bootstraps_master_from_pending_when_missing(tmp_path):
@@ -1000,6 +1219,137 @@ def test_replenish_pool_partial_fill_when_not_enough_idle(tmp_path):
     assert result is not None
 
 
+def test_replenish_pool_reassigns_shards_when_no_idle_nodes_available(tmp_path):
+    """Regression: assign_locality_first only runs once per run (at
+    ASSIGNING), so shard_assignments_RUN1.json is never regenerated later.
+    Previously, when select_idle_nodes found zero idle replacements,
+    _replenish_pool returned early *before* reaching the reassign_failed
+    call -- excluded_node's shards stayed assigned to a node that will
+    never train again, silently shrinking shard coverage for the rest of
+    the run. Reassignment to survivors must happen regardless of whether a
+    replacement node was found.
+    """
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config()  # node001, node002, node003 -- fish tier
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.target_pool_size = 3
+    exclude_node(state, "node003", "crash-loop")
+
+    shard_map = {
+        "s1": [Holder(host="node001", subnet="/254")],
+        "s2": [Holder(host="node002", subnet="/254")],
+        "s3": [Holder(host="node003", subnet="/254")],
+    }
+    save_shard_map(mesh_shared / "metadata" / "shard_map.json", shard_map)
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
+    assignments_path.write_text(
+        json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]})
+    )
+
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": list(_NODES),
+                    "n_shards": 3,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+
+    no_idle_sinfo = MagicMock(returncode=0, stdout="")  # nothing idle
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=no_idle_sinfo
+    ):
+        _replenish_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            "node003",
+        )
+
+    assignments = json.loads(assignments_path.read_text())
+    assert "node003" not in assignments
+    assert "s3" in assignments["node001"] + assignments["node002"]
+
+
+def test_replenish_pool_reassigns_shards_when_deficit_zero(tmp_path):
+    """Same root cause as the sibling test above, via the other early-return
+    path: when the roster already meets target_pool_size even after this
+    exclusion (e.g. a prior replenishment already grew it), _replenish_pool
+    returned None before ever reaching reassign_failed -- orphaning
+    excluded_node's shards despite there being no actual pool deficit to
+    excuse it.
+    """
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config(nodes=_NODES + ["node004"])  # 4 nodes
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.target_pool_size = 3  # 4 - 1 excluded = 3, meets target -> deficit 0
+    exclude_node(state, "node003", "crash-loop")
+
+    shard_map = {
+        "s1": [Holder(host="node001", subnet="/254")],
+        "s2": [Holder(host="node002", subnet="/254")],
+        "s3": [Holder(host="node003", subnet="/254")],
+    }
+    save_shard_map(mesh_shared / "metadata" / "shard_map.json", shard_map)
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
+    assignments_path.write_text(
+        json.dumps(
+            {"node001": ["s1"], "node002": ["s2"], "node003": ["s3"], "node004": []}
+        )
+    )
+
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": _NODES + ["node004"],
+                    "n_shards": 3,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+
+    _replenish_pool(
+        run_config,
+        run,
+        state,
+        mesh_shared,
+        tmp_path,
+        run_configs_path,
+        "node003",
+    )
+
+    assignments = json.loads(assignments_path.read_text())
+    assert "node003" not in assignments
+    assert (
+        "s3" in assignments["node001"] + assignments["node002"] + assignments["node004"]
+    )
+
+
 def test_advance_one_run_sets_target_pool_size_on_first_sight(tmp_path):
     run_config = _run_config()  # 3 nodes
     state = WatcherState()
@@ -1186,3 +1536,133 @@ def test_do_awaiting_checkpoints_does_not_double_pick_same_node_for_simultaneous
         if c[0][0][0] == "sbatch" and "--nodelist=node007" in c[0][0]
     ]
     assert len(node007_sbatch_calls) == 1
+
+
+def test_momentum_and_residual_live_off_nfs(tmp_path):
+    """Both buffers are read/written only by the watcher, so keeping them on
+    NFS cost 698 MiB of round-trip per round per pool for data no worker
+    ever opens."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+
+    run_config = _run_config(outer_lr=0.7, outer_momentum=0.9, weighting="data")
+    state = WatcherState()
+    state.run("RUN1").status = "MERGING"
+
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as m:
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    cmd = m.call_args[0][0]
+    momentum = Path(cmd[cmd.index("--momentum") + 1])
+    residual = Path(cmd[cmd.index("--residual") + 1])
+    assert mesh_shared not in momentum.parents
+    assert mesh_shared not in residual.parents
+    assert momentum.parent == residual.parent
+    # And the merge is told which round it is, so a vanished momentum buffer
+    # past round 0 is fatal rather than a silent degrade to plain averaging.
+    assert "--round" in cmd
+
+
+def test_done_run_sweeps_its_leftover_pending_checkpoints(tmp_path):
+    """A run whose final round timed out leaves late arrivals in pending/,
+    and nothing else collects them: _clean_stale_run_artifacts only fires on
+    run_id reuse. Observed in production as 15 stale checkpoints (2.6 GiB)
+    sitting where the next run's merge would have read them."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    (mesh_shared / "checkpoints" / "RUN1").mkdir(parents=True)
+
+    for node in _NODES:
+        _write_pending_checkpoint(pending_dir / f"RUN1_{node}.pt")
+    _write_pending_checkpoint(pending_dir / "OTHER_a.pt")
+
+    run_config = _run_config(
+        outer_lr=0.7, outer_momentum=0.9, weighting="data", rounds=1
+    )
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 0
+
+    with patch(
+        "video_encoding.watcher.mesh_tick._transfer_results_to_node089",
+        return_value="transfer skipped",
+    ):
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert state.run("RUN1").status == "DONE"
+    assert list(pending_dir.glob("RUN1_*.pt")) == []
+    # A sibling run's checkpoints must survive the sweep.
+    assert (pending_dir / "OTHER_a.pt").exists()
+
+
+def test_done_run_stages_local_momentum_back_for_the_node089_archive(tmp_path):
+    """The buffer moved off NFS for the per-round budget, but it was in every
+    previous archive and is part of a reproducible result -- so it comes back
+    exactly once, at DONE, before the transfer runs."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+    local_root = Path(os.environ["MESH_LOCAL_ROOT"]) / "RUN1"
+    local_root.mkdir(parents=True, exist_ok=True)
+    torch.save({"momentum_buf": {"w": torch.ones(2)}}, local_root / "outer_momentum.pt")
+
+    run_config = _run_config(
+        outer_lr=0.7, outer_momentum=0.9, weighting="data", rounds=1
+    )
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 0
+
+    seen: dict[str, bool] = {}
+
+    def _fake_transfer(rc, ms):
+        seen["momentum_present"] = (
+            ms / "checkpoints" / rc.run_id / "outer_momentum.pt"
+        ).exists()
+        return "transfer skipped"
+
+    with patch(
+        "video_encoding.watcher.mesh_tick._transfer_results_to_node089", _fake_transfer
+    ):
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert seen["momentum_present"] is True
+
+
+def test_watcher_cron_entry_uses_no_sync():
+    """This cron fires once a minute; `uv sync --dry-run` reports an
+    unconditional reinstall into the NFS-hosted venv even against an
+    up-to-date lockfile, so a bare `uv run` here is ~1440 rewrites/day."""
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "launch_mesh_pool.sh"
+    ).read_text()
+    cron_lines = [
+        ln for ln in script.splitlines() if "watch_training" in ln and "* * * * *" in ln
+    ]
+    assert cron_lines, "no watcher cron line found in launch_mesh_pool.sh"
+    for line in cron_lines:
+        assert "uv run --no-sync" in line

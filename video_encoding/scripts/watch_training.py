@@ -9,7 +9,12 @@ path, most ticks) or run a full check (detectors -> remediate/escalate ->
 backoff update -> one log line) once the adaptive backoff timer says it's due.
 
 Install: crontab -e on login-node ->
-  * * * * *  cd ~/stern && uv run python video_encoding/scripts/watch_training.py
+  * * * * *  cd ~/stern && uv run --no-sync python -m video_encoding.scripts.watch_training
+
+--no-sync is load-bearing, not tidiness: the project venv is on the NFS home
+and `uv sync --dry-run` reports an unconditional reinstall even against an
+up-to-date lockfile, so without it this cron rewrites a shared 9.4 GB venv
+1440 times a day.
 """
 
 from __future__ import annotations
@@ -87,13 +92,22 @@ def main() -> int:
     if now < state.next_full_check_at:
         return 0  # fast path -- not due yet
 
+    # Exempt every mesh run the watcher has EVER tracked, not just the
+    # currently-configured ones. state.runs is written only by mesh_tick, so
+    # its keys are exactly the set of mesh run_ids seen so far. A run that has
+    # finished (or was dropped from mesh_run_configs.json by hand) still leaves
+    # dead worker jobs in jobs_registry.json; scoping the exemption to the live
+    # config let those fall through to remediate_dead_job, which hardcodes
+    # train.sbatch and resubmitted 39 junk jobs on 2026-07-27. Those jobs then
+    # queue AHEAD of the mesh worker submissions _replenish_pool needs, so the
+    # leak also stalls recovery of the runs that are still going.
     result = run_full_check(
         repo_root=REPO_ROOT,
         state_dir=STATE_DIR,
         results_root=RESULTS_DIR,
         now=now,
         state=state,
-        mesh_run_ids=frozenset(c.run_id for c in run_configs),
+        mesh_run_ids=frozenset(c.run_id for c in run_configs) | frozenset(state.runs),
     )
     save_state(state_path, state)
     _log(

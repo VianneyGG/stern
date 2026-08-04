@@ -12,16 +12,15 @@ wheels/
 # Local bulk dataset downloads (TalkingCelebs, VoxMini, etc.) -- never commit raw video
 .data/
 
-# Model outputs
+# Hydra run dirs (hydra.job.chdir=false, so these are logs only, never inputs)
 outputs/
-docs/
 
 # Temporary files
 *.tmp
-cache/
 .pytest_cache/
 .ruff_cache/
 .superpowers/
+graphify-out/
 
 # IDEs
 .vscode/

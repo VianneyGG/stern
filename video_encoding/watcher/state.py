@@ -45,6 +45,17 @@ class RunState:
     # mesh_tick.advance_one_run to len(run_config.nodes) the first tick
     # this run is seen, so pool_deficit (epoch_advance.py) has a stable
     # baseline even after replenishment grows run_config.nodes later.
+    timeout_forced: bool = False  # set by _do_awaiting_checkpoints each time
+    # it decides AWAITING_CHECKPOINTS -> MERGING (both branches, so it never
+    # carries a stale value from a prior round); read by _do_merging to pass
+    # run_outer_step.py's --timeout-forced, recorded into the round metrics
+    # JSONL so a partial-quorum merge is distinguishable from a full one.
+    round_started_at: float = 0.0  # set to `now` every time status becomes
+    # RUNNING for a fresh round (_do_assigning, _do_syncing); _round_elapsed_s
+    # falls back to this when zero checkpoints have arrived yet, so the
+    # AWAITING_CHECKPOINTS timeout can still fire if the whole pool dies
+    # before checking in even once -- pending-checkpoint mtimes alone can't
+    # cover that case.
 
 
 @dataclass

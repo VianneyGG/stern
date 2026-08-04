@@ -136,9 +136,10 @@ def read_my_shards(assignments_path: Path, hostname: str) -> list[str]:
     `run_mesh_worker.sh` before the trainer starts.
 
     Raises `KeyError` naming the host, not a generic one, if `hostname` has no
-    entry: training on an empty/default shard list would silently produce a
-    meaningless checkpoint that still gets merged into the master, so an
-    unassigned host must fail loud instead of falling back to `[]`.
+    entry, OR if `hostname` maps to an empty list: training on an
+    empty/default shard list would silently produce a meaningless checkpoint
+    that still gets merged into the master, so an unassigned OR
+    zero-shard host must fail loud instead of falling back to `[]`.
     """
     payload = json.loads(Path(assignments_path).read_text())
     if hostname not in payload:
@@ -146,4 +147,11 @@ def read_my_shards(assignments_path: Path, hostname: str) -> list[str]:
             f"read_my_shards: host {hostname!r} has no entry in "
             f"{assignments_path} (assigned hosts: {sorted(payload)})"
         )
-    return payload[hostname]
+    shards = payload[hostname]
+    if not shards:
+        raise KeyError(
+            f"read_my_shards: host {hostname!r} has an empty shard list in "
+            f"{assignments_path} -- training on zero shards would silently "
+            "produce a meaningless checkpoint"
+        )
+    return shards

@@ -545,7 +545,12 @@ def test_run_mesh_pretrain_stage_warm_starts_round_zero_from_existing_master(
     monkeypatch.setattr(
         mesh_round,
         "push_checkpoint_and_wait",
-        lambda *args, **kwargs: None,
+        # Returns the per-round I/O stats the caller folds into its mesh_io log.
+        lambda *args, **kwargs: {
+            "pending_push_s": 0.0,
+            "pending_bytes": 0,
+            "flag_wait_s": 0.0,
+        },
     )
 
     run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
@@ -747,3 +752,130 @@ def test_scaled_lr_uses_local_batch_override_not_train_batch_size():
     assert lr_unmodified_callers == pytest.approx(1.5e-4 * 16 / 256.0)
     assert lr_mesh == pytest.approx(1.5e-4 * 1 / 256.0)
     assert lr_mesh != pytest.approx(lr_unmodified_callers)
+
+
+def test_push_checkpoint_and_wait_reports_push_and_barrier_time_separately(
+    tmp_path, monkeypatch
+):
+    """The two costs have to be distinguishable: only pending_push_s shrinks
+    when the payload shrinks, while flag_wait_s is barrier time that a
+    smaller payload cannot fix. Conflating them makes any NFS optimization
+    unfalsifiable."""
+    mesh_shared = tmp_path / "shared"
+    flag_dir = mesh_shared / "checkpoints" / "flags"
+    flag_dir.mkdir(parents=True)
+    (flag_dir / "sync_complete_run1_0.flag").touch()
+
+    monkeypatch.setattr(mesh_round.time, "sleep", lambda _s: None)
+
+    stats = push_checkpoint_and_wait(
+        {"model_state_dict": {"w": torch.ones(64, 64)}, "n_samples": 1},
+        mesh_shared=mesh_shared,
+        run_id="run1",
+        node="node001",
+        round_num=0,
+        merge=True,
+    )
+
+    assert set(stats) == {"pending_push_s", "pending_bytes", "flag_wait_s"}
+    assert stats["pending_bytes"] > 0
+    assert stats["pending_push_s"] >= 0.0
+    assert stats["flag_wait_s"] >= 0.0
+
+
+def test_push_checkpoint_and_wait_reports_bytes_when_not_merging(tmp_path):
+    mesh_shared = tmp_path / "shared"
+
+    stats = push_checkpoint_and_wait(
+        {"model_state_dict": {"w": torch.ones(32, 32)}, "n_samples": 1},
+        mesh_shared=mesh_shared,
+        run_id="run1",
+        node="node001",
+        round_num=0,
+        merge=False,
+    )
+
+    assert stats["pending_bytes"] > 0
+    assert stats["flag_wait_s"] == 0.0
+
+
+def test_run_mesh_pretrain_stage_writes_one_round_metrics_line(tmp_path, monkeypatch):
+    """0c: per-round loss otherwise exists only in worker stdout, scattered
+    across one SLURM job per node per run -- unworkable for an 8-run sweep."""
+    torch.manual_seed(0)
+    hostname = socket.gethostname().split(".", 1)[0]
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)  # exactly 1 window
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(tmp_path / "stern_checkpoints"))
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 1,
+                "steps_per_round": 1,
+                "merge": False,
+                "outer_lr": 0.7,
+                "outer_momentum": 0.9,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+    run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+
+    metrics_path = mesh_shared / "metrics" / "run1" / f"{hostname}.jsonl"
+    lines = metrics_path.read_text().splitlines()
+    assert len(lines) == 1
+
+    record = json.loads(lines[0])
+    assert record["run_id"] == "run1"
+    assert record["node"] == hostname
+    assert record["round"] == 1  # 1-based, matching the printed "round 1/1" line
+    assert record["n_shards"] == 1  # matches len(assignments[hostname])
+    assert math.isfinite(record["train_loss"])
+    # val_loss is nan here -- this fixture seeds no val shards (val_root
+    # never exists), same as every other run_mesh_pretrain_stage test in
+    # this file; only its presence/type is this test's concern.
+    assert isinstance(record["val_loss"], float)
+    assert record["samp_s"] >= 0.0
+    assert isinstance(record["ts"], float)
+
+
+def test_append_round_metrics_swallows_unwritable_metrics_dir(tmp_path):
+    """A failed metrics write must never kill a training round -- metrics are
+    diagnostic, not correctness-critical."""
+    mesh_shared = tmp_path / "mesh_shared"
+    mesh_shared.mkdir()
+    # A plain file where the metrics/<run_id> directory needs to go forces
+    # the mkdir inside _append_round_metrics to fail.
+    (mesh_shared / "metrics").write_text("not a directory")
+
+    mesh_round._append_round_metrics(
+        mesh_shared, "run1", "node001", 1, 0.5, 0.4, 12.0, 3
+    )  # must not raise
+
+    assert (mesh_shared / "metrics").is_file()  # untouched, still a plain file

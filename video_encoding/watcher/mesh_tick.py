@@ -18,6 +18,7 @@ covers them for free; this module only tracks round progress.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -58,6 +59,24 @@ from video_encoding.watcher.state import RunState, WatcherState
 # arrived (partial average)").
 ROUND_TIMEOUT_S = 900.0
 
+# Watcher-local scratch for merge state nobody but the watcher reads: the
+# Nesterov momentum buffer and the fp16 broadcast's error-feedback residual.
+# Both were on NFS, costing 698 MiB of read+write per round per pool for data
+# no worker ever opens. The watcher is pinned to one host (login-node's crontab),
+# so node-local disk is safe here -- and 26x faster (measured: 3.0 GB/s on
+# /Data vs 114 MB/s to the NFS home).
+#
+# The momentum buffer is still copied back to the run's NFS dir at DONE so
+# _transfer_results_to_node089 keeps archiving it; the residual is a pure
+# optimization and is deliberately not preserved.
+MESH_LOCAL_ROOT_DEFAULT = Path("/Data/$USER/stern_mesh_local")
+
+
+def _mesh_local_root() -> Path:
+    """Overridable via MESH_LOCAL_ROOT so tests and a relocated watcher don't
+    have to write to a hardcoded /Data path."""
+    return Path(os.environ.get("MESH_LOCAL_ROOT", MESH_LOCAL_ROOT_DEFAULT))
+
 
 @dataclass(frozen=True)
 class MeshRunConfig:
@@ -70,6 +89,11 @@ class MeshRunConfig:
     weighting: str  # "data" | "inverse_loss"
     rounds: int
     merge: bool = True  # False for the ab-single_node reference arm
+    # "fp32" (default) or "fp16" for the master.pt every worker reads back
+    # each round. fp16 halves the dominant per-round NFS term but doubles the
+    # quantization noise floor in the pseudo-gradient -- opt in per run, once
+    # measured. See run_outer_step.BROADCAST_DTYPE_CHOICES.
+    broadcast_dtype: str = "fp32"
 
 
 def load_run_configs(path: Path) -> list[MeshRunConfig]:
@@ -153,7 +177,7 @@ def advance_one_run(
     if run.target_pool_size == 0:
         run.target_pool_size = len(run_config.nodes)
     if run.status == "ASSIGNING":
-        return _do_assigning(run_config, run, state, repo_root, mesh_shared)
+        return _do_assigning(run_config, run, state, repo_root, mesh_shared, now)
     if run.status == "RUNNING":
         return _do_running(run_config, run, mesh_shared)
     if run.status == "AWAITING_CHECKPOINTS":
@@ -163,7 +187,7 @@ def advance_one_run(
     if run.status == "MERGING":
         return _do_merging(run_config, run, repo_root, mesh_shared)
     if run.status == "SYNCING":
-        return _do_syncing(run_config, run, mesh_shared)
+        return _do_syncing(run_config, run, mesh_shared, now)
     return None  # DONE, or an unrecognized status -- nothing to do
 
 
@@ -251,6 +275,7 @@ def _do_assigning(
     state: WatcherState,
     repo_root: Path,
     mesh_shared: Path,
+    now: float,
 ) -> str | None:
     eligible = eligible_nodes(state, run_config.nodes)
     if not eligible:
@@ -290,6 +315,7 @@ def _do_assigning(
         _submit_worker_job(run_config, node, repo_root, registry_path, submitted_at)
 
     run.status = "RUNNING"
+    run.round_started_at = now
     action = f"{run_config.run_id}: ASSIGNING -> RUNNING ({len(eligible)} nodes)"
     if deleted:
         action += f"; cleaned {len(deleted)} stale artifact(s) from a prior attempt"
@@ -320,17 +346,23 @@ def _do_running(
 # --- AWAITING_CHECKPOINTS ---------------------------------------------------
 
 
-def _round_elapsed_s(pending_dir: Path, run_id: str, now: float) -> float:
-    """Seconds since this round's earliest checkpoint arrived.
+def _round_elapsed_s(
+    pending_dir: Path, run_id: str, now: float, round_started_at: float
+) -> float:
+    """Seconds since this round's earliest checkpoint arrived, or since the
+    round started if none have arrived yet.
 
     pending/{run_id}_{node}.pt files are overwritten every round (see
     epoch_advance.pending_nodes' docstring), so their mtimes always reflect
-    only the current round's check-ins -- no separate round-start timestamp
-    needs to be persisted in WatcherState for this.
+    only the current round's check-ins. But if the whole pool dies before a
+    single node checks in, there are no files to read mtimes from at all --
+    falling back to `now - round_started_at` (RunState.round_started_at, set
+    whenever a round starts) is what lets the AWAITING_CHECKPOINTS timeout
+    still fire in that case, instead of reading a permanent 0.0.
     """
     files = list(pending_dir.glob(f"{run_id}_*.pt"))
     if not files:
-        return 0.0
+        return now - round_started_at
     return now - min(f.stat().st_mtime for f in files)
 
 
@@ -349,20 +381,24 @@ def _do_awaiting_checkpoints(
 
     if checked_in >= eligible:
         run.status = "MERGING"
+        run.timeout_forced = False
         return (
             f"{run_config.run_id}: AWAITING_CHECKPOINTS -> MERGING "
             f"({len(checked_in)} nodes)"
         )
 
-    if _round_elapsed_s(pending_dir, run_config.run_id, now) < ROUND_TIMEOUT_S:
+    if (
+        _round_elapsed_s(pending_dir, run_config.run_id, now, run.round_started_at)
+        < ROUND_TIMEOUT_S
+    ):
         return None  # still waiting, not timed out yet
 
     missing = sorted(eligible - checked_in)
-    # excluded here permanently loses its assigned shards for the rest of
-    # this run: ASSIGNING (and therefore assign_locality_first) only runs
-    # once per run now (see SYNCING -> RUNNING, not ASSIGNING, above), so
-    # there is no later round that redistributes an excluded node's shards
-    # to a survivor -- shard coverage silently shrinks for the remainder.
+    # ASSIGNING (and therefore assign_locality_first) only runs once per run
+    # now (see SYNCING -> RUNNING, not ASSIGNING, above), so _replenish_pool
+    # is the only place that redistributes an excluded node's shards to a
+    # survivor afterward -- it always does so, even when no replacement
+    # node is found, so shard coverage does not silently shrink.
     excluded = [
         node for node in missing if record_missed_round(state, run_config.run_id, node)
     ]
@@ -377,6 +413,7 @@ def _do_awaiting_checkpoints(
         is not None
     ]
     run.status = "MERGING"
+    run.timeout_forced = True
     excluded_note = f", permanently excluded {excluded}" if excluded else ""
     result = (
         f"{run_config.run_id}: AWAITING_CHECKPOINTS -> MERGING "
@@ -445,44 +482,57 @@ def _replenish_pool(
     feature existed -- see Task 5 call site). Tops the pool back up
     toward run.target_pool_size with idle same-tier nodes and hands
     them excluded_node's orphaned shards. Returns a status string
-    describing what happened, or None if there was nothing to do
-    (no deficit) or nothing that could be done (no run_configs_path,
-    no idle candidates)."""
-    if run_configs_path is None:
-        return None
+    describing what happened, or None if there was nothing to do at all
+    (no run_configs_path and no shard reassignment to make either).
 
-    roster = _live_roster(run_configs_path, run_config.run_id, run_config.nodes)
-    deficit = pool_deficit(run, roster, state)
-    if deficit <= 0:
-        return None
+    Shard reassignment (below) always runs when possible, independent of
+    whether a replacement node is found: assign_locality_first only runs
+    once per run (at ASSIGNING), so this is the only place that ever
+    updates shard_assignments_<run_id>.json again. Returning early before
+    reaching it -- as this function previously did whenever deficit <= 0
+    or no idle node was available -- left excluded_node's shards assigned
+    to a node that will never train again, silently shrinking shard
+    coverage for the rest of the run.
+    """
+    picked: list[str] = []
+    replenish_note: str | None = None
 
-    tier = NODE_GROUPS[roster[0]]
-    tier_roster = [h for h, g in NODE_GROUPS.items() if g == tier]
-    idle = query_idle_nodes()
-    candidates = candidate_replacements(
-        tier_roster, in_use=set(roster), excluded=set(state.excluded_nodes)
-    )
-    picked = select_idle_nodes(candidates, deficit, idle)
-    if not picked:
-        return (
-            f"{run_config.run_id}: replenish skipped -- no idle {tier} nodes "
-            f"available (deficit {deficit})"
-        )
+    if run_configs_path is not None:
+        roster = _live_roster(run_configs_path, run_config.run_id, run_config.nodes)
+        deficit = pool_deficit(run, roster, state)
+        if deficit > 0:
+            tier = NODE_GROUPS[roster[0]]
+            tier_roster = [h for h, g in NODE_GROUPS.items() if g == tier]
+            idle = query_idle_nodes()
+            candidates = candidate_replacements(
+                tier_roster, in_use=set(roster), excluded=set(state.excluded_nodes)
+            )
+            picked = select_idle_nodes(candidates, deficit, idle)
+            if picked:
+                _append_nodes_to_run_config(run_configs_path, run_config.run_id, picked)
 
-    _append_nodes_to_run_config(run_configs_path, run_config.run_id, picked)
+                registry_path = repo_root / ".claude" / "state" / "jobs_registry.json"
+                submitted_at = datetime.now(timezone.utc).isoformat()
+                for node in picked:
+                    _submit_worker_job(
+                        run_config,
+                        node,
+                        repo_root,
+                        registry_path,
+                        submitted_at,
+                        start_round=run.round + 1,
+                    )
+                replenish_note = (
+                    f"{run_config.run_id}: replenished with {picked} "
+                    f"(deficit was {deficit})"
+                )
+            else:
+                replenish_note = (
+                    f"{run_config.run_id}: replenish skipped -- no idle {tier} nodes "
+                    f"available (deficit {deficit})"
+                )
 
-    registry_path = repo_root / ".claude" / "state" / "jobs_registry.json"
-    submitted_at = datetime.now(timezone.utc).isoformat()
-    for node in picked:
-        _submit_worker_job(
-            run_config,
-            node,
-            repo_root,
-            registry_path,
-            submitted_at,
-            start_round=run.round + 1,
-        )
-
+    reassign_note = None
     shard_map_path = mesh_shared / "metadata" / "shard_map.json"
     assignments_path = (
         mesh_shared / "metadata" / f"shard_assignments_{run_config.run_id}.json"
@@ -495,8 +545,12 @@ def _replenish_pool(
                 assignments.setdefault(node, [])
             assignments = reassign_failed(excluded_node, assignments, placement)
             _write_json_atomic(assignments_path, assignments)
+            reassign_note = (
+                f"{run_config.run_id}: reassigned {excluded_node}'s shards to survivors"
+            )
 
-    return f"{run_config.run_id}: replenished with {picked} (deficit was {deficit})"
+    notes = [n for n in (replenish_note, reassign_note) if n]
+    return "; ".join(notes) if notes else None
 
 
 # --- MERGING -----------------------------------------------------------
@@ -552,30 +606,56 @@ def _do_merging(
 ) -> str | None:
     pending_dir = mesh_shared / "checkpoints" / "pending"
     master_path = mesh_shared / "checkpoints" / run_config.run_id / "master.pt"
-    momentum_path = (
-        mesh_shared / "checkpoints" / run_config.run_id / "outer_momentum.pt"
-    )
+    local_dir = _mesh_local_root() / run_config.run_id
+    momentum_path = local_dir / "outer_momentum.pt"
+    residual_path = local_dir / "broadcast_residual.pt"
+    local_dir.mkdir(parents=True, exist_ok=True)
     if not master_path.exists():
         _bootstrap_master(pending_dir, run_config.run_id, master_path)
     cmd = [
         _uv_bin(),
         "run",
+        # Without this, every merge re-syncs the 9.4 GB NFS-hosted venv
+        # before running -- `uv sync --dry-run` reports an unconditional
+        # reinstall even against an up-to-date lockfile, and this cron runs
+        # once a minute.
+        "--no-sync",
         "python",
         "-m",
         "video_encoding.scripts.run_outer_step",
         "--pending-dir",
         str(pending_dir),
+        # pending/ is one flat dir shared by every concurrent run; without
+        # this the merge averages sibling and already-finished runs in.
+        "--run-id",
+        run_config.run_id,
         "--master",
         str(master_path),
         "--momentum",
         str(momentum_path),
+        "--residual",
+        str(residual_path),
+        "--broadcast-dtype",
+        run_config.broadcast_dtype,
+        "--round",
+        str(run.round),
         "--outer-lr",
         str(run_config.outer_lr),
         "--outer-momentum",
         str(run_config.outer_momentum),
         "--weighting",
         run_config.weighting,
+        "--metrics-out",
+        str(
+            repo_root
+            / ".claude"
+            / "results"
+            / "mesh"
+            / f"{run_config.run_id}_rounds.jsonl"
+        ),
     ]
+    if run.timeout_forced:
+        cmd.append("--timeout-forced")
     try:
         result = subprocess.run(
             cmd, cwd=repo_root, capture_output=True, text=True, timeout=300
@@ -672,7 +752,48 @@ def _transfer_results_to_node089(run_config: MeshRunConfig, mesh_shared: Path) -
     )
 
 
-def _do_syncing(run_config: MeshRunConfig, run: RunState, mesh_shared: Path) -> str:
+def _sweep_pending_checkpoints(run_id: str, mesh_shared: Path) -> int:
+    """Delete this run's pending checkpoints once it reaches DONE.
+
+    MERGING already clears them after each successful merge, but a run that
+    finishes on a *timed-out* round leaves behind whatever arrived late, and
+    nothing else ever collects it: _clean_stale_run_artifacts only fires on
+    run_id *reuse*, so a new run_id never sweeps a dead one's leftovers.
+    Observed in production: 15 pool-birds-5r checkpoints (2.6 GiB against a
+    30 GiB quota) still in pending/ hours after that run went DONE, where
+    the next run's merge would have averaged them in.
+    """
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    swept = 0
+    for path in pending_dir.glob(f"{run_id}_*.pt"):
+        path.unlink(missing_ok=True)
+        swept += 1
+    return swept
+
+
+def _stage_local_merge_state_for_archive(
+    run_config: MeshRunConfig, mesh_shared: Path
+) -> None:
+    """Copy the watcher-local momentum buffer into the run's NFS dir so the
+    existing node089 transfer still archives it.
+
+    The buffer moved to local disk to keep it off the per-round NFS budget,
+    but it is part of a run's reproducible result (it was in every previous
+    archive) -- so it comes back exactly once, at DONE. The error-feedback
+    residual deliberately does not: it is a transient compression aid, not a
+    result.
+    """
+    momentum_path = _mesh_local_root() / run_config.run_id / "outer_momentum.pt"
+    if not momentum_path.exists():
+        return
+    dest_dir = mesh_shared / "checkpoints" / run_config.run_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(momentum_path, dest_dir / "outer_momentum.pt")
+
+
+def _do_syncing(
+    run_config: MeshRunConfig, run: RunState, mesh_shared: Path, now: float
+) -> str:
     flag_path = (
         mesh_shared
         / "checkpoints"
@@ -684,10 +805,13 @@ def _do_syncing(run_config: MeshRunConfig, run: RunState, mesh_shared: Path) -> 
 
     if run.round >= run_config.rounds:
         run.status = "DONE"
+        _stage_local_merge_state_for_archive(run_config, mesh_shared)
         transfer_note = _transfer_results_to_node089(run_config, mesh_shared)
+        swept = _sweep_pending_checkpoints(run_config.run_id, mesh_shared)
         return (
             f"{run_config.run_id}: SYNCING -> DONE "
-            f"(round {run.round}/{run_config.rounds}); {transfer_note}"
+            f"(round {run.round}/{run_config.rounds}); {transfer_note}; "
+            f"swept {swept} pending checkpoint(s)"
         )
     # Not ASSIGNING: Task 2's worker job is a single long-lived SLURM
     # allocation that loops over every round internally, polling this exact
@@ -700,6 +824,7 @@ def _do_syncing(run_config: MeshRunConfig, run: RunState, mesh_shared: Path) -> 
     # following round's checkpoints to land in pending/ (cleared by MERGING
     # on success) and re-enter AWAITING_CHECKPOINTS once they do.
     run.status = "RUNNING"
+    run.round_started_at = now
     return (
         f"{run_config.run_id}: SYNCING -> RUNNING "
         f"(round {run.round}/{run_config.rounds})"

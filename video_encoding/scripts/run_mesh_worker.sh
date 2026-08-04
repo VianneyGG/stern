@@ -66,4 +66,11 @@ export STERN_CHECKPOINT_ROOT="${STERN_CHECKPOINT_ROOT:-/Data/$USER/stern_checkpo
 mkdir -p "${STERN_CHECKPOINT_ROOT}"
 chmod 700 "${STERN_CHECKPOINT_ROOT}"
 
-uv run python -m video_encoding.training.pretrain experiment="${EXPERIMENT}" "$@"
+# --no-sync: the project venv lives on the NFS home (9.4 GB, ~53k files) and
+# `uv sync` reinstalls into it unconditionally -- `uv sync --dry-run` reports
+# an uninstall+install even against an up-to-date lockfile. Without this,
+# every worker in the pool re-downloads and rewrites the same package into
+# the same shared NFS venv at launch, all at once. The venv must already be
+# provisioned (launch_mesh_pool.sh runs `uv sync` once, from the login node).
+uv run --no-sync python -m video_encoding.training.pretrain \
+  experiment="${EXPERIMENT}" "$@"

@@ -21,7 +21,10 @@ rather than let some default weight quietly bias the merge.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +40,14 @@ from video_encoding.mesh.outer_step import (
 
 WEIGHTING_CHOICES = ("data", "inverse_loss")
 
+# Dtype master.pt is written in for workers to read back. "fp32" is the
+# historical behaviour and stays the default: switching to "fp16" halves the
+# dominant term in the per-round NFS budget but doubles the quantization
+# noise floor inside pseudo_gradient (the worker push is already fp16), and
+# that trade is model-dependent. Measure ||delta||/||w|| per tensor on a real
+# round before flipping it -- see _quantize_broadcast_with_error_feedback.
+BROADCAST_DTYPE_CHOICES = ("fp32", "fp16")
+
 
 def _to_fp32_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Upcasts every floating-point tensor to fp32, leaving any non-float
@@ -50,17 +61,35 @@ def _to_fp32_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.
     }
 
 
-def _load_worker_checkpoints(pending_dir: Path) -> dict[str, dict[str, Any]]:
-    """Load every `*.pt` in `pending_dir`, keyed by filename stem.
+def _load_worker_checkpoints(
+    pending_dir: Path, run_id: str
+) -> dict[str, dict[str, Any]]:
+    """Load this run's `{run_id}_*.pt` in `pending_dir`, keyed by filename stem.
+
+    `pending_dir` is ONE flat directory shared by every concurrent run
+    (mesh_tick.py's _do_merging builds `checkpoints/pending` with no
+    per-run subdirectory), and finished runs can leave their checkpoints
+    behind. Globbing `*.pt` here therefore averaged sibling runs -- and dead
+    runs' leftovers -- straight into this run's master. Every other glob in
+    mesh_tick.py (lines 331/519/594/748) is already `{run_id}_*.pt`; this
+    was the one path that was not, so the scoping is mandatory here rather
+    than a defaulted convenience.
+
+    The literal `_` between run_id and the node name is what keeps
+    "pool-fish" from matching "pool-fish-5r_..." -- the same delimiter
+    argument mesh_tick.py's _clean_stale_run_artifacts docstring makes.
 
     Validates the two keys every downstream computation needs regardless of
     weighting scheme (`model_state_dict`, `n_samples`) up front, so a
     malformed checkpoint fails before any merge math runs rather than
     surfacing as a confusing KeyError deep in `average_deltas`.
     """
-    files = sorted(pending_dir.glob("*.pt"))
+    files = sorted(pending_dir.glob(f"{run_id}_*.pt"))
     if not files:
-        raise ValueError(f"merge_round: no pending checkpoints found in {pending_dir}")
+        raise ValueError(
+            f"merge_round: no pending checkpoints found for run_id={run_id!r} "
+            f"in {pending_dir}"
+        )
 
     checkpoints: dict[str, dict[str, Any]] = {}
     for f in files:
@@ -90,9 +119,9 @@ def _inverse_loss_weights(checkpoints: dict[str, dict[str, Any]]) -> dict[str, f
                 "'val_loss', needed for weighting='inverse_loss'"
             )
         val_loss = float(ckpt["val_loss"])
-        if val_loss <= 0:
+        if not math.isfinite(val_loss) or val_loss <= 0:
             raise ValueError(
-                f"merge_round: non-positive val_loss for '{name}' ({val_loss}) "
+                f"merge_round: non-finite val_loss for '{name}' ({val_loss}) "
                 "-- cannot compute an inverse-loss weight"
             )
         inv[name] = 1.0 / val_loss
@@ -125,14 +154,110 @@ def _atomic_save(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _quantize_broadcast_with_error_feedback(
+    master_sd: StateDict, residual_path: Path | None
+) -> StateDict:
+    """Cast `master_sd` to fp16 for the NFS broadcast, carrying the rounding
+    residual across rounds.
+
+    Every worker reads master.pt once per round, so it is the only 16x-
+    amplified term in the round's NFS budget (measured: 349 MiB fp32 x 16
+    nodes = 5.4 GiB/round/pool, vs 174 MiB for the whole push direction,
+    which push_checkpoint_and_wait already casts to fp16). fp16 -- not bf16
+    -- because these are weights in roughly [-1, 1]: bf16 buys exponent
+    range nothing here needs and gives up 3 mantissa bits (rel. precision
+    ~3.9e-3 vs fp16's ~4.9e-4).
+
+    Plain casting biases every round in the same direction, and DiLoCo's
+    pseudo-gradient is a small difference of large numbers -- 30 rounds of
+    correlated rounding is exactly the regime where that accumulates. So
+    the residual `(x - fp16(x))` is persisted and added back next round,
+    making the compression unbiased over time (standard error feedback from
+    the gradient-compression literature).
+
+    `residual_path` lives on watcher-local disk, never NFS: it is a pure
+    optimization. If it is missing (first round, or a wiped /Data) this
+    degrades to a plain cast rather than failing -- unlike the momentum
+    buffer, losing it costs precision, not correctness.
+    """
+    residual: StateDict = {}
+    if residual_path is not None and residual_path.exists():
+        residual = torch.load(residual_path, map_location="cpu", weights_only=False)[
+            "residual"
+        ]
+
+    broadcast: StateDict = {}
+    new_residual: StateDict = {}
+    for key, value in master_sd.items():
+        if not torch.is_floating_point(value):
+            broadcast[key] = value
+            continue
+        compensated = value.float()
+        prior = residual.get(key)
+        # A shape change (model surgery mid-run) invalidates the residual
+        # for that tensor -- drop it rather than crashing the merge.
+        if prior is not None and prior.shape == compensated.shape:
+            compensated = compensated + prior.float()
+        quantized = compensated.half()
+        broadcast[key] = quantized
+        new_residual[key] = compensated - quantized.float()
+
+    if residual_path is not None:
+        _atomic_save(residual_path, {"residual": new_residual})
+
+    return broadcast
+
+
+def _append_merge_metrics(
+    metrics_out: Path,
+    *,
+    run_id: str,
+    round_num: int | None,
+    result: dict,
+    timeout_forced: bool,
+) -> None:
+    """Append one JSONL record for this merge round to `metrics_out`.
+
+    Mirrors mesh_round.py's worker-side per-round metrics: per-round merge
+    data (the contributor set, alpha weights) otherwise exists only in this
+    process's stdout -- unworkable to scrape across an 8-run sweep. A failed
+    write is logged and swallowed: metrics must never fail a merge that
+    otherwise succeeded.
+    """
+    record = {
+        "run_id": run_id,
+        "round": round_num,
+        "n_contributors": result["n_workers"],
+        "contributors": sorted(result["alphas"]),
+        "alphas": result["alphas"],
+        "timeout_forced": timeout_forced,
+        "ts": time.time(),
+    }
+    try:
+        metrics_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(metrics_out, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        print(
+            f"run_outer_step: WARNING failed to write metrics to {metrics_out} "
+            f"(run_id={run_id} round={round_num}): {exc}",
+            file=sys.stderr,
+        )
+
+
 def merge_round(
     pending_dir: Path,
     master_path: Path,
     momentum_path: Path,
     *,
+    run_id: str,
     lr: float,
     momentum: float,
     weighting: str = "data",
+    round_num: int | None = None,
+    allow_missing_momentum: bool = False,
+    broadcast_dtype: str = "fp32",
+    residual_path: Path | None = None,
 ) -> dict:
     """Run one DiLoCo outer-optimizer merge round.
 
@@ -146,11 +271,21 @@ def merge_round(
     master_path = Path(master_path)
     momentum_path = Path(momentum_path)
 
-    checkpoints = _load_worker_checkpoints(pending_dir)
+    if broadcast_dtype not in BROADCAST_DTYPE_CHOICES:
+        raise ValueError(
+            f"merge_round: unknown broadcast_dtype {broadcast_dtype!r}, expected "
+            f"one of {BROADCAST_DTYPE_CHOICES}"
+        )
+
+    checkpoints = _load_worker_checkpoints(pending_dir, run_id)
     alphas = _compute_alphas(checkpoints, weighting)
 
     master_payload = torch.load(master_path, map_location="cpu", weights_only=False)
-    master_sd: StateDict = master_payload["model_state_dict"]
+    # Upcast for the same reason worker checkpoints are upcast above: with
+    # broadcast_dtype="fp16" master.pt is itself stored fp16, and every
+    # pseudo-gradient/momentum operation below must run in fp32 regardless
+    # of what dtype the file happened to be written in.
+    master_sd: StateDict = _to_fp32_state_dict(master_payload["model_state_dict"])
 
     deltas = {
         name: pseudo_gradient(master_sd, ckpt["model_state_dict"])
@@ -164,6 +299,18 @@ def merge_round(
             momentum_path, map_location="cpu", weights_only=False
         )
         momentum_buf = momentum_payload["momentum_buf"]
+    elif round_num is not None and round_num > 0 and not allow_missing_momentum:
+        # The buffer now lives on watcher-local disk (/Data), which
+        # serve_shards.sh documents as shared world-writable scratch -- a
+        # sweep there can delete it mid-run. Silently continuing would
+        # degrade Nesterov to plain weighted averaging for the rest of the
+        # run and surface only as "DiLoCo underperforms", so past round 0
+        # this is fatal unless the caller opts out explicitly.
+        raise ValueError(
+            f"merge_round: no momentum buffer at {momentum_path} but round_num="
+            f"{round_num} > 0 -- refusing to silently degrade to plain weighted "
+            "averaging; pass allow_missing_momentum=True to override"
+        )
     else:
         # Expected only on round 1 -- warn loudly rather than silently
         # degrading to plain averaging, so a real bug elsewhere (e.g. the
@@ -179,7 +326,14 @@ def merge_round(
         master_sd, delta, momentum_buf, lr=lr, momentum=momentum
     )
 
-    _atomic_save(master_path, {"model_state_dict": new_master})
+    if broadcast_dtype == "fp16":
+        broadcast_sd = _quantize_broadcast_with_error_feedback(
+            new_master, residual_path
+        )
+    else:
+        broadcast_sd = new_master
+
+    _atomic_save(master_path, {"model_state_dict": broadcast_sd})
     _atomic_save(momentum_path, {"momentum_buf": new_buf})
 
     return {"n_workers": len(checkpoints), "alphas": alphas}
@@ -194,11 +348,54 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     parser.add_argument("--pending-dir", type=Path, required=True)
+    parser.add_argument(
+        "--run-id",
+        required=True,
+        help=(
+            "Only merge pending/{run-id}_*.pt. Required, not defaulted: "
+            "pending/ is shared by every concurrent run."
+        ),
+    )
     parser.add_argument("--master", type=Path, required=True)
     parser.add_argument("--momentum", type=Path, required=True)
     parser.add_argument("--outer-lr", type=float, default=0.7)
     parser.add_argument("--outer-momentum", type=float, default=0.9)
     parser.add_argument("--weighting", choices=WEIGHTING_CHOICES, default="data")
+    parser.add_argument(
+        "--round",
+        dest="round_num",
+        type=int,
+        default=None,
+        help="Round being merged; past round 0 a missing momentum buffer is fatal.",
+    )
+    parser.add_argument("--allow-missing-momentum", action="store_true")
+    parser.add_argument(
+        "--broadcast-dtype", choices=BROADCAST_DTYPE_CHOICES, default="fp32"
+    )
+    parser.add_argument(
+        "--residual",
+        type=Path,
+        default=None,
+        help="Watcher-local error-feedback buffer, used only with --broadcast-dtype fp16.",
+    )
+    parser.add_argument(
+        "--metrics-out",
+        type=Path,
+        default=None,
+        help=(
+            "Append one JSONL merge record to this path. Omit to skip "
+            "(back-compat, no file created)."
+        ),
+    )
+    parser.add_argument(
+        "--timeout-forced",
+        action="store_true",
+        help=(
+            "Set by the watcher's forced-merge branch when this round's "
+            "checkpoints were merged after ROUND_TIMEOUT_S rather than a "
+            "full check-in -- recorded verbatim into --metrics-out."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -206,13 +403,27 @@ def main(argv: list[str] | None = None) -> int:
             args.pending_dir,
             args.master,
             args.momentum,
+            run_id=args.run_id,
             lr=args.outer_lr,
             momentum=args.outer_momentum,
             weighting=args.weighting,
+            round_num=args.round_num,
+            allow_missing_momentum=args.allow_missing_momentum,
+            broadcast_dtype=args.broadcast_dtype,
+            residual_path=args.residual,
         )
     except ValueError as exc:
         print(f"run_outer_step: {exc}", file=sys.stderr)
         return 1
+
+    if args.metrics_out is not None:
+        _append_merge_metrics(
+            args.metrics_out,
+            run_id=args.run_id,
+            round_num=args.round_num,
+            result=result,
+            timeout_forced=args.timeout_forced,
+        )
 
     print(
         f"run_outer_step: merged {result['n_workers']} worker checkpoint(s) "

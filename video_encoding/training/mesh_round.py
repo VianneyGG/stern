@@ -24,6 +24,7 @@ Each round:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
@@ -85,6 +86,50 @@ def _fp16_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Ten
         k: (v.half() if torch.is_floating_point(v) else v)
         for k, v in state_dict.items()
     }
+
+
+def _append_round_metrics(
+    mesh_shared: Path,
+    run_id: str,
+    node: str,
+    round_1_based: int,
+    train_loss: float,
+    val_loss: float,
+    samp_s: float,
+    n_shards: int,
+) -> None:
+    """Append one JSONL record to mesh_shared/metrics/<run_id>/<node>.jsonl.
+
+    Per-round loss otherwise exists only in this process's stdout, scattered
+    across one SLURM job per node per run -- an 8-run sweep must not repeat
+    the bespoke multi-job log scraper that took to extract it last time. A
+    failed write is logged and swallowed: metrics are diagnostic, never a
+    reason to kill a training round.
+    """
+    record = {
+        "run_id": run_id,
+        "node": node,
+        "round": round_1_based,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+        "samp_s": samp_s,
+        "n_shards": n_shards,
+        "ts": time.time(),
+    }
+    metrics_path = mesh_shared / "metrics" / run_id / f"{node}.jsonl"
+    try:
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(metrics_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        logger.warning(
+            "_append_round_metrics: failed to write %s (run_id=%s round=%d) "
+            "-- continuing without it: %s",
+            metrics_path,
+            run_id,
+            round_1_based,
+            exc,
+        )
 
 
 def _resolve_subnet(hostname: str, cfg: DictConfig) -> str:
@@ -211,14 +256,26 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         # relaunch a resume (and a late joiner's first round a real join)
         # instead of silently overwriting the mesh average with a
         # fresh-init/stale model's contribution.
+        io_stats = {
+            "master_load_s": 0.0,
+            "master_bytes": 0,
+            "local_save_s": 0.0,
+            "pending_push_s": 0.0,
+            "pending_bytes": 0,
+            "flag_wait_s": 0.0,
+        }
+
         if merge:
             if master_path.exists():
+                _t0 = time.monotonic()
+                io_stats["master_bytes"] = master_path.stat().st_size
                 master_payload = torch.load(
                     master_path, map_location=device, weights_only=False
                 )
                 load_result = ckpt_io.unwrap(model).load_state_dict(
                     master_payload["model_state_dict"], strict=False
                 )
+                io_stats["master_load_s"] = time.monotonic() - _t0
                 if load_result.missing_keys or load_result.unexpected_keys:
                     # strict=False silently skips mismatched keys rather than
                     # raising -- without this check a key-name regression (e.g.
@@ -295,26 +352,62 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         payload["outer_momentum"] = outer_momentum
 
         local_path = checkpoint_root / f"{run_id}.pt"
+        _t0 = time.monotonic()
         ckpt_io.save(local_path, payload)
+        io_stats["local_save_s"] = time.monotonic() - _t0
 
         shared_payload = {
             k: v for k, v in payload.items() if k not in _SHARED_PAYLOAD_DROP_KEYS
         }
-        push_checkpoint_and_wait(
-            shared_payload,
-            mesh_shared=mesh_shared,
-            run_id=run_id,
-            node=node,
-            round_num=round_num,
-            merge=merge,
-            sync_timeout_s=sync_timeout_s,
+        io_stats.update(
+            push_checkpoint_and_wait(
+                shared_payload,
+                mesh_shared=mesh_shared,
+                run_id=run_id,
+                node=node,
+                round_num=round_num,
+                merge=merge,
+                sync_timeout_s=sync_timeout_s,
+            )
         )
+
+        # One structured line per round. The point is to separate real NFS
+        # transfer time from barrier time: only the former is what shrinking
+        # the payload can fix, and if flag_wait dominates then the whole
+        # byte-reduction premise is wrong and the round barrier is the thing
+        # to attack instead.
+        logger.info(
+            "mesh_io round=%d node=%s master_load_s=%.2f master_bytes=%d "
+            "local_save_s=%.2f pending_push_s=%.2f pending_bytes=%d "
+            "flag_wait_s=%.2f",
+            round_num,
+            node,
+            io_stats["master_load_s"],
+            io_stats["master_bytes"],
+            io_stats["local_save_s"],
+            io_stats["pending_push_s"],
+            io_stats["pending_bytes"],
+            io_stats["flag_wait_s"],
+        )
+        if writer is not None:
+            for key in ("master_load_s", "pending_push_s", "flag_wait_s"):
+                writer.add_scalar(f"round_io/{key}", io_stats[key], round_num)
 
         final_round = round_num
         print(
             f"mesh round {round_num + 1}/{rounds}  train_loss={train_stats['loss']:.4f}  "
             f"val_loss={val_loss:.4f}  {train_stats['samples_per_s_per_gpu']:.1f} samp/s",
             flush=True,
+        )
+        _append_round_metrics(
+            mesh_shared,
+            run_id,
+            node,
+            round_num + 1,
+            train_stats["loss"],
+            val_loss,
+            train_stats["samples_per_s_per_gpu"],
+            len(train_shard_names),
         )
 
     if writer is not None:
@@ -422,8 +515,13 @@ def push_checkpoint_and_wait(
     round_num: int,
     merge: bool,
     sync_timeout_s: float = 1800.0,
-) -> None:
+) -> dict[str, float]:
     """Push `payload` to the shared pending/ dir, then (if merging) wait.
+
+    Returns `{"pending_push_s", "pending_bytes", "flag_wait_s"}` for the
+    caller's per-round I/O log -- the push and the barrier wait are the two
+    costs that have to be told apart before any NFS optimization can be
+    judged, and they are only separable here.
 
     Writes to mesh_shared/checkpoints/pending/{run_id}_{node}.pt, with
     `model_state_dict` cast to fp16 (this shared copy only -- the caller's
@@ -443,10 +541,16 @@ def push_checkpoint_and_wait(
     pending_path.parent.mkdir(parents=True, exist_ok=True)
     shared_payload = dict(payload)
     shared_payload["model_state_dict"] = _fp16_state_dict(payload["model_state_dict"])
+    _t0 = time.monotonic()
     ckpt_io.save(pending_path, shared_payload)
+    stats = {
+        "pending_push_s": time.monotonic() - _t0,
+        "pending_bytes": pending_path.stat().st_size if pending_path.exists() else 0,
+        "flag_wait_s": 0.0,
+    }
 
     if not merge:
-        return
+        return stats
 
     flag_path = (
         mesh_shared
@@ -457,6 +561,7 @@ def push_checkpoint_and_wait(
     start = time.monotonic()
     while not flag_path.exists():
         elapsed = time.monotonic() - start
+        stats["flag_wait_s"] = elapsed
         if elapsed >= sync_timeout_s:
             logger.error(
                 "push_checkpoint_and_wait: timed out after %.0fs waiting for %s "
@@ -469,3 +574,6 @@ def push_checkpoint_and_wait(
             )
             sys.exit(1)
         time.sleep(_SYNC_POLL_INTERVAL_S)
+
+    stats["flag_wait_s"] = time.monotonic() - start
+    return stats

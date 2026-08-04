@@ -42,7 +42,17 @@ MESH_DIR = "/Data/$USER/mesh"
 
 # Shared-home quota constraint (25.6/30 GB used, ~15-20 GB freeable):
 # N x 172 MB (bf16 ViT-B checkpoint) + master + momentum buffer must fit.
+# This caps how many nodes may PUSH checkpoints to shared NFS concurrently
+# (--active-nodes below) -- it does not cap how many may hold a seeded
+# shard payload, since seeded shards live on node-local /Data, which is not
+# quota'd. That's MAX_SEEDED_NODES.
 MAX_MESH_NODES = 16
+
+# Nodes that may be seeded with a local shard payload: the 16 active nodes
+# plus 6 backup nodes the watcher promotes into --active-nodes on
+# replenishment. Without pre-seeding, a promoted backup has no
+# /Data/$USER/mesh payload and dies on read_my_shards' KeyError.
+MAX_SEEDED_NODES = 22
 
 # Tier node lists, copied verbatim from video_encoding/scripts/pick_nodes.sh.
 _TIER_FISH = "node001,node002,node003,node004,node005,node006,node007,node008,node009,node010,node011,node012,node013,node014,node015,node016,node017,node018,node019,node020,node021,node022,node023"
@@ -383,6 +393,17 @@ def main() -> int:
         help="hostname that already holds the full built shard set (train + val/)",
     )
     parser.add_argument(
+        "--active-nodes",
+        default=None,
+        help=(
+            "comma-separated subset of --nodes that will push checkpoints to "
+            "shared NFS this run (<= MAX_MESH_NODES). Defaults to all of "
+            "--nodes, matching prior behaviour for callers that never seed "
+            "backup nodes. Pass this when --nodes includes backup nodes that "
+            "should only hold a seeded local payload."
+        ),
+    )
+    parser.add_argument(
         "--shards-dir",
         required=True,
         help="remote directory on --source-node with shard-*.tar and a val/ subdir",
@@ -404,15 +425,36 @@ def main() -> int:
     args = parser.parse_args()
 
     hostnames = [h.strip() for h in args.nodes.split(",") if h.strip()]
+    active_nodes = (
+        [h.strip() for h in args.active_nodes.split(",") if h.strip()]
+        if args.active_nodes is not None
+        else hostnames
+    )
+    if not set(active_nodes) <= set(hostnames):
+        print(
+            "seed_mesh: --active-nodes must be a subset of --nodes -- "
+            f"extra: {sorted(set(active_nodes) - set(hostnames))}",
+            file=sys.stderr,
+        )
+        return 1
+    if len(active_nodes) > MAX_MESH_NODES:
+        print(
+            f"seed_mesh: {len(active_nodes)} --active-nodes exceeds "
+            f"MAX_MESH_NODES={MAX_MESH_NODES} (shared home quota: N x 172 MB "
+            "checkpoint + master + momentum buffer) -- reduce --active-nodes",
+            file=sys.stderr,
+        )
+        return 1
+
     nodes = probe_nodes(hostnames)
     if not nodes:
         print("seed_mesh: no reachable nodes among --nodes; aborting", file=sys.stderr)
         return 1
-    if len(nodes) > MAX_MESH_NODES:
+    if len(nodes) > MAX_SEEDED_NODES:
         print(
-            f"seed_mesh: {len(nodes)} reachable node(s) exceeds MAX_MESH_NODES="
-            f"{MAX_MESH_NODES} (shared home quota: N x 172 MB checkpoint + "
-            "master + momentum buffer) -- reduce --nodes",
+            f"seed_mesh: {len(nodes)} reachable node(s) exceeds MAX_SEEDED_NODES="
+            f"{MAX_SEEDED_NODES} (nodes that may hold a seeded local shard "
+            "payload) -- reduce --nodes",
             file=sys.stderr,
         )
         return 1

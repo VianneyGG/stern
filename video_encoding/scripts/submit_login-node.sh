@@ -68,7 +68,7 @@ echo "\${SBATCH_OUT}"
 # was ever submitted."
 JOB_ID=\$(echo "\${SBATCH_OUT}" | awk '/Submitted batch job/ {print \$NF}')
 if [ -n "\${JOB_ID}" ]; then
-  uv run python video_encoding/scripts/append_job_registry.py \
+  PYTHONPATH=. uv run python video_encoding/scripts/append_job_registry.py \
     --job-id "\${JOB_ID}" --experiment "${EXPERIMENT}" \
     --run-tag "${RUN_TAG}" --nodelist "\${NODELIST}"
 else

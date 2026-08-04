@@ -120,7 +120,32 @@ installed and are superseded by a single script:
 (docs/superpowers/specs/2026-07-15-slurm-training-watcher-design.md). Install
 on login-node via `crontab -e`:
 
-    * * * * *  cd ~/stern && uv run python video_encoding/scripts/watch_training.py
+    * * * * *  cd ~/stern && ~/.local/bin/uv run --no-sync python -m video_encoding.scripts.watch_training
+
+Three gotchas this line must keep, all already learned the hard way elsewhere
+in this codebase (`mesh_tick.py`'s `_do_merging`, `run_mesh_worker.sh`,
+`launch_mesh_pool.sh`, `submit_login-node.sh`, and `watch_training.py`'s own
+module docstring) but previously missing from -- or wrong in -- this doc,
+causing the same class of failure to recur across three separate incidents
+(2026-07-27, 2026-07-29 x2):
+- cron's minimal PATH does not include `~/.local/bin`, so a bare `uv` here
+  resolves fine when installed interactively but fails with `uv: command not
+  found` on every cron tick (silently, into `.claude/state/cron_stderr.log`).
+  Always use the absolute/`~` path to the `uv` binary itself.
+- `-m video_encoding.scripts.watch_training` is required, NOT a direct file
+  path (`python video_encoding/scripts/watch_training.py`). Python sets
+  `sys.path[0]` to the *script's own directory* when given a file path, but
+  to the current directory (repo root) when given `-m` -- and this project
+  has no editable install of `video_encoding` to compensate. The file-path
+  form fails with `ModuleNotFoundError: No module named 'video_encoding'`
+  every single tick, identically whether run from cron or an interactive
+  shell -- this is a Python invocation bug, not a `uv`/cron/NFS issue, and
+  no amount of PATH or `--no-sync` fiddling touches it.
+- Separately, without `--no-sync`, every tick re-resolves/reinstalls the
+  9.4GB NFS-hosted venv from the lockfile -- wasted work against a venv
+  shared with concurrent worker/merge processes, though not itself the
+  source of the `ModuleNotFoundError` above (that persists even with
+  `--no-sync` if the file-path form is used).
 
 State lives in `.claude/state/` (`jobs_registry.json`, `watcher_state.json`,
 `squeue.json`, `watcher.log`, `escalations/*.md`) — gitignored, inspect with

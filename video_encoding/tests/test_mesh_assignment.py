@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from video_encoding.mesh.assignment import assign_locality_first, reassign_failed
+import json
+
+import pytest
+
+from video_encoding.mesh.assignment import (
+    assign_locality_first,
+    read_my_shards,
+    reassign_failed,
+)
 
 SHARDS = [f"s{i}" for i in range(6)]
 
@@ -68,3 +76,29 @@ def test_reassign_falls_back_to_least_loaded_when_no_survivor_holds_it():
     assert "a" not in r
     holders = [h for h, shards in r.items() if "s0" in shards]
     assert len(holders) == 1
+
+
+def test_read_my_shards_raises_on_empty_list_for_present_host(tmp_path):
+    path = tmp_path / "shard_assignments_run.json"
+    path.write_text(json.dumps({"node040": []}))
+
+    with pytest.raises(KeyError, match="node040.*empty|empty.*node040"):
+        read_my_shards(path, "node040")
+
+
+def test_read_my_shards_raises_on_missing_host_unchanged(tmp_path):
+    """Existing missing-host behaviour must be unaffected by the empty-list
+    check -- a host absent from the assignments file is a different failure
+    mode from a host present with an empty list."""
+    path = tmp_path / "shard_assignments_run.json"
+    path.write_text(json.dumps({"node011": ["a.tar"]}))
+
+    with pytest.raises(KeyError, match="node040"):
+        read_my_shards(path, "node040")
+
+
+def test_read_my_shards_returns_shards_for_present_nonempty_host(tmp_path):
+    path = tmp_path / "shard_assignments_run.json"
+    path.write_text(json.dumps({"node011": ["a.tar"]}))
+
+    assert read_my_shards(path, "node011") == ["a.tar"]

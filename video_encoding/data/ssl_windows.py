@@ -17,7 +17,7 @@ from torch.utils.data import Dataset
 
 from video_encoding.data.frame_decoder import decode_frames, read_frames_at
 from video_encoding.data.loaders import SSLDataset
-from video_encoding.data.wds_frames import load_shard_index, read_shard_frames_at
+from video_encoding.data.wds_frames import load_shard_index, read_shard_frames_indexed
 from video_encoding.data.windows import window_starts
 from video_encoding.models.videomaev2.encoder import preprocess_window
 from video_encoding.data.windows import build_frame_windows
@@ -104,7 +104,7 @@ class SSLWindowDataset(Dataset):
         try:
             if isinstance(source, tuple):
                 shard_path, clip_key = source
-                frames = read_shard_frames_at(
+                frames = read_shard_frames_indexed(
                     shard_path, clip_key, idx, size=self._image_size
                 )
             elif source is not None:

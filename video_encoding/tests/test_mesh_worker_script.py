@@ -53,3 +53,14 @@ def test_worker_script_has_no_syntax_errors():
     )
 
     assert result.returncode == 0, result.stderr.decode()
+
+
+def test_worker_script_runs_uv_with_no_sync():
+    """The project venv is on the NFS home and `uv sync` reinstalls into it
+    unconditionally, so without --no-sync every worker in the pool rewrites
+    the same shared venv at launch, simultaneously."""
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_mesh_worker.sh"
+    ).read_text()
+    assert "uv run --no-sync" in script
+    assert "uv run python" not in script

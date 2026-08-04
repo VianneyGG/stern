@@ -6,6 +6,7 @@ from video_encoding.mesh.scoring import NodeInfo
 from video_encoding.mesh.shard_map import Holder
 from video_encoding.scripts.seed_mesh import (
     MAX_MESH_NODES,
+    MAX_SEEDED_NODES,
     NODE_GROUPS,
     _execute_rsync_pull,
     _remote_file_exists,
@@ -158,9 +159,11 @@ def test_remote_file_exists_returns_false_when_test_dash_f_fails():
         assert not _remote_file_exists("node001", "/nonexistent/manifest.json")
 
 
-def test_main_rejects_more_reachable_nodes_than_the_quota_allows(monkeypatch, capsys):
+def test_main_rejects_more_reachable_nodes_than_the_seeded_quota_allows(
+    monkeypatch, capsys
+):
     fake_nodes = [
-        NodeInfo(f"n{i}", "fish", "/254", 500.0) for i in range(MAX_MESH_NODES + 1)
+        NodeInfo(f"n{i}", "fish", "/254", 500.0) for i in range(MAX_SEEDED_NODES + 1)
     ]
     monkeypatch.setattr(
         "video_encoding.scripts.seed_mesh.probe_nodes", lambda hostnames: fake_nodes
@@ -171,6 +174,45 @@ def test_main_rejects_more_reachable_nodes_than_the_quota_allows(monkeypatch, ca
             "seed_mesh.py",
             "--nodes",
             ",".join(n.hostname for n in fake_nodes),
+            # Stay within MAX_MESH_NODES so this test isolates the
+            # MAX_SEEDED_NODES check (--nodes count) from the separate
+            # MAX_MESH_NODES check (--active-nodes count).
+            "--active-nodes",
+            ",".join(n.hostname for n in fake_nodes[:MAX_MESH_NODES]),
+            "--source-node",
+            "n0",
+            "--shards-dir",
+            "/Data/$USER/shards",
+            "--shard-map",
+            "/tmp/shard_map.json",
+            "--dataset-gb",
+            "100",
+        ],
+    )
+
+    assert main() == 1
+    assert "MAX_SEEDED_NODES" in capsys.readouterr().err
+
+
+def test_main_rejects_too_many_active_nodes_even_within_seeded_quota(
+    monkeypatch, capsys
+):
+    """22 --nodes (within MAX_SEEDED_NODES) but >16 --active-nodes must still
+    be rejected -- --active-nodes is the one that maps to the NFS pusher
+    quota MAX_MESH_NODES guards."""
+    node_names = [f"n{i}" for i in range(MAX_SEEDED_NODES)]
+    monkeypatch.setattr(
+        "video_encoding.scripts.seed_mesh.probe_nodes",
+        lambda hostnames: [NodeInfo(h, "fish", "/254", 500.0) for h in hostnames],
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "seed_mesh.py",
+            "--nodes",
+            ",".join(node_names),
+            "--active-nodes",
+            ",".join(node_names[: MAX_MESH_NODES + 1]),
             "--source-node",
             "n0",
             "--shards-dir",
@@ -184,6 +226,30 @@ def test_main_rejects_more_reachable_nodes_than_the_quota_allows(monkeypatch, ca
 
     assert main() == 1
     assert "MAX_MESH_NODES" in capsys.readouterr().err
+
+
+def test_main_rejects_active_nodes_not_a_subset_of_nodes(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "seed_mesh.py",
+            "--nodes",
+            "n0,n1",
+            "--active-nodes",
+            "n0,n2",
+            "--source-node",
+            "n0",
+            "--shards-dir",
+            "/Data/$USER/shards",
+            "--shard-map",
+            "/tmp/shard_map.json",
+            "--dataset-gb",
+            "100",
+        ],
+    )
+
+    assert main() == 1
+    assert "subset" in capsys.readouterr().err
 
 
 def _base_argv(tmp_path, nodes: list[str], source_node: str) -> list[str]:

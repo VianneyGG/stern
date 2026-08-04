@@ -55,12 +55,17 @@ export MASTER_PORT="$((15000 + SLURM_JOB_ID % 5000))"
 export STERN_CHECKPOINT_ROOT="${STERN_CHECKPOINT_ROOT:-/Data/$USER/stern_checkpoints}"
 
 # VoxCeleb2 SSL data. Staged node-locally under /Data on the fish nodes
-# (node001/node002/node003/node004) as 100 balanced WDS shards
-# (video_encoding/scripts/build_wds_shards.py + distribute_shards.sh). The
-# job MUST be pinned to a data node (see submit_login-node.sh's FIXED_NODELIST).
+# (node001/node002/node003/node004, plus node023 for single-node traditional
+# training) as balanced WDS shards (video_encoding/scripts/build_wds_shards.py
+# + distribute_shards.sh). The job MUST be pinned to a data node (see
+# submit_login-node.sh's FIXED_NODELIST).
 export VOXMINI_PRESENT="${VOXMINI_PRESENT:-true}"
 export VOXMINI_ROOT="${VOXMINI_ROOT:-/Data/$USER/voxceleb2}"
 export VOXMINI_SHARDS_ROOT="${VOXMINI_SHARDS_ROOT:-/Data/$USER/voxceleb2_shards}"
+# Expected shard count -- override if a node stages a different-sized subset
+# (the full corpus, staged 2026-07-17, is 260 shards; the original 218h
+# voxmini subset was 100).
+export VOXMINI_N_SHARDS="${VOXMINI_N_SHARDS:-260}"
 
 # Fail fast if this node doesn't actually have the shard set, instead of
 # relying on a deep-dataloader FileNotFoundError plus the 30-min NCCL
@@ -68,8 +73,8 @@ export VOXMINI_SHARDS_ROOT="${VOXMINI_SHARDS_ROOT:-/Data/$USER/voxceleb2_shards}
 # comment documents that exact 48-min-hang failure mode for a similar gap).
 if [[ "${VOXMINI_PRESENT}" == "true" ]]; then
   n_shards=$(find "${VOXMINI_SHARDS_ROOT}" -maxdepth 1 -name 'shard-*.tar' 2>/dev/null | wc -l)
-  if [[ ! -f "${VOXMINI_SHARDS_ROOT}/manifest.json" || "${n_shards}" -ne 100 ]]; then
-    echo "ERROR: VOXMINI_SHARDS_ROOT=${VOXMINI_SHARDS_ROOT} on $(hostname) has ${n_shards}/100 shards" \
+  if [[ ! -f "${VOXMINI_SHARDS_ROOT}/manifest.json" || "${n_shards}" -ne "${VOXMINI_N_SHARDS}" ]]; then
+    echo "ERROR: VOXMINI_SHARDS_ROOT=${VOXMINI_SHARDS_ROOT} on $(hostname) has ${n_shards}/${VOXMINI_N_SHARDS} shards" \
          "or is missing manifest.json -- run build_wds_shards.py + distribute_shards.sh before submitting." >&2
     exit 1
   fi
