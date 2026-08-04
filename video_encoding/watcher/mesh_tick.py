@@ -34,7 +34,7 @@ from video_encoding.mesh.scoring import (
     compute_shard_counts,
 )
 from video_encoding.mesh.shard_map import Holder, load_shard_map
-from video_encoding.scripts.seed_mesh import NODE_GROUPS, NODE_SUBNETS
+from video_encoding.mesh.topology import NODE_GROUPS, NODE_SUBNETS
 from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.watcher.cluster import query_idle_nodes
 from video_encoding.watcher.epoch_advance import (

@@ -44,7 +44,7 @@ from video_encoding.models.videomaev2.masking import (
     MotionGuidedTubeMasking,
     RandomTubeMasking,
 )
-from video_encoding.scripts.seed_mesh import NODE_SUBNETS
+from video_encoding.mesh.topology import NODE_SUBNETS
 from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.compile_utils import maybe_compile
 from video_encoding.training.pretrain import _scaled_lr, _train_epoch_ssl
@@ -137,7 +137,7 @@ def _resolve_subnet(hostname: str, cfg: DictConfig) -> str:
     preference (cross-switch uplink caps at ~0.94 Gbps total vs. a
     non-blocking intra-switch backplane -- shard_map.py's docstring).
 
-    NODE_SUBNETS (seed_mesh.py) is the same hostname->subnet mapping the
+    NODE_SUBNETS (mesh/topology.py) is the same hostname->subnet mapping the
     rest of the mesh design is keyed on (fish=/254, birds=/253, cars=/252,
     countries=/254, orchids=/253) -- a single yaml-wide constant would
     misreport every birds/cars/orchids node as fish's "/254", silently

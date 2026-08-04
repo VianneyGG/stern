@@ -30,13 +30,10 @@ set -euo pipefail
 
 N="${1:?usage: pick_nodes.sh <N>}"
 
-# Tier node lists — derived from T1.7 GPU ramp (T2 confirmed /254 and /253 subnets).
-# River/department nodes (ain, allier, ardennes…) are omitted: GPU type unconfirmed.
-TIER_FISH="node001,node002,node003,node004,node005,node006,node007,node008,node009,node010,node011,node012,node013,node014,node015,node016,node017,node018,node019,node020,node021,node022,node023"
-TIER_BIRDS="node024,node025,node026,node027,node028,node029,node030,node031,node032,node033,node034,node035,node036,node037,node038,node039,node040,node041,node042,node043,node044,node045,node046"
-TIER_CARS="node047,node048,node049,node050,node051,node052,node053,node054,node055,node056,node057,node058,node059,node060,node061,node062,node063,node064,node065,node066,node067,node068,node069"
-TIER_COUNTRIES="node070,node071,node072,node073,node074,node075,node076,node077,node078,node079,node080,node081,node082,node083,node084,node085,node086,node087,node088"
-TIER_ORCHIDS="node089,node090,node091,node092,node093,node094,node095,node096,node097,node098,node099,node100,node101,node102,node103,node104,node105,node106,node107,node108,node109,node110,node111,node112,node113"
+# Tier node lists come from video_encoding/mesh/tiers.tsv via tiers_lib.sh, which
+# also fixes the preference order below. That file records why the river/department
+# nodes (ain, allier, ardennes…) are absent: GPU type unconfirmed.
+source "$(dirname "${BASH_SOURCE[0]}")/tiers_lib.sh"
 
 # Snapshot idle nodes once (avoids repeated sinfo calls per tier).
 IDLE=$(sinfo -N -o "%N %T" --state=idle 2>/dev/null | awk '$2=="idle"{print $1}' | sort)
@@ -64,30 +61,23 @@ pick_from_tier() {
     return 1
 }
 
-for tier_name_nodes in \
-    "fish:${TIER_FISH}" \
-    "birds:${TIER_BIRDS}" \
-    "cars:${TIER_CARS}" \
-    "countries:${TIER_COUNTRIES}" \
-    "orchids:${TIER_ORCHIDS}"
-do
-    tier_name="${tier_name_nodes%%:*}"
-    tier_nodes="${tier_name_nodes#*:}"
+while read -r tier_name; do
+    tier_hosts="$(tier_nodes "$tier_name")"
 
-    if nodelist=$(pick_from_tier "$tier_nodes" "$N"); then
+    if nodelist=$(pick_from_tier "$tier_hosts" "$N"); then
         echo "# pick_nodes: selected tier=${tier_name} N=${N}" >&2
         echo "$nodelist"
         exit 0
     else
         # Count available in this tier for the diagnostic message.
         available=0
-        IFS=',' read -ra nodes <<< "$tier_nodes"
+        IFS=',' read -ra nodes <<< "$tier_hosts"
         for node in "${nodes[@]}"; do
             echo "$IDLE" | grep -qx "$node" && ((available++)) || true
         done
         echo "# pick_nodes: tier=${tier_name} has ${available}/${N} idle — skipping" >&2
     fi
-done
+done < <(all_tiers)
 
 echo "ERROR: no tier has ${N} idle nodes available. Run 'sinfo -N -o \"%N %T\" --state=idle' to inspect." >&2
 exit 1

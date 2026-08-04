@@ -19,11 +19,11 @@ fish cluster:
    routes through the submitting laptop, matching the existing
    `distribute_shards.sh` precedent.
 
-`NODE_GROUPS` / `NODE_SUBNETS` are copied verbatim from the tier rosters in
-`video_encoding/scripts/pick_nodes.sh` (the SLURM node-picker) -- `bones`
-and `rivers` are deliberately absent because they are absent there too
-(`bones` was never listed; `rivers` was excluded pending GPU-type
-confirmation). Do not add them without updating `pick_nodes.sh` first.
+`NODE_GROUPS` / `NODE_SUBNETS` come from `video_encoding/mesh/topology.py`,
+which reads `video_encoding/mesh/tiers.tsv` -- the single source of truth,
+also read directly by `pick_nodes.sh`, `clean_tier_data.sh` and
+`launch_mesh_pool.sh`. Add a node there and every consumer sees it; there is
+no longer a second roster to keep in sync.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from pathlib import Path
 from video_encoding.mesh.placement import InsufficientCapacityError, plan_placement
 from video_encoding.mesh.scoring import NodeInfo
 from video_encoding.mesh.shard_map import Holder, save_shard_map
+from video_encoding.mesh.topology import NODE_GROUPS, NODE_SUBNETS
 
 MESH_DIR = "/Data/$USER/mesh"
 
@@ -54,31 +55,9 @@ MAX_MESH_NODES = 16
 # /Data/$USER/mesh payload and dies on read_my_shards' KeyError.
 MAX_SEEDED_NODES = 22
 
-# Tier node lists, copied verbatim from video_encoding/scripts/pick_nodes.sh.
-_TIER_FISH = "node001,node002,node003,node004,node005,node006,node007,node008,node009,node010,node011,node012,node013,node014,node015,node016,node017,node018,node019,node020,node021,node022,node023"
-_TIER_BIRDS = "node024,node025,node026,node027,node028,node029,node030,node031,node032,node033,node034,node035,node036,node037,node038,node039,node040,node041,node042,node043,node044,node045,node046"
-_TIER_CARS = "node047,node048,node049,node050,node051,node052,node053,node054,node055,node056,node057,node058,node059,node060,node061,node062,node063,node064,node065,node066,node067,node068,node069"
-_TIER_COUNTRIES = "node070,node071,node072,node073,node074,node075,node076,node077,node078,node079,node080,node081,node082,node083,node084,node085,node086,node087,node088"
-_TIER_ORCHIDS = "node089,node090,node091,node092,node093,node094,node095,node096,node097,node098,node099,node100,node101,node102,node103,node104,node105,node106,node107,node108,node109,node110,node111,node112,node113"
-
-# (group, csv nodelist, subnet) -- subnets per pick_nodes.sh's tier comment:
-# fish=/254, birds=/253, cars=/252, countries=/254 (shares with fish),
-# orchids=/253 (shares with birds).
-_TIERS = (
-    ("fish", _TIER_FISH, "/254"),
-    ("birds", _TIER_BIRDS, "/253"),
-    ("cars", _TIER_CARS, "/252"),
-    ("countries", _TIER_COUNTRIES, "/254"),
-    ("orchids", _TIER_ORCHIDS, "/253"),
-)
-
-NODE_GROUPS: dict[str, str] = {}
-NODE_SUBNETS: dict[str, str] = {}
-for _group, _csv, _subnet in _TIERS:
-    for _host in _csv.split(","):
-        NODE_GROUPS[_host] = _group
-        NODE_SUBNETS[_host] = _subnet
-del _group, _csv, _subnet, _host
+# Re-exported for the callers that historically imported the roster from this
+# script. The roster itself now lives in video_encoding/mesh/tiers.tsv.
+__all__ = ["NODE_GROUPS", "NODE_SUBNETS", "MAX_MESH_NODES", "MAX_SEEDED_NODES"]
 
 _DF_COMMAND = "df -BG /Data | awk 'NR==2{print $2, $4}'"
 _VAL_SUBDIR = "val"
