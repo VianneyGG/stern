@@ -20,7 +20,7 @@ from typing import Any
 
 import torch
 
-from video_encoding.training.ddp import _get
+from video_encoding.training.ddp.ddp import _get
 
 
 def result_json_filename(experiment_name: str, run_tag: str | None) -> str:

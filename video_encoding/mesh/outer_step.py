@@ -25,9 +25,23 @@ specific equivalence breaks while every other test here still passes.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 StateDict = dict[str, torch.Tensor]
+
+
+def to_fp32_state_dict(state_dict: StateDict) -> StateDict:
+    """Upcasts every floating-point tensor to fp32, leaving non-float
+    buffers untouched. Both the merge side (a pending checkpoint or master.pt
+    may arrive fp16) and the worker side (Phase 3.2: the master snapshot a
+    pseudo-gradient push diffs against) need this before any delta/momentum
+    arithmetic -- a no-op if the input already arrives in fp32."""
+    return {
+        k: (v.float() if torch.is_floating_point(v) else v)
+        for k, v in state_dict.items()
+    }
 
 
 def data_weights(n_samples: dict[str, int]) -> dict[str, float]:
@@ -70,6 +84,38 @@ def average_deltas(deltas: dict[str, StateDict], alphas: dict[str, float]) -> St
         for key, tensor in deltas[name].items():
             acc[key] += alpha * tensor.to(torch.float32)
     return acc
+
+
+def filter_stale_deltas(
+    checkpoints: dict[str, dict[str, Any]], current_master_version: int | None
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Drops any checkpoint whose `master_version` doesn't match
+    `current_master_version` -- a pseudo-gradient (Phase 3.2) computed
+    against a master that's no longer current must not be silently applied
+    to the wrong one via nesterov_outer_step.
+
+    Skips the check (keeps everything) when `current_master_version` is
+    None: an unversioned master predates Phase 3.2, and rejecting every
+    checkpoint on that basis would stall a mesh mid-upgrade rather than
+    merging it plain. A checkpoint with no `master_version` key at all
+    pushed full weights (round 0, or a pre-3.2 worker) rather than a delta
+    -- that's not comparable to a version, not stale, so it is always kept
+    regardless of `current_master_version`.
+
+    Returns `(survivors, dropped_names)` -- the caller logs `dropped_names`
+    rather than losing them silently.
+    """
+    if current_master_version is None:
+        return dict(checkpoints), []
+    survivors: dict[str, dict[str, Any]] = {}
+    dropped: list[str] = []
+    for name, ckpt in checkpoints.items():
+        version = ckpt.get("master_version")
+        if version is None or version == current_master_version:
+            survivors[name] = ckpt
+        else:
+            dropped.append(name)
+    return survivors, dropped
 
 
 def nesterov_outer_step(

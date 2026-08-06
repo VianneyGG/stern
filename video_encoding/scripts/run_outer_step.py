@@ -34,9 +34,12 @@ from video_encoding.mesh.outer_step import (
     StateDict,
     average_deltas,
     data_weights,
+    filter_stale_deltas,
     nesterov_outer_step,
     pseudo_gradient,
+    to_fp32_state_dict,
 )
+from video_encoding.mesh.quantize import quantize_with_error_feedback
 
 WEIGHTING_CHOICES = ("data", "inverse_loss")
 
@@ -47,18 +50,6 @@ WEIGHTING_CHOICES = ("data", "inverse_loss")
 # that trade is model-dependent. Measure ||delta||/||w|| per tensor on a real
 # round before flipping it -- see _quantize_broadcast_with_error_feedback.
 BROADCAST_DTYPE_CHOICES = ("fp32", "fp16")
-
-
-def _to_fp32_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Upcasts every floating-point tensor to fp32, leaving any non-float
-    buffer untouched. mesh_round.py's push_checkpoint_and_wait casts
-    model_state_dict to fp16 before writing to pending/ to halve NFS
-    traffic; the pseudo-gradient/momentum arithmetic below needs fp32
-    (a no-op if a checkpoint already arrives in fp32, e.g. in tests)."""
-    return {
-        k: (v.float() if torch.is_floating_point(v) else v)
-        for k, v in state_dict.items()
-    }
 
 
 def _load_worker_checkpoints(
@@ -79,10 +70,12 @@ def _load_worker_checkpoints(
     "pool-fish" from matching "pool-fish-5r_..." -- the same delimiter
     argument mesh_tick.py's _clean_stale_run_artifacts docstring makes.
 
-    Validates the two keys every downstream computation needs regardless of
-    weighting scheme (`model_state_dict`, `n_samples`) up front, so a
-    malformed checkpoint fails before any merge math runs rather than
-    surfacing as a confusing KeyError deep in `average_deltas`.
+    Validates `n_samples` and exactly one of `model_state_dict` (round 0, or
+    a pre-3.2/merge=False push -- full weights, nothing to diff against yet)
+    / `delta_state_dict` (Phase 3.2: already `master - worker`, quantized
+    with error feedback on the worker side) up front, so a malformed
+    checkpoint fails before any merge math runs rather than surfacing as a
+    confusing KeyError deep in `average_deltas`.
     """
     files = sorted(pending_dir.glob(f"{run_id}_*.pt"))
     if not files:
@@ -99,13 +92,17 @@ def _load_worker_checkpoints(
                 f"merge_round: checkpoint '{f.name}' is missing required key "
                 "'n_samples' -- refusing to default a merge weight silently"
             )
-        if "model_state_dict" not in payload:
+        has_model = "model_state_dict" in payload
+        has_delta = "delta_state_dict" in payload
+        if has_model == has_delta:
             raise ValueError(
-                f"merge_round: checkpoint '{f.name}' is missing required key "
-                "'model_state_dict'"
+                f"merge_round: checkpoint '{f.name}' must have exactly one of "
+                "'model_state_dict' or 'delta_state_dict', found "
+                f"{'both' if has_model else 'neither'}"
             )
         payload = dict(payload)
-        payload["model_state_dict"] = _to_fp32_state_dict(payload["model_state_dict"])
+        state_key = "model_state_dict" if has_model else "delta_state_dict"
+        payload[state_key] = to_fp32_state_dict(payload[state_key])
         checkpoints[f.stem] = payload
     return checkpoints
 
@@ -168,44 +165,11 @@ def _quantize_broadcast_with_error_feedback(
     range nothing here needs and gives up 3 mantissa bits (rel. precision
     ~3.9e-3 vs fp16's ~4.9e-4).
 
-    Plain casting biases every round in the same direction, and DiLoCo's
-    pseudo-gradient is a small difference of large numbers -- 30 rounds of
-    correlated rounding is exactly the regime where that accumulates. So
-    the residual `(x - fp16(x))` is persisted and added back next round,
-    making the compression unbiased over time (standard error feedback from
-    the gradient-compression literature).
-
-    `residual_path` lives on watcher-local disk, never NFS: it is a pure
-    optimization. If it is missing (first round, or a wiped /Data) this
-    degrades to a plain cast rather than failing -- unlike the momentum
-    buffer, losing it costs precision, not correctness.
+    Thin wrapper: see `mesh/quantize.py::quantize_with_error_feedback` for
+    the error-feedback mechanics, shared with the worker's pseudo-gradient
+    push (Phase 3.2).
     """
-    residual: StateDict = {}
-    if residual_path is not None and residual_path.exists():
-        residual = torch.load(residual_path, map_location="cpu", weights_only=False)[
-            "residual"
-        ]
-
-    broadcast: StateDict = {}
-    new_residual: StateDict = {}
-    for key, value in master_sd.items():
-        if not torch.is_floating_point(value):
-            broadcast[key] = value
-            continue
-        compensated = value.float()
-        prior = residual.get(key)
-        # A shape change (model surgery mid-run) invalidates the residual
-        # for that tensor -- drop it rather than crashing the merge.
-        if prior is not None and prior.shape == compensated.shape:
-            compensated = compensated + prior.float()
-        quantized = compensated.half()
-        broadcast[key] = quantized
-        new_residual[key] = compensated - quantized.float()
-
-    if residual_path is not None:
-        _atomic_save(residual_path, {"residual": new_residual})
-
-    return broadcast
+    return quantize_with_error_feedback(master_sd, residual_path)
 
 
 def _append_merge_metrics(
@@ -277,18 +241,28 @@ def merge_round(
             f"one of {BROADCAST_DTYPE_CHOICES}"
         )
 
-    checkpoints = _load_worker_checkpoints(pending_dir, run_id)
-    alphas = _compute_alphas(checkpoints, weighting)
-
     master_payload = torch.load(master_path, map_location="cpu", weights_only=False)
-    # Upcast for the same reason worker checkpoints are upcast above: with
+    # Upcast for the same reason worker checkpoints are upcast below: with
     # broadcast_dtype="fp16" master.pt is itself stored fp16, and every
     # pseudo-gradient/momentum operation below must run in fp32 regardless
     # of what dtype the file happened to be written in.
-    master_sd: StateDict = _to_fp32_state_dict(master_payload["model_state_dict"])
+    master_sd: StateDict = to_fp32_state_dict(master_payload["model_state_dict"])
+    current_master_version = master_payload.get("master_version")
+
+    checkpoints = _load_worker_checkpoints(pending_dir, run_id)
+    checkpoints, stale = filter_stale_deltas(checkpoints, current_master_version)
+    if stale:
+        print(
+            f"run_outer_step: WARNING dropped {len(stale)} checkpoint(s) pushed "
+            f"against a stale master (run_id={run_id!r}): {sorted(stale)}",
+            file=sys.stderr,
+        )
+    alphas = _compute_alphas(checkpoints, weighting)
 
     deltas = {
-        name: pseudo_gradient(master_sd, ckpt["model_state_dict"])
+        name: ckpt["delta_state_dict"]
+        if "delta_state_dict" in ckpt
+        else pseudo_gradient(master_sd, ckpt["model_state_dict"])
         for name, ckpt in checkpoints.items()
     }
     delta = average_deltas(deltas, alphas)
@@ -333,7 +307,10 @@ def merge_round(
     else:
         broadcast_sd = new_master
 
-    _atomic_save(master_path, {"model_state_dict": broadcast_sd})
+    _atomic_save(
+        master_path,
+        {"model_state_dict": broadcast_sd, "master_version": round_num},
+    )
     _atomic_save(momentum_path, {"momentum_buf": new_buf})
 
     return {"n_workers": len(checkpoints), "alphas": alphas}

@@ -33,7 +33,7 @@ from video_encoding.data.loaders import build_probe_loader
 from video_encoding.data.probe_windows import VAWindowDataset
 from video_encoding.models import VideoMAEVARegressor
 from video_encoding.training import checkpoint as ckpt_io
-from video_encoding.training.ddp import setup_ddp, teardown_ddp, wrap_ddp
+from video_encoding.training.ddp.ddp import setup_ddp, teardown_ddp, wrap_ddp
 from video_encoding.training.loop_utils import set_sampler_epoch
 from video_encoding.training.tb_logger import make_writer, write_result_json
 

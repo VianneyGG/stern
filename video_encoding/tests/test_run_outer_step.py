@@ -69,8 +69,8 @@ def _sd(v: float) -> dict[str, torch.Tensor]:
     return {"w": torch.full((2, 2), v), "b": torch.full((2,), v)}
 
 
-def _write_master(path: Path, v: float) -> None:
-    torch.save({"model_state_dict": _sd(v)}, path)
+def _write_master(path: Path, v: float, *, master_version: int | None = None) -> None:
+    torch.save({"model_state_dict": _sd(v), "master_version": master_version}, path)
 
 
 def _write_worker(
@@ -90,6 +90,20 @@ def _write_worker(
     if not omit_n_samples:
         payload["n_samples"] = n_samples
     torch.save(payload, path)
+
+
+def _write_worker_delta(
+    path: Path, v: float, *, n_samples: int = 100, master_version: int | None = None
+) -> None:
+    """Phase 3.2 push shape: delta_state_dict instead of model_state_dict."""
+    torch.save(
+        {
+            "delta_state_dict": _sd(v),
+            "n_samples": n_samples,
+            "master_version": master_version,
+        },
+        path,
+    )
 
 
 def test_merge_with_lr1_momentum0_reproduces_weighted_average(tmp_path):
@@ -114,6 +128,85 @@ def test_merge_with_lr1_momentum0_reproduces_weighted_average(tmp_path):
 
     merged = torch.load(master_path, weights_only=False)["model_state_dict"]
     assert merged["w"][0, 0].item() == pytest.approx(1.0)
+
+
+def test_merge_round_reads_delta_state_dict_directly_when_present(tmp_path):
+    """Phase 3.2: a worker that already pushed master-worker doesn't need
+    merge_round to recompute it -- at lr=1, momentum=0 the outer step is
+    exactly master - delta, same equivalence the full-weight path relies on."""
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+
+    _write_master(master_path, 1.0)
+    _write_worker_delta(pending_dir / "run1_a.pt", 1.0, n_samples=100)
+
+    merge_round(
+        pending_dir,
+        master_path,
+        momentum_path,
+        run_id="run1",
+        lr=1.0,
+        momentum=0.0,
+    )
+
+    merged = torch.load(master_path, weights_only=False)["model_state_dict"]
+    assert merged["w"][0, 0].item() == pytest.approx(0.0)
+
+
+def test_merge_round_mixes_delta_and_full_weight_checkpoints_in_one_round(tmp_path):
+    """A round-0 straggler merged late still pushes full weights (no master
+    to have diffed against yet) alongside nodes already on the delta path --
+    both must contribute to the same merge."""
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+
+    _write_master(master_path, 1.0)
+    _write_worker_delta(pending_dir / "run1_a.pt", 1.0, n_samples=100)
+    _write_worker(pending_dir / "run1_b.pt", 0.0, n_samples=100)  # equivalent delta
+
+    result = merge_round(
+        pending_dir,
+        master_path,
+        momentum_path,
+        run_id="run1",
+        lr=1.0,
+        momentum=0.0,
+    )
+
+    assert result["n_workers"] == 2
+    merged = torch.load(master_path, weights_only=False)["model_state_dict"]
+    assert merged["w"][0, 0].item() == pytest.approx(0.0)
+
+
+def test_merge_round_drops_a_checkpoint_pushed_against_a_stale_master(tmp_path):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+
+    _write_master(master_path, 1.0, master_version=5)
+    _write_worker_delta(pending_dir / "run1_a.pt", 1.0, n_samples=100, master_version=5)
+    # Stale: computed against an older master, must be dropped, not merged in.
+    _write_worker_delta(
+        pending_dir / "run1_b.pt", 999.0, n_samples=100, master_version=4
+    )
+
+    result = merge_round(
+        pending_dir,
+        master_path,
+        momentum_path,
+        run_id="run1",
+        lr=1.0,
+        momentum=0.0,
+    )
+
+    assert set(result["alphas"]) == {"run1_a"}
+    merged = torch.load(master_path, weights_only=False)["model_state_dict"]
+    assert merged["w"][0, 0].item() == pytest.approx(0.0)
 
 
 def test_alphas_follow_sample_counts_not_val_loss(tmp_path):
@@ -182,6 +275,49 @@ def test_momentum_buffer_is_written_and_reloaded(tmp_path, capsys):
     ].item()
 
     assert m2 != pytest.approx(m1)
+
+
+def test_checkpoint_with_neither_state_dict_key_is_rejected_loudly(tmp_path):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+
+    _write_master(master_path, 1.0)
+    torch.save({"n_samples": 100}, pending_dir / "run1_a.pt")
+
+    with pytest.raises(ValueError, match="exactly one of"):
+        merge_round(
+            pending_dir,
+            master_path,
+            momentum_path,
+            run_id="run1",
+            lr=0.7,
+            momentum=0.9,
+        )
+
+
+def test_checkpoint_with_both_state_dict_keys_is_rejected_loudly(tmp_path):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+
+    _write_master(master_path, 1.0)
+    torch.save(
+        {"model_state_dict": _sd(0.5), "delta_state_dict": _sd(0.5), "n_samples": 100},
+        pending_dir / "run1_a.pt",
+    )
+
+    with pytest.raises(ValueError, match="exactly one of"):
+        merge_round(
+            pending_dir,
+            master_path,
+            momentum_path,
+            run_id="run1",
+            lr=0.7,
+            momentum=0.9,
+        )
 
 
 def test_checkpoint_without_n_samples_is_rejected_loudly(tmp_path):
@@ -431,6 +567,49 @@ def test_broadcast_dtype_fp16_halves_master_and_still_merges(tmp_path):
     assert torch.isfinite(
         torch.load(master_path, weights_only=False)["model_state_dict"]["w"]
     ).all()
+
+
+def test_merge_round_stamps_master_version_from_round_num(tmp_path):
+    """Phase 3.2: the version a worker's pushed delta was computed against
+    has to be checkable against the master it would merge into -- merge_round
+    is the only writer of master.pt, so it stamps the round it just wrote."""
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+
+    merge_round(
+        pending_dir,
+        master_path,
+        tmp_path / "momentum.pt",
+        run_id="run1",
+        lr=0.7,
+        momentum=0.9,
+        round_num=3,
+        allow_missing_momentum=True,
+    )
+
+    assert torch.load(master_path, weights_only=False)["master_version"] == 3
+
+
+def test_merge_round_stamps_none_master_version_when_round_num_is_none(tmp_path):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+
+    merge_round(
+        pending_dir,
+        master_path,
+        tmp_path / "momentum.pt",
+        run_id="run1",
+        lr=0.7,
+        momentum=0.9,
+    )
+
+    assert torch.load(master_path, weights_only=False)["master_version"] is None
 
 
 def test_error_feedback_removes_the_fp16_rounding_bias_over_rounds(tmp_path):

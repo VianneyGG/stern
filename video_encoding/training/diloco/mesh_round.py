@@ -14,8 +14,10 @@ Each round:
      `master.pt` into the local model (the outer-optimizer merge itself runs
      on the watcher side -- Task 3 -- between this worker's rounds, never
      here).
-  2. Train `H = cfg.mesh.steps_per_round` local steps over this node's
-     assigned shards (`train_one_round`).
+  2. Train `H` local steps over this node's assigned shards
+     (`train_one_round`). `H` is `cfg.mesh.steps_per_round` unless
+     `cfg.mesh.round_budget_s` is set, in which case it is whatever fits in
+     that budget at this node's own measured rate (`mesh/pacing.py`).
   3. Evaluate a fixed ~2000-window val subsample (`evaluate_val_loss`).
   4. Save a local checkpoint, then push it to the shared `pending/` dir and
      (if merging) block until the watcher's sync flag appears
@@ -47,6 +49,9 @@ from video_encoding.models.videomaev2.masking import (
 from video_encoding.mesh.topology import NODE_SUBNETS
 from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.compile_utils import maybe_compile
+from video_encoding.mesh.outer_step import pseudo_gradient, to_fp32_state_dict
+from video_encoding.mesh.pacing import steps_for_budget, update_rate_ema
+from video_encoding.mesh.quantize import quantize_with_error_feedback
 from video_encoding.training.pretrain import _scaled_lr, _train_epoch_ssl
 from video_encoding.training.tb_logger import make_writer
 
@@ -181,6 +186,17 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     outer_lr = float(cfg.mesh.get("outer_lr", 0.7))
     outer_momentum = float(cfg.mesh.get("outer_momentum", 0.9))
     sync_timeout_s = float(cfg.mesh.get("sync_timeout_s", 1800.0))
+    # Per-node pacing (spec 2.3'): None keeps the uniform steps_per_round every
+    # node uses today. When set, each node instead trains whatever fits in
+    # round_budget_s at its own measured rate, so rounds take equal *time*
+    # across heterogeneous hardware and the fast nodes stop idling at the
+    # barrier. The clamps are expressed as fractions of steps_per_round so a
+    # run only has to tune one number.
+    round_budget_s = cfg.mesh.get("round_budget_s", None)
+    round_budget_s = None if round_budget_s is None else float(round_budget_s)
+    step_floor = int(float(cfg.mesh.get("step_floor_frac", 0.25)) * steps_per_round)
+    step_ceil = int(float(cfg.mesh.get("step_ceil_frac", 2.0)) * steps_per_round)
+    rate_ema: float | None = None
 
     num_frames = int(cfg.model.num_frames)
     image_size = int(cfg.model.image_size)
@@ -265,6 +281,13 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             "flag_wait_s": 0.0,
         }
 
+        # Snapshot of the master this round started from, kept around to push
+        # a pseudo-gradient (Phase 3.2) instead of the full trained weights.
+        # None on a cold start (no master.pt yet) or merge=False -- both keep
+        # push_checkpoint_and_wait's pre-3.2 full-weight path.
+        master_sd_for_delta: dict[str, torch.Tensor] | None = None
+        master_version: int | None = None
+
         if merge:
             if master_path.exists():
                 _t0 = time.monotonic()
@@ -272,6 +295,13 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
                 master_payload = torch.load(
                     master_path, map_location=device, weights_only=False
                 )
+                # torch.load returns tensors independent of what
+                # load_state_dict copies into the model below, so this stays
+                # an untouched snapshot of the round's starting master.
+                master_sd_for_delta = to_fp32_state_dict(
+                    master_payload["model_state_dict"]
+                )
+                master_version = master_payload.get("master_version")
                 load_result = ckpt_io.unwrap(model).load_state_dict(
                     master_payload["model_state_dict"], strict=False
                 )
@@ -312,19 +342,37 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         # so max_steps=steps_per_round truncated at the identical windows
         # every round regardless of round_num.
         train_dataset.set_round(round_num)
+        # rate_ema is None until a round has actually been timed, so the first
+        # round this process runs is always the calibration round at the
+        # configured step count -- there is nothing to pace against yet.
+        round_steps = (
+            steps_for_budget(
+                rate_steps_per_s=rate_ema,
+                budget_s=round_budget_s,
+                floor_steps=step_floor,
+                ceil_steps=step_ceil,
+            )
+            if round_budget_s is not None and rate_ema is not None
+            else steps_per_round
+        )
         train_stats = train_one_round(
             model,
             optimizer,
             device,
             masker,
             train_dataset,
-            steps_per_round=steps_per_round,
+            steps_per_round=round_steps,
             amp=amp,
             accum_steps=accum_steps,
             grad_clip=grad_clip,
             round_num=round_num,
         )
         last_train_loss = train_stats["loss"]
+        # _MESH_BATCH_SIZE is 1 and _train_epoch_ssl counts micro-steps, so
+        # samples/s is steps/s exactly -- no conversion needed here.
+        observed_rate = float(train_stats["samples_per_s_per_gpu"])
+        if observed_rate > 0:
+            rate_ema = update_rate_ema(rate_ema, observed_rate)
 
         val_loss = evaluate_val_loss(model, val_dataset, device, masker, amp)
 
@@ -358,6 +406,10 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
                 optimizer_name="adamw",
             )
             payload["n_samples"] = train_stats["samples"]
+            # Step count travels with the checkpoint because round_budget_s
+            # makes it vary per node: without it the merge cannot tell a node
+            # that took few steps from one that was assigned less data.
+            payload["n_steps"] = train_stats["steps"]
             payload["val_loss"] = val_loss
             payload["round"] = round_num
             payload["samples_per_s"] = train_stats["samples_per_s_per_gpu"]
@@ -381,6 +433,9 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
                     round_num=round_num,
                     merge=merge,
                     sync_timeout_s=sync_timeout_s,
+                    master_sd=master_sd_for_delta,
+                    master_version=master_version,
+                    residual_path=checkpoint_root / f"{run_id}_push_residual.pt",
                 )
             )
 
@@ -528,6 +583,9 @@ def push_checkpoint_and_wait(
     round_num: int,
     merge: bool,
     sync_timeout_s: float = 1800.0,
+    master_sd: dict[str, torch.Tensor] | None = None,
+    master_version: int | None = None,
+    residual_path: Path | None = None,
 ) -> dict[str, float]:
     """Push `payload` to the shared pending/ dir, then (if merging) wait.
 
@@ -536,13 +594,24 @@ def push_checkpoint_and_wait(
     the two costs that have to be told apart before any NFS optimization can
     be judged, and they are only separable here.
 
-    Writes to mesh_shared/checkpoints/pending/{run_id}_{node}.pt, with
-    `model_state_dict` cast to fp16 (this shared copy only -- the caller's
-    own local checkpoint save happens before this call and keeps fp32), via
+    Writes to mesh_shared/checkpoints/pending/{run_id}_{node}.pt via
     `checkpoint.try_save` so a transient NFS write failure degrades instead
     of raising: on exhausted retries this returns `pushed=False` and skips
     the barrier entirely, leaving the caller to proceed to the next round
     from its own weights rather than dying mid-run.
+
+    When `master_sd` is given (every round this worker had a master to load,
+    i.e. every round but round 0), pushes `master_sd - model_state_dict`
+    (Phase 3.2) instead of the full weights: DiLoCo's actual signal is that
+    small difference, and quantizing it directly (with the same error
+    feedback as the master broadcast, via `residual_path`) wastes far less
+    precision than quantizing the large weight values before the merge side
+    subtracts them. `master_version` travels alongside so the merge can
+    reject a delta computed against a master that's no longer current rather
+    than silently applying it to the wrong one. When `master_sd` is None
+    (round 0, or a merge=False solo run with nothing to diff against), keeps
+    pushing the full `model_state_dict` cast to fp16, unchanged from before
+    this parameter existed.
 
     If the push succeeded and `merge` is False (the ab-single_node reference
     arm), returns immediately -- no wait, the caller proceeds to the next
@@ -558,7 +627,17 @@ def push_checkpoint_and_wait(
     pending_path = mesh_shared / "checkpoints" / "pending" / f"{run_id}_{node}.pt"
     pending_path.parent.mkdir(parents=True, exist_ok=True)
     shared_payload = dict(payload)
-    shared_payload["model_state_dict"] = _fp16_state_dict(payload["model_state_dict"])
+    if master_sd is not None:
+        delta_sd = pseudo_gradient(master_sd, payload["model_state_dict"])
+        shared_payload["delta_state_dict"] = quantize_with_error_feedback(
+            delta_sd, residual_path
+        )
+        shared_payload["master_version"] = master_version
+        del shared_payload["model_state_dict"]
+    else:
+        shared_payload["model_state_dict"] = _fp16_state_dict(
+            payload["model_state_dict"]
+        )
     _t0 = time.monotonic()
     pushed = ckpt_io.try_save(pending_path, shared_payload)
     stats = {

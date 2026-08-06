@@ -32,7 +32,7 @@ from video_encoding.models.videomaev2.masking import (
 )
 from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
 from video_encoding.training import checkpoint as ckpt_io
-from video_encoding.training.ddp import (
+from video_encoding.training.ddp.ddp import (
     all_reduce_mean,
     setup_ddp,
     teardown_ddp,
@@ -572,7 +572,7 @@ def _select_stage(
     can inspect `.func` to see which stage was selected without running it.
     """
     if os.environ.get("MESH_RUN_ID"):
-        from video_encoding.training.mesh_round import run_mesh_pretrain_stage
+        from video_encoding.training.diloco.mesh_round import run_mesh_pretrain_stage
 
         return functools.partial(run_mesh_pretrain_stage, cfg, device=device)
     return functools.partial(

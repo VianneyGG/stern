@@ -6,13 +6,67 @@ import torch
 from video_encoding.mesh.outer_step import (
     average_deltas,
     data_weights,
+    filter_stale_deltas,
     nesterov_outer_step,
     pseudo_gradient,
+    to_fp32_state_dict,
 )
 
 
 def _sd(v: float) -> dict[str, torch.Tensor]:
     return {"w": torch.full((2, 2), v), "b": torch.full((2,), v)}
+
+
+def test_filter_stale_deltas_keeps_everything_when_versions_match():
+    checkpoints = {
+        "a": {"master_version": 5, "n_samples": 1},
+        "b": {"master_version": 5, "n_samples": 1},
+    }
+    survivors, dropped = filter_stale_deltas(checkpoints, current_master_version=5)
+    assert survivors == checkpoints
+    assert dropped == []
+
+
+def test_filter_stale_deltas_drops_exactly_the_mismatched_checkpoint():
+    checkpoints = {
+        "a": {"master_version": 5, "n_samples": 1},
+        "b": {"master_version": 4, "n_samples": 1},
+    }
+    survivors, dropped = filter_stale_deltas(checkpoints, current_master_version=5)
+    assert set(survivors) == {"a"}
+    assert dropped == ["b"]
+
+
+def test_filter_stale_deltas_skips_the_check_when_current_version_is_none():
+    """An unversioned master predates Phase 3.2 -- treat every checkpoint as
+    compatible rather than rejecting a mesh mid-upgrade."""
+    checkpoints = {
+        "a": {"master_version": 5, "n_samples": 1},
+        "b": {"n_samples": 1},  # full-weight push, no master_version key at all
+    }
+    survivors, dropped = filter_stale_deltas(checkpoints, current_master_version=None)
+    assert survivors == checkpoints
+    assert dropped == []
+
+
+def test_filter_stale_deltas_keeps_a_checkpoint_with_no_master_version_key():
+    """A full-weight (round-0) push never had a master to diff against, so it
+    has no master_version at all -- that is not the same as "stale"."""
+    checkpoints = {"a": {"n_samples": 1}}
+    survivors, dropped = filter_stale_deltas(checkpoints, current_master_version=5)
+    assert survivors == checkpoints
+    assert dropped == []
+
+
+def test_to_fp32_state_dict_upcasts_float_and_passes_non_float_through():
+    sd = {
+        "w": torch.full((2, 2), 0.5).half(),
+        "step": torch.tensor([7], dtype=torch.int64),
+    }
+    out = to_fp32_state_dict(sd)
+    assert out["w"].dtype == torch.float32
+    assert out["step"].dtype == torch.int64
+    assert out["step"].item() == 7
 
 
 def test_data_weights_are_proportional_to_samples_and_sum_to_one():

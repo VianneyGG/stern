@@ -60,6 +60,13 @@ def _run_config(**overrides) -> MeshRunConfig:
     return MeshRunConfig(**defaults)
 
 
+def test_meshrunconfig_broadcast_dtype_defaults_to_fp16():
+    """3.1: halves the 349 MiB/round x 16 nodes master broadcast by default
+    -- the unbiased error-feedback path already exists, this only flips
+    which dtype a run gets when it doesn't ask."""
+    assert _run_config().broadcast_dtype == "fp16"
+
+
 def _seed_shard_map(mesh_shared) -> None:
     """9 shards, all seeded on node001 -- phase-1 locality then spreads the
     remaining 6 across node002/node003 in assign_locality_first's phase 2."""
@@ -310,6 +317,103 @@ def test_awaiting_checkpoints_times_out_when_zero_checkpoints_ever_arrive(tmp_pa
     assert action is not None
 
 
+def test_awaiting_checkpoints_merges_early_when_quorum_reached_before_full_arrival(
+    tmp_path,
+):
+    """2.1: a run configured with quorum_k merges as soon as quorum_k nodes
+    check in, without waiting for the rest of the pool or ROUND_TIMEOUT_S --
+    the whole point of killing the barrier. The still-missing node must not
+    be excluded or counted as a missed round: it just hasn't finished yet,
+    not crashed."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    for node in ("node001", "node002"):  # 2 of 3 -- node003 still training
+        (pending_dir / f"RUN1_{node}.pt").write_text("x")
+
+    run_config = _run_config(quorum_k=2, grace_s=900.0)
+    state = WatcherState()
+    state.run("RUN1").status = "AWAITING_CHECKPOINTS"
+    state.run("RUN1").round_started_at = 1000.0
+
+    action = advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=1010.0,  # only 10s in -- nowhere near grace_s or ROUND_TIMEOUT_S
+    )
+
+    assert state.run("RUN1").status == "MERGING"
+    assert "node003" not in state.run("RUN1").missed_rounds
+    assert "node003" not in state.excluded_nodes
+    assert action is not None
+    assert "quorum" in action
+
+
+def test_awaiting_checkpoints_quorum_configured_still_waits_below_quorum(tmp_path):
+    """Below quorum_k, a quorum-configured run waits exactly like the
+    default path does below ROUND_TIMEOUT_S -- grace_s hasn't expired yet
+    either, so there's nothing to merge with."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    (pending_dir / "RUN1_node001.pt").write_text("x")  # only 1 of 3
+
+    run_config = _run_config(quorum_k=2, grace_s=900.0)
+    state = WatcherState()
+    state.run("RUN1").status = "AWAITING_CHECKPOINTS"
+    state.run("RUN1").round_started_at = 1000.0
+
+    action = advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=1010.0,
+    )
+
+    assert state.run("RUN1").status == "AWAITING_CHECKPOINTS"
+    assert action is None
+
+
+def test_awaiting_checkpoints_quorum_configured_falls_back_to_exclusion_after_grace(
+    tmp_path,
+):
+    """Quorum never reached and grace_s has fully elapsed: falls back to the
+    exact same exclusion/replenish path the plain timeout uses -- grace_s
+    plays ROUND_TIMEOUT_S's old role once quorum is configured."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    old_mtime = 1000.0
+    path = pending_dir / "RUN1_node001.pt"
+    path.write_text("x")
+    os.utime(path, (old_mtime, old_mtime))
+
+    run_config = _run_config(quorum_k=2, grace_s=900.0)
+    state = WatcherState()
+    state.run("RUN1").status = "AWAITING_CHECKPOINTS"
+    state.run("RUN1").round_started_at = old_mtime
+
+    action = advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=old_mtime + 901.0,  # past grace_s (900s)
+    )
+
+    assert state.run("RUN1").status == "MERGING"
+    assert state.run("RUN1").timeout_forced is True
+    for node in ("node002", "node003"):
+        assert state.run("RUN1").missed_rounds.get(node) == 1
+    assert action is not None
+
+
 def test_merging_calls_run_outer_step_with_correct_args(tmp_path):
     mesh_shared = tmp_path / "mesh_shared"
     (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
@@ -541,6 +645,10 @@ def test_merging_bootstraps_master_from_pending_when_missing(tmp_path):
     assert master_path.exists()
     payload = torch.load(master_path, map_location="cpu", weights_only=False)
     assert "model_state_dict" in payload
+    # Phase 3.2: 0 predates every real round_num merge_round ever stamps, so
+    # every worker's first real diff (against a genuine merge) is never
+    # rejected as stale by comparison to a bootstrap master.
+    assert payload["master_version"] == 0
 
 
 def test_merging_bootstraps_master_upcasts_fp16_pending_to_fp32(tmp_path):

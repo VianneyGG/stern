@@ -1,4 +1,4 @@
-"""Tests for `video_encoding.training.mesh_round` (Task 2 of the mesh
+"""Tests for `video_encoding.training.diloco.mesh_round` (Task 2 of the mesh
 round-loop-integration plan) plus the `pretrain.py` dispatch branch and
 `_train_epoch_ssl`'s new `progress_desc` param.
 
@@ -22,7 +22,7 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
-import video_encoding.training.mesh_round as mesh_round
+import video_encoding.training.diloco.mesh_round as mesh_round
 from video_encoding.data.mesh_shard_dataset import MeshShardIterableDataset
 from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
 from video_encoding.models.videomaev2.masking import RandomTubeMasking
@@ -30,7 +30,7 @@ from video_encoding.scripts.build_wds_shards import (
     BalancedShardWriter,
     encode_frames_jpeg,
 )
-from video_encoding.training.mesh_round import (
+from video_encoding.training.diloco.mesh_round import (
     evaluate_val_loss,
     push_checkpoint_and_wait,
     run_mesh_pretrain_stage,
@@ -301,6 +301,74 @@ def test_push_checkpoint_and_wait_casts_shared_payload_to_fp16(tmp_path):
     assert payload["model_state_dict"]["w"].dtype == torch.float32
 
 
+def test_push_checkpoint_and_wait_pushes_delta_not_weights_when_master_sd_given(
+    tmp_path,
+):
+    """Phase 3.2: once a worker has a master snapshot to diff against, it
+    pushes master-worker (quantized with error feedback), not the full
+    weights -- the naked full-weight fp16 cast biases the small difference
+    the merge actually cares about."""
+    master_sd = {"w": torch.full((2, 2), 1.0), "b": torch.full((2,), 1.0)}
+    payload = {
+        "model_state_dict": {
+            "w": torch.full((2, 2), 0.75),
+            "b": torch.full((2,), 0.75),
+        },
+        "n_samples": 1,
+    }
+
+    push_checkpoint_and_wait(
+        payload,
+        mesh_shared=tmp_path,
+        run_id="r1",
+        node="nodeA",
+        round_num=0,
+        merge=False,
+        master_sd=master_sd,
+        master_version=3,
+        residual_path=tmp_path / "push_residual.pt",
+    )
+
+    shared = torch.load(
+        tmp_path / "checkpoints" / "pending" / "r1_nodeA.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert "model_state_dict" not in shared
+    assert shared["master_version"] == 3
+    delta = shared["delta_state_dict"]
+    assert delta["w"].dtype == torch.float16
+    assert torch.allclose(delta["w"].float(), torch.full((2, 2), 0.25), atol=1e-3)
+    # Caller's own dict must be untouched -- same guarantee as the
+    # full-weight path above.
+    assert payload["model_state_dict"]["w"].dtype == torch.float32
+    assert "delta_state_dict" not in payload
+
+
+def test_push_checkpoint_and_wait_keeps_full_weights_when_master_sd_is_none(tmp_path):
+    """Round 0 / unmerged solo runs have no master to diff against and must
+    keep pushing full weights exactly as before Phase 3.2."""
+    payload = {"model_state_dict": {"w": torch.ones(2, 2)}, "n_samples": 1}
+
+    push_checkpoint_and_wait(
+        payload,
+        mesh_shared=tmp_path,
+        run_id="r1",
+        node="nodeA",
+        round_num=0,
+        merge=False,
+    )
+
+    shared = torch.load(
+        tmp_path / "checkpoints" / "pending" / "r1_nodeA.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert "delta_state_dict" not in shared
+    assert "master_version" not in shared
+    assert shared["model_state_dict"]["w"].dtype == torch.float16
+
+
 def test_fp16_state_dict_leaves_non_float_buffers_untouched():
     state_dict = {"w": torch.ones(2), "step_count": torch.tensor(5, dtype=torch.int64)}
 
@@ -538,6 +606,7 @@ def test_run_mesh_pretrain_stage_warm_starts_round_zero_from_existing_master(
         return {
             "loss": 0.0,
             "samples": 1,
+            "steps": 1,
             "samples_per_s_per_gpu": 1.0,
         }
 
@@ -556,6 +625,143 @@ def test_run_mesh_pretrain_stage_warm_starts_round_zero_from_existing_master(
     run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
 
     assert captured_first_param["value"] == pytest.approx(7.0)
+
+
+def test_round_loop_pushes_delta_against_the_master_snapshot_it_loaded(
+    tmp_path, monkeypatch
+):
+    """Phase 3.2: once a round starts from an existing master.pt, the round
+    loop must hand push_checkpoint_and_wait that exact snapshot (upcast to
+    fp32) and its version tag -- not recompute or skip either."""
+    torch.manual_seed(0)
+    hostname = socket.gethostname().split(".", 1)[0]
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    seed_model = VideoMAEForPreTraining(_tiny_cfg())
+    with torch.no_grad():
+        for p in seed_model.parameters():
+            p.fill_(7.0)
+    master_path = mesh_shared / "checkpoints" / "run1" / "master.pt"
+    master_path.parent.mkdir(parents=True)
+    torch.save(
+        {"model_state_dict": seed_model.state_dict(), "master_version": 5},
+        master_path,
+    )
+
+    checkpoint_root = tmp_path / "stern_checkpoints"
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 1,
+                "steps_per_round": 1,
+                "merge": True,
+                "outer_lr": 0.7,
+                "outer_momentum": 0.9,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+    captured = {}
+
+    def _fake_push(payload, **kwargs):
+        captured.update(kwargs)
+        return {"pending_push_s": 0.0, "pending_bytes": 0, "flag_wait_s": 0.0}
+
+    monkeypatch.setattr(mesh_round, "push_checkpoint_and_wait", _fake_push)
+
+    run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+
+    assert captured["master_version"] == 5
+    assert captured["master_sd"] is not None
+    for tensor in captured["master_sd"].values():
+        assert tensor.dtype == torch.float32
+        assert torch.equal(tensor, torch.full_like(tensor, 7.0))
+
+
+def test_round_loop_omits_master_sd_on_a_cold_start(tmp_path, monkeypatch):
+    """Round 0 with no master.pt on disk has nothing to diff against --
+    push_checkpoint_and_wait must fall back to its pre-3.2 full-weight path."""
+    torch.manual_seed(0)
+    hostname = socket.gethostname().split(".", 1)[0]
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    checkpoint_root = tmp_path / "stern_checkpoints"
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 1,
+                "steps_per_round": 1,
+                "merge": True,
+                "outer_lr": 0.7,
+                "outer_momentum": 0.9,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+    captured = {}
+
+    def _fake_push(payload, **kwargs):
+        captured.update(kwargs)
+        return {"pending_push_s": 0.0, "pending_bytes": 0, "flag_wait_s": 0.0}
+
+    monkeypatch.setattr(mesh_round, "push_checkpoint_and_wait", _fake_push)
+
+    run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+
+    assert captured["master_sd"] is None
+    assert captured["master_version"] is None
 
 
 def test_late_joiner_loads_master_before_first_local_round(tmp_path, monkeypatch):
@@ -1000,6 +1206,7 @@ def test_run_mesh_pretrain_stage_skips_push_on_zero_sample_round(tmp_path, monke
         lambda *a, **kw: {
             "loss": float("nan"),
             "samples": 0,
+            "steps": 0,
             "samples_per_s_per_gpu": 0.0,
         },
     )
@@ -1065,3 +1272,129 @@ def test_append_round_metrics_swallows_unwritable_metrics_dir(tmp_path):
     )  # must not raise
 
     assert (mesh_shared / "metrics").is_file()  # untouched, still a plain file
+
+
+def _run_with_step_capture(tmp_path, monkeypatch, *, mesh_cfg, rates):
+    """Run `run_mesh_pretrain_stage` with training stubbed out, returning the
+    `steps_per_round` it asked for on each round plus the checkpoint root.
+
+    `rates` supplies the throughput each stubbed round reports, which is what
+    the next round's budget is derived from.
+    """
+    hostname = socket.gethostname().split(".", 1)[0]
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    checkpoint_root = tmp_path / "stern_checkpoints"
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": mesh_cfg,
+        }
+    )
+
+    captured: list[int] = []
+
+    def _fake_train_one_round(*args, steps_per_round: int, **kwargs):
+        captured.append(steps_per_round)
+        return {
+            "loss": 0.0,
+            # Deliberately != steps: a stub where samples == steps can't
+            # tell apart a production bug that reads n_steps from the wrong
+            # field (see test_local_payload_records_steps_for_the_merge_weighting).
+            "samples": steps_per_round * 3,
+            "steps": steps_per_round,
+            "samples_per_s_per_gpu": rates[len(captured) - 1],
+        }
+
+    monkeypatch.setattr(mesh_round, "train_one_round", _fake_train_one_round)
+    monkeypatch.setattr(
+        mesh_round,
+        "push_checkpoint_and_wait",
+        lambda *a, **kw: {
+            "pending_push_s": 0.0,
+            "pending_bytes": 0,
+            "flag_wait_s": 0.0,
+        },
+    )
+
+    run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+    return captured, checkpoint_root
+
+
+_BUDGET_MESH_CFG = {
+    "rounds": 2,
+    "steps_per_round": 100,
+    "merge": False,
+    "outer_lr": 0.7,
+    "outer_momentum": 0.9,
+    "sync_timeout_s": 5.0,
+}
+
+
+def test_round_budget_absent_keeps_the_fixed_step_count(tmp_path, monkeypatch):
+    """round_budget_s is opt-in: with it unset every round asks for exactly
+    cfg.mesh.steps_per_round, byte-for-byte the pre-pacing behaviour. Every
+    mesh run currently configured on the cluster predates this field."""
+    captured, _ = _run_with_step_capture(
+        tmp_path,
+        monkeypatch,
+        mesh_cfg=dict(_BUDGET_MESH_CFG),
+        rates=[10.0, 10.0],
+    )
+    assert captured == [100, 100]
+
+
+def test_round_budget_paces_later_rounds_from_the_measured_rate(tmp_path, monkeypatch):
+    """Round 0 is the calibration round (no rate observed yet, so it uses the
+    configured step count); round 1 trains what fits in the budget at the
+    rate round 0 measured -- 10 steps/s x 5s = 50, against a configured 100.
+    Equalising round *duration* across heterogeneous nodes is what removes
+    the barrier the fast nodes otherwise wait out."""
+    captured, _ = _run_with_step_capture(
+        tmp_path,
+        monkeypatch,
+        mesh_cfg={**_BUDGET_MESH_CFG, "round_budget_s": 5.0},
+        rates=[10.0, 10.0],
+    )
+    assert captured == [100, 50]
+
+
+def test_local_payload_records_steps_for_the_merge_weighting(tmp_path, monkeypatch):
+    """Unequal step counts across nodes are only sound if the merge can see
+    them; n_samples alone can't distinguish a node that took few steps from
+    one that was assigned less data."""
+    captured, checkpoint_root = _run_with_step_capture(
+        tmp_path,
+        monkeypatch,
+        mesh_cfg={**_BUDGET_MESH_CFG, "round_budget_s": 5.0},
+        rates=[10.0, 10.0],
+    )
+    payload = torch.load(checkpoint_root / "run1.pt", weights_only=False)
+    assert payload["n_steps"] == captured[-1]
+    assert (
+        payload["n_samples"] == captured[-1] * 3
+    )  # distinct from n_steps, not a stand-in for it

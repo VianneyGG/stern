@@ -29,6 +29,7 @@ from pathlib import Path
 import torch
 
 from video_encoding.mesh.assignment import assign_locality_first, reassign_failed
+from video_encoding.mesh.quorum import ready_for_merge
 from video_encoding.mesh.scoring import (
     NodeInfo,
     compute_effective_weights,
@@ -90,11 +91,21 @@ class MeshRunConfig:
     weighting: str  # "data" | "inverse_loss"
     rounds: int
     merge: bool = True  # False for the ab-single_node reference arm
-    # "fp32" (default) or "fp16" for the master.pt every worker reads back
-    # each round. fp16 halves the dominant per-round NFS term but doubles the
-    # quantization noise floor in the pseudo-gradient -- opt in per run, once
-    # measured. See run_outer_step.BROADCAST_DTYPE_CHOICES.
-    broadcast_dtype: str = "fp32"
+    # "fp32" or "fp16" (default) for the master.pt every worker reads back
+    # each round. fp16 halves the dominant per-round NFS term (349 MiB/round
+    # x 16 nodes) via the unbiased error-feedback path in
+    # run_outer_step._quantize_broadcast_with_error_feedback -- correlated
+    # rounding across rounds does not accumulate. See
+    # run_outer_step.BROADCAST_DTYPE_CHOICES.
+    broadcast_dtype: str = "fp16"
+    # Quorum merge (spec 2.1): None keeps the old all-or-ROUND_TIMEOUT_S wait
+    # -- required for backward compatibility, since every run currently
+    # configured on login-node predates this field and has no value for it in
+    # its on-disk JSON. Set quorum_k to merge once that many nodes check in,
+    # with grace_s as the below-quorum fallback deadline (replaces
+    # ROUND_TIMEOUT_S's role for quorum-configured runs).
+    quorum_k: int | None = None
+    grace_s: float = ROUND_TIMEOUT_S
 
 
 def load_run_configs(path: Path) -> list[MeshRunConfig]:
@@ -388,10 +399,36 @@ def _do_awaiting_checkpoints(
             f"({len(checked_in)} nodes)"
         )
 
-    if (
-        _round_elapsed_s(pending_dir, run_config.run_id, now, run.round_started_at)
-        < ROUND_TIMEOUT_S
-    ):
+    elapsed = _round_elapsed_s(
+        pending_dir, run_config.run_id, now, run.round_started_at
+    )
+
+    if run_config.quorum_k is not None:
+        if not ready_for_merge(
+            checked_in,
+            quorum_k=run_config.quorum_k,
+            grace_s=run_config.grace_s,
+            now=elapsed,
+        ):
+            return None  # still below quorum, grace not yet expired
+        if len(checked_in) >= run_config.quorum_k:
+            # Quorum reached before grace expired: merge now with whoever's
+            # here. No exclusion, no missed_rounds bump -- the stragglers
+            # haven't crashed, they just haven't finished yet, and get
+            # another chance next round. Still a partial merge from
+            # run_outer_step's point of view, so timeout_forced stays True
+            # (2.2's token weighting will replace this bias; until then it
+            # gets the same renormalization any partial merge does).
+            run.status = "MERGING"
+            run.timeout_forced = True
+            return (
+                f"{run_config.run_id}: AWAITING_CHECKPOINTS -> MERGING "
+                f"(quorum {run_config.quorum_k}/{len(eligible)} reached, "
+                f"{len(checked_in)} nodes)"
+            )
+        # Grace expired without reaching quorum -- fall through to the same
+        # exclusion/replenish path the plain timeout uses below.
+    elif elapsed < ROUND_TIMEOUT_S:
         return None  # still waiting, not timed out yet
 
     missing = sorted(eligible - checked_in)
@@ -607,7 +644,12 @@ def _bootstrap_master(pending_dir: Path, run_id: str, master_path: Path) -> None
         for k, v in payload["model_state_dict"].items()
     }
     master_path.parent.mkdir(parents=True, exist_ok=True)
-    ckpt_io.save(master_path, {"model_state_dict": model_state_dict})
+    # master_version=0 predates every real round_num merge_round stamps
+    # (Phase 3.2), so a worker's first real diff is never rejected as stale
+    # by comparison to this bootstrap master.
+    ckpt_io.save(
+        master_path, {"model_state_dict": model_state_dict, "master_version": 0}
+    )
 
 
 def _uv_bin() -> str:

@@ -18,6 +18,18 @@ mesh:
   outer_lr: 0.7
   outer_momentum: 0.9
   sync_timeout_s: 1800.0
+  # Per-node pacing (mesh/pacing.py). null keeps the uniform steps_per_round
+  # above for every node. Set it and each node instead trains what fits in
+  # this many seconds at its own measured rate, so rounds finish together
+  # instead of the fast nodes idling at the barrier (measured: 19.1% of all
+  # mesh wall-clock, over 1455 rounds). 960s ~= 9600 steps at the observed
+  # median 9.91 steps/s, so total work per round is roughly unchanged.
+  round_budget_s: null
+  # Clamps as fractions of steps_per_round: the floor stops a degraded node
+  # contributing a round of mostly-noise, the ceiling stops one bad rate
+  # estimate stalling the mesh it was meant to unblock.
+  step_floor_frac: 0.25
+  step_ceil_frac: 2.0
   subnet: "/254"               # fish tier default (pick_nodes.sh); only affects P2P fetch preference, not correctness
 
 train:
