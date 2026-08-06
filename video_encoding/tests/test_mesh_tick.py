@@ -17,6 +17,7 @@ from video_encoding.watcher.mesh_tick import (
     _submit_worker_job,
     advance_all_runs,
     advance_one_run,
+    sweep_orphaned_pending,
 )
 from video_encoding.watcher.state import WatcherState
 
@@ -396,7 +397,7 @@ def test_merging_passes_metrics_out_pointing_at_results_mesh_run_id(tmp_path):
     assert "--metrics-out" in cmd
     metrics_out_idx = cmd.index("--metrics-out")
     assert cmd[metrics_out_idx + 1] == str(
-        repo_root / ".claude" / "results" / "mesh" / "RUN1_rounds.jsonl"
+        repo_root / "runs" / "results" / "mesh" / "RUN1_rounds.jsonl"
     )
 
 
@@ -1159,9 +1160,145 @@ def test_replenish_pool_appends_idle_node_and_reassigns_shards(tmp_path):
     assert assignments["node004"] == ["s3"]
 
     registry = json.loads(
-        (tmp_path / ".claude" / "state" / "jobs_registry.json").read_text()
+        (tmp_path / "runs" / "state" / "jobs_registry.json").read_text()
     )
     assert any(r["nodelist"] == "node004" for r in registry)
+
+
+def test_replenish_pool_does_not_submit_a_replacement_with_no_shards_to_inherit(
+    tmp_path,
+):
+    """0.4 (redefined): a picked replacement only ever receives shards via
+    excluded_node's own reassign_failed handoff. If excluded_node has no
+    entry in shard_assignments at all, submitting a replacement anyway
+    leaves it with nothing to train on -- it crashes immediately on
+    read_my_shards, gets excluded itself, and _replenish_pool repeats with
+    the next idle node. Reproduced live on login-node 2026-08-05
+    (pool-cars-2r, node066/node051 both submitted with zero shard_assignments
+    entries)."""
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config()  # node001, node002, node003 -- fish tier
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.target_pool_size = 3
+    exclude_node(state, "node003", "crash-loop")
+
+    shard_map = {
+        "s1": [Holder(host="node001", subnet="/254")],
+        "s2": [Holder(host="node002", subnet="/254")],
+    }
+    save_shard_map(mesh_shared / "metadata" / "shard_map.json", shard_map)
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
+    # node003 has NO entry at all -- e.g. it was itself a prior replacement
+    # that fell into this same gap, or assign_locality_first never gave it
+    # any shards.
+    assignments_path.write_text(json.dumps({"node001": ["s1"], "node002": ["s2"]}))
+
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": list(_NODES),
+                    "n_shards": 2,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+
+    idle_sinfo = MagicMock(returncode=0, stdout="node004 idle\n")
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=idle_sinfo
+    ) as mock_run:
+        result = _replenish_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            "node003",
+        )
+
+    # sinfo (idle query) is allowed; sbatch (job submission) must never fire.
+    assert all(call.args[0][0] == "sinfo" for call in mock_run.call_args_list)
+    grown = json.loads(run_configs_path.read_text())
+    assert "node004" not in grown[0]["nodes"]
+    assert not (tmp_path / "runs" / "state" / "jobs_registry.json").exists()
+    assignments = json.loads(assignments_path.read_text())
+    assert "node004" not in assignments
+    assert result is not None  # still reports the skip, not silence
+
+
+def test_replenish_pool_does_not_submit_a_replacement_for_an_empty_shard_list(
+    tmp_path,
+):
+    """Same root cause, the other shape: excluded_node has an entry but it's
+    already empty (a prior reassignment took its shards, or it started with
+    none). read_my_shards treats an empty list as fatal too, so this must be
+    gated the same as a missing key."""
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config()
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.target_pool_size = 3
+    exclude_node(state, "node003", "crash-loop")
+
+    shard_map = {
+        "s1": [Holder(host="node001", subnet="/254")],
+        "s2": [Holder(host="node002", subnet="/254")],
+    }
+    save_shard_map(mesh_shared / "metadata" / "shard_map.json", shard_map)
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
+    assignments_path.write_text(
+        json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": []})
+    )
+
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": list(_NODES),
+                    "n_shards": 2,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+
+    idle_sinfo = MagicMock(returncode=0, stdout="node004 idle\n")
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=idle_sinfo
+    ) as mock_run:
+        _replenish_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            "node003",
+        )
+
+    assert all(call.args[0][0] == "sinfo" for call in mock_run.call_args_list)
+    grown = json.loads(run_configs_path.read_text())
+    assert "node004" not in grown[0]["nodes"]
 
 
 def test_replenish_pool_partial_fill_when_not_enough_idle(tmp_path):
@@ -1397,10 +1534,16 @@ def test_do_awaiting_checkpoints_triggers_replenish_on_new_exclusion(tmp_path):
 
     save_shard_map(
         mesh_shared / "metadata" / "shard_map.json",
-        {"s1": [Holder(host="node001", subnet="/254")]},
+        {
+            "s1": [Holder(host="node001", subnet="/254")],
+            "s2": [Holder(host="node003", subnet="/254")],
+        },
     )
+    # node003 must have a real shard to hand off -- an empty list would
+    # correctly block replenishment (0.4's fix), which is not what this
+    # test is exercising.
     (mesh_shared / "metadata" / "shard_assignments_RUN1.json").write_text(
-        json.dumps({"node001": ["s1"], "node002": [], "node003": []})
+        json.dumps({"node001": ["s1"], "node002": [], "node003": ["s2"]})
     )
 
     run_configs_path = tmp_path / "mesh_run_configs.json"
@@ -1613,6 +1756,46 @@ def test_done_run_sweeps_its_leftover_pending_checkpoints(tmp_path):
     assert (pending_dir / "OTHER_a.pt").exists()
 
 
+def test_done_run_clears_only_its_own_crash_loop_exclusions(tmp_path):
+    """0.5: SYNCING -> DONE must wipe this run's own crash-loop exclusions
+    (the 'dead list') so a node that misbehaved on a finished run isn't
+    permanently locked out of every future run -- but an exclusion tagged
+    for a different run, or flagged by hand, must survive."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "RUN1").mkdir(parents=True)
+
+    run_config = _run_config(
+        outer_lr=0.7, outer_momentum=0.9, weighting="data", rounds=1
+    )
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 0
+    state.excluded_nodes["node003"] = "crash-loop: missed 2 consecutive rounds of RUN1"
+    state.excluded_nodes["node004"] = "crash-loop: missed 2 consecutive rounds of RUN2"
+    state.excluded_nodes["cigogne"] = "manually flagged: broken GPU"
+
+    with patch(
+        "video_encoding.watcher.mesh_tick._transfer_results_to_node089",
+        return_value="transfer skipped",
+    ):
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert state.run("RUN1").status == "DONE"
+    assert "node003" not in state.excluded_nodes
+    assert "node004" in state.excluded_nodes
+    assert "cigogne" in state.excluded_nodes
+    # state.runs["RUN1"] must survive -- it's the only record protecting
+    # this run's worker jobs from remediate_dead_job going forward.
+    assert "RUN1" in state.runs
+
+
 def test_done_run_stages_local_momentum_back_for_the_node089_archive(tmp_path):
     """The buffer moved off NFS for the per-round budget, but it was in every
     previous archive and is part of a reproducible result -- so it comes back
@@ -1666,3 +1849,57 @@ def test_watcher_cron_entry_uses_no_sync():
     assert cron_lines, "no watcher cron line found in launch_mesh_pool.sh"
     for line in cron_lines:
         assert "uv run --no-sync" in line
+
+
+def test_sweep_orphaned_pending_deletes_nothing_with_empty_active_run_ids(tmp_path):
+    """load_run_configs returns [] when its file is missing (e.g. a
+    transient read failure) -- an empty active_run_ids must be treated as
+    "unknown", not "nothing is active", or this would wipe every live
+    checkpoint in pending/ on a bad tick."""
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    _write_pending_checkpoint(pending_dir / "RUN1_node001.pt")
+
+    swept = sweep_orphaned_pending(pending_dir, set(), max_age_s=0.0)
+
+    assert swept == 0
+    assert (pending_dir / "RUN1_node001.pt").exists()
+
+
+def test_sweep_orphaned_pending_deletes_old_files_from_unknown_runs(tmp_path):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    orphan = pending_dir / "DEAD_node001.pt"
+    _write_pending_checkpoint(orphan)
+    old_time = os.path.getmtime(orphan) - 7200
+    os.utime(orphan, (old_time, old_time))
+
+    swept = sweep_orphaned_pending(pending_dir, {"RUN1"}, max_age_s=3600.0)
+
+    assert swept == 1
+    assert not orphan.exists()
+
+
+def test_sweep_orphaned_pending_keeps_recent_files_from_unknown_runs(tmp_path):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    _write_pending_checkpoint(pending_dir / "DEAD_node001.pt")
+
+    swept = sweep_orphaned_pending(pending_dir, {"RUN1"}, max_age_s=3600.0)
+
+    assert swept == 0
+    assert (pending_dir / "DEAD_node001.pt").exists()
+
+
+def test_sweep_orphaned_pending_never_touches_an_active_runs_files(tmp_path):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    active = pending_dir / "RUN1_node001.pt"
+    _write_pending_checkpoint(active)
+    old_time = os.path.getmtime(active) - 7200
+    os.utime(active, (old_time, old_time))
+
+    swept = sweep_orphaned_pending(pending_dir, {"RUN1"}, max_age_s=3600.0)
+
+    assert swept == 0
+    assert active.exists()

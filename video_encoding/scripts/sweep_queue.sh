@@ -6,10 +6,10 @@
 #
 # Usage: sweep_queue.sh <fish|birds>
 #
-#   queue  .claude/state/sweep_queue_<tier>.txt -- "run_id rounds outer_lr
+#   queue  runs/state/sweep_queue_<tier>.txt -- "run_id rounds outer_lr
 #          outer_momentum" per line ('#' comments allowed), read ONCE at start
 #          and drained top-down.
-#   stop   touch .claude/state/sweep_queue_<tier>.stop to exit cleanly at the
+#   stop   touch runs/state/sweep_queue_<tier>.stop to exit cleanly at the
 #          next poll, leaving the in-flight run alone.
 set -euo pipefail
 
@@ -29,12 +29,12 @@ SINFO="${SWEEP_SINFO:-sinfo}"
 SQUEUE="${SWEEP_SQUEUE:-squeue}"
 STALL_S="${SWEEP_STALL_S:-1800}"
 
-# launch_mesh_pool.sh writes .claude/state/* through RELATIVE paths, so the
+# launch_mesh_pool.sh writes runs/state/* through RELATIVE paths, so the
 # fallback path is only correct with cwd at the repo root -- which a nohup'd
 # daemon started from anywhere else would not have.
 cd "${REPO_ROOT}"
 
-STATE_DIR="${REPO_ROOT}/.claude/state"
+STATE_DIR="${REPO_ROOT}/runs/state"
 QUEUE_FILE="${STATE_DIR}/sweep_queue_${TIER}.txt"
 LOG_FILE="${STATE_DIR}/sweep_queue_${TIER}.log"
 LOCK_FILE="${STATE_DIR}/sweep_queue_${TIER}.lock"

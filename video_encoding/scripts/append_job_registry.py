@@ -3,7 +3,7 @@ submit_login-node.sh's remote ssh block right after `sbatch` returns a job id.
 
 Usage:
   uv run python video_encoding/scripts/append_job_registry.py \
-      --registry-path .claude/state/jobs_registry.json \
+      --registry-path runs/state/jobs_registry.json \
       --job-id 36901 --experiment videomae_ssl_pretrain_voxmini \
       --run-tag p2-eb256 --nodelist node001
 """
@@ -21,7 +21,7 @@ from video_encoding.watcher.registry import JobRecord, append_job_record
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--registry-path", type=Path, default=Path(".claude/state/jobs_registry.json")
+        "--registry-path", type=Path, default=Path("runs/state/jobs_registry.json")
     )
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--experiment", required=True)

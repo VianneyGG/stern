@@ -5,6 +5,7 @@ from video_encoding.watcher.state import (
     SLOW_INTERVAL_S,
     WatcherState,
     advance_backoff,
+    clear_run_state,
     load_state,
     save_state,
 )
@@ -44,6 +45,17 @@ def test_save_and_load_round_trip(tmp_path):
     assert loaded.escalation_count_today == 3
 
 
+def test_nan_escalations_in_flight_round_trips(tmp_path):
+    path = tmp_path / "watcher_state.json"
+    state = WatcherState()
+    state.nan_escalations_in_flight["run1"] = 1234.0
+
+    save_state(path, state)
+    loaded = load_state(path)
+
+    assert loaded.nan_escalations_in_flight == {"run1": 1234.0}
+
+
 def test_advance_backoff_grows_toward_ceiling_when_no_action():
     state = WatcherState(current_interval_s=1000.0)
     advance_backoff(state, now=5000.0, action_taken=False)
@@ -78,3 +90,46 @@ def test_run_target_pool_size_roundtrips(tmp_path):
     loaded = load_state(path)
 
     assert loaded.run("RUN1").target_pool_size == 16
+
+
+def test_clear_run_state_removes_only_this_runs_crash_loop_exclusions():
+    """0.5: 'wipe the dead list at job end' must not re-admit a node
+    excluded for a different run or flagged by hand -- excluded_nodes is
+    documented as never auto-reversed except by a human, so clearing must
+    be scoped to exclusions this run itself caused."""
+    state = WatcherState()
+    state.excluded_nodes["node001"] = "crash-loop: missed 2 consecutive rounds of RUN1"
+    state.excluded_nodes["node002"] = "crash-loop: missed 3 consecutive rounds of RUN2"
+    state.excluded_nodes["node003"] = "manually flagged: broken GPU"
+
+    clear_run_state(state, "RUN1")
+
+    assert "node001" not in state.excluded_nodes
+    assert (
+        state.excluded_nodes["node002"]
+        == "crash-loop: missed 3 consecutive rounds of RUN2"
+    )
+    assert state.excluded_nodes["node003"] == "manually flagged: broken GPU"
+
+
+def test_clear_run_state_leaves_state_runs_untouched():
+    """state.runs must survive DONE -- it is the ONLY source watch_training.py
+    has for exempting a finished run's worker jobs from remediate_dead_job
+    (mesh_run_ids = configured runs | state.runs); popping it here would
+    reopen the exact bug fixed by the _is_mesh_job filter."""
+    state = WatcherState()
+    state.run("RUN1").status = "DONE"
+
+    clear_run_state(state, "RUN1")
+
+    assert "RUN1" in state.runs
+    assert state.runs["RUN1"].status == "DONE"
+
+
+def test_clear_run_state_is_a_noop_when_nothing_matches():
+    state = WatcherState()
+    state.excluded_nodes["node001"] = "manually flagged: broken GPU"
+
+    clear_run_state(state, "RUN1")
+
+    assert state.excluded_nodes == {"node001": "manually flagged: broken GPU"}

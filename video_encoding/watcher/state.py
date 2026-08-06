@@ -1,6 +1,6 @@
 """Watcher state: per-job tracking + the adaptive backoff timer.
 
-Persisted to .claude/state/watcher_state.json. The watcher has no long-lived
+Persisted to runs/state/watcher_state.json. The watcher has no long-lived
 process (it's cron-driven, spec §2) -- this file *is* its memory between
 invocations: loaded fresh each tick, mutated in memory by tick.run_full_check,
 written back atomically by the caller.
@@ -67,6 +67,13 @@ class WatcherState:
     escalation_count_today: int = 0
     runs: dict[str, RunState] = field(default_factory=dict)
     excluded_nodes: dict[str, str] = field(default_factory=dict)  # node -> reason
+    # run_id -> epoch time a NaN-remediation claude -p was spawned, so the
+    # per-run concurrency cap (at most one in flight) survives across the
+    # separate cron-spawned watch_training.py process each tick runs in --
+    # nothing in-memory carries over otherwise. Cleared implicitly once
+    # `now - value` exceeds the caller's concurrency_timeout_s, not by an
+    # explicit pop (see escalate.remediate_nan_node).
+    nan_escalations_in_flight: dict[str, float] = field(default_factory=dict)
 
     def job(self, slurm_job_id: str) -> JobState:
         return self.jobs.setdefault(slurm_job_id, JobState(slurm_job_id=slurm_job_id))
@@ -91,6 +98,7 @@ def load_state(path: Path) -> WatcherState:
         escalation_count_today=payload.get("escalation_count_today", 0),
         runs=runs,
         excluded_nodes=payload.get("excluded_nodes", {}),
+        nan_escalations_in_flight=payload.get("nan_escalations_in_flight", {}),
     )
 
 
@@ -104,10 +112,36 @@ def save_state(path: Path, state: WatcherState) -> None:
         "escalation_count_today": state.escalation_count_today,
         "runs": {k: asdict(v) for k, v in state.runs.items()},
         "excluded_nodes": state.excluded_nodes,
+        "nan_escalations_in_flight": state.nan_escalations_in_flight,
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2))
     tmp.replace(path)
+
+
+def clear_run_state(state: WatcherState, run_id: str) -> None:
+    """Wipe run_id's crash-loop exclusions when it reaches DONE.
+
+    Only removes excluded_nodes entries whose reason names run_id
+    (record_missed_round's exact format: "...consecutive rounds of
+    {run_id}") -- exclude_node's own contract is that a node is "never
+    auto-reversed... a human clears excluded_nodes by hand", so an
+    exclusion from a different run, or a manually-flagged permanent
+    hardware reason, must survive this call untouched.
+
+    Deliberately does NOT pop run_id from state.runs: that dict is the only
+    record watch_training.py has of every mesh run_id ever seen, and its
+    union with the live mesh_run_configs.json is what exempts a finished
+    run's worker jobs from remediate_dead_job (see watch_training.py's
+    mesh_run_ids comment) -- removing it here would reopen that exact bug
+    for any run that goes through DONE.
+    """
+    suffix = f"of {run_id}"
+    state.excluded_nodes = {
+        node: reason
+        for node, reason in state.excluded_nodes.items()
+        if not reason.endswith(suffix)
+    }
 
 
 def advance_backoff(state: WatcherState, *, now: float, action_taken: bool) -> None:

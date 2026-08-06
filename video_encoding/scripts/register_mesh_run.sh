@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # video_encoding/scripts/register_mesh_run.sh
-# Add (or replace) one run's entry in .claude/state/mesh_run_configs.json --
+# Add (or replace) one run's entry in runs/state/mesh_run_configs.json --
 # the file the watcher's load_run_configs() reads. This is the ONLY writer of
 # that file; launch_mesh_pool.sh and sweep_queue.sh both call it.
 #
@@ -37,7 +37,7 @@ run_id, active_csv, rounds, outer_lr, outer_momentum, repo_root = (
 )
 nodes = active_csv.split(",")
 
-path = repo_root / ".claude" / "state" / "mesh_run_configs.json"
+path = repo_root / "runs" / "state" / "mesh_run_configs.json"
 cfgs = json.loads(path.read_text()) if path.exists() else []
 cfgs = [c for c in cfgs if c["run_id"] != run_id]
 cfgs.append(

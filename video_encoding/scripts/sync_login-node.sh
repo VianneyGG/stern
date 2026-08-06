@@ -13,10 +13,10 @@ REMOTE_DIR="~/stern"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # 1. Pull results from cluster → local (non-fatal: dir may not exist yet)
-mkdir -p "${REPO_ROOT}/.claude/results"
+mkdir -p "${REPO_ROOT}/runs/results"
 rsync -avz \
-  "${REMOTE_HOST}:${REMOTE_DIR}/.claude/results/" \
-  "${REPO_ROOT}/.claude/results/" || true
+  "${REMOTE_HOST}:${REMOTE_DIR}/runs/results/" \
+  "${REPO_ROOT}/runs/results/" || true
 
 # 2. Push source → login-node (--delete is safe: results now exist locally)
 rsync -avz --delete \

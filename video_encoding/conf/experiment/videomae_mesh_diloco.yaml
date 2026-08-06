@@ -1,0 +1,59 @@
+# @package _global_
+#
+# DiLoCo-faithful mesh SSL defaults (arXiv 2311.08105 / OpenDiLoCo 2407.07852),
+# adapted to this cluster. Differs from videomae_mesh_ssl.yaml (the ad-hoc grid
+# config) in three ways, all deliberate:
+#
+#   1. H (inner optimizer steps per round) 150 -> 250. The paper uses H=500;
+#      halving it is the concession to a 3-day SLURM wall and 1GbE-backed NFS,
+#      not a disagreement with the paper. H is the single biggest lever on both
+#      convergence and NFS load: every round costs one full master.pt read plus
+#      one checkpoint push per node, so doubling H halves per-step merge I/O.
+#   2. eff_batch 64 -> 128, the lower shoulder the Phase-2 sweep actually
+#      recommended (128-256). The old config's comment claimed it landed there
+#      at accum_steps=64, but 1 * 64 = 64 is below the band.
+#   3. Outer-optimizer knobs are NOT declared here. See the note below.
+#
+# NOT SET HERE, ON PURPOSE -- outer_lr, outer_momentum, weighting and
+# broadcast_dtype look like they belong in this file, but the worker never
+# reads them: mesh_round.py only consumes cfg.mesh.{rounds,steps_per_round,
+# merge,subnet}. They reach the merge through mesh_run_configs.json, written by
+# launch_mesh_pool.sh (whose own defaults are outer_lr=0.7, outer_momentum=0.9
+# -- the paper's values) and consumed by watcher/mesh_tick.py +
+# scripts/run_outer_step.py. Declaring them here would compose cleanly and
+# silently do nothing, which is exactly the trap videomae_mesh_ssl.yaml sets.
+# Launch with:
+#   launch_mesh_pool.sh <tier> <run_id> <rounds> 0.7 0.9
+
+defaults:
+  - override /train: ssl
+
+experiment:
+  name: videomae_mesh_diloco
+  description: "DiLoCo-faithful decentralized mesh SSL pretraining -- consumes MESH_* env vars, bypasses cfg.dataset entirely (see training/mesh_round.py)."
+  stage: pretrain
+
+mesh:
+  # 250 outer steps x H=250 inner steps = 62.5k optimizer steps total.
+  rounds: 250
+  # Micro-batches per round, NOT optimizer steps: H * accum_steps = 250 * 128.
+  # mesh_round.py caps the round at this many DataLoader items.
+  steps_per_round: 32000
+  merge: true
+  sync_timeout_s: 1800.0
+  # Only affects P2P shard-fetch holder preference, never correctness. Override
+  # per tier at launch; "/254" is the fish default from pick_nodes.sh.
+  subnet: "/254"
+
+train:
+  # eff_batch = _MESH_BATCH_SIZE(1) * accum_steps = 128. _scaled_lr derives
+  # lr = base_lr * 128/256 * lr_mult = 7.5e-5 automatically.
+  accum_steps: 128
+  # AdamW inner optimizer, MAE convention -- betas (0.9, 0.95) are set in
+  # mesh_round.py, not here.
+  weight_decay: 0.05
+  base_lr: 1.5e-4
+  lr_mult: 1.0
+  warmup_epochs: 5
+  grad_clip: 1.0
+  amp: bf16

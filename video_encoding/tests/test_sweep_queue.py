@@ -85,7 +85,7 @@ class Sweep:
     def __init__(self, tmp_path: Path):
         self.tmp = tmp_path
         self.root = tmp_path / "repo"
-        self.state = self.root / ".claude" / "state"
+        self.state = self.root / "runs" / "state"
         self.mesh = tmp_path / "mesh_shared"
         self.bin = tmp_path / "bin"
         self.state.mkdir(parents=True)
@@ -198,7 +198,7 @@ class Sweep:
 
     def popen(self) -> subprocess.Popen:
         # cwd deliberately NOT the repo root: a nohup'd daemon has no reason to
-        # inherit one, and launch_mesh_pool.sh writes .claude/state relatively.
+        # inherit one, and launch_mesh_pool.sh writes runs/state relatively.
         return subprocess.Popen(
             ["bash", str(SCRIPT), TIER],
             env=self.env(),

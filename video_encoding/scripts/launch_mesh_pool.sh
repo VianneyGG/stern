@@ -73,7 +73,7 @@ echo "launch_mesh_pool: ${TIER} backup (seeded, not active)=[$(IFS=,; echo "${BA
 # replenish a dead active node from a backup that already has a seeded
 # /Data/$USER/mesh payload, instead of the replacement dying on
 # read_my_shards' KeyError with an empty local shard dir.
-printf '%s\n' "${READY[@]}" > ".claude/state/mesh_pool_ready_${TIER}.txt"
+printf '%s\n' "${READY[@]}" > "runs/state/mesh_pool_ready_${TIER}.txt"
 
 SOURCE_NODE="${ACTIVE[0]}"
 echo "launch_mesh_pool: reseeding ${SOURCE_NODE} from node089..."
@@ -95,5 +95,5 @@ echo "launch_mesh_pool: registering run config ${RUN_ID} (outer_lr=${OUTER_LR} o
 "$(dirname "${BASH_SOURCE[0]}")/register_mesh_run.sh" \
   "${RUN_ID}" "${ACTIVE_CSV}" "${ROUNDS}" "${OUTER_LR}" "${OUTER_MOMENTUM}"
 
-echo "${ACTIVE_CSV}" > ".claude/state/mesh_pool_active_${TIER}.txt"
+echo "${ACTIVE_CSV}" > "runs/state/mesh_pool_active_${TIER}.txt"
 echo "launch_mesh_pool: ${TIER} pool launched -- watcher cron will pick up ${RUN_ID} within a minute"

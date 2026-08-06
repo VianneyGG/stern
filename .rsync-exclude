@@ -6,8 +6,9 @@ uv.toml
 # Remote-only watcher state (job registry, watcher.log, watcher_state.json).
 # NOT excluding this deleted it wholesale via rsync --delete on 2026-07-22
 # (same failure mode as the slurm-logs note below) since it doesn't exist
-# in the local checkout.
-.claude/state/
+# in the local checkout. Moved out of .claude/ to runs/ on 2026-08-05 --
+# path changed, the remote-only rationale did not.
+runs/state/
 human/
 .pytest_cache/
 __pycache__/

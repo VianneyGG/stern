@@ -8,7 +8,11 @@ import torch
 from omegaconf import OmegaConf
 
 from video_encoding.models.videomaev2.encoder import VideoMAEEncoder
-from video_encoding.training.checkpoint import load_checkpoint_file, load_encoder_state
+from video_encoding.training.checkpoint import (
+    load_checkpoint_file,
+    load_encoder_state,
+    try_save,
+)
 
 
 def _tiny_cfg(in_channels: int):
@@ -102,3 +106,55 @@ def test_load_checkpoint_file_from_unzipped_directory(tmp_path):
     assert torch.equal(
         loaded["model_state_dict"]["x"], payload["model_state_dict"]["x"]
     )
+
+
+def test_try_save_writes_payload_and_reports_success(tmp_path):
+    """The happy path must still produce a real, loadable file -- try_save is a
+    wrapper around save(), not a separate write path."""
+    path = tmp_path / "ckpt.pt"
+    payload = {"epoch": 1, "model_state_dict": {"w": torch.tensor([1.0, 2.0])}}
+
+    assert try_save(path, payload, backoff_s=0.0) is True
+    assert path.exists()
+    assert torch.equal(torch.load(path, weights_only=False)["model_state_dict"]["w"],
+                       payload["model_state_dict"]["w"])
+
+
+def test_try_save_recovers_when_a_write_fails_once(tmp_path, monkeypatch):
+    """The 74 production crashes were a transient-looking NFS write failure at
+    torch.save. One failure must not lose the checkpoint."""
+    path = tmp_path / "ckpt.pt"
+    real_save = torch.save
+    calls = []
+
+    def flaky_save(obj, f, *a, **kw):
+        calls.append(f)
+        if len(calls) == 1:
+            raise RuntimeError("basic_ios::clear: iostream error")
+        return real_save(obj, f, *a, **kw)
+
+    monkeypatch.setattr(torch, "save", flaky_save)
+
+    assert try_save(path, {"epoch": 1}, backoff_s=0.0) is True
+    assert len(calls) == 2
+    assert path.exists()
+
+
+def test_try_save_returns_false_instead_of_raising_when_all_attempts_fail(
+    tmp_path, monkeypatch
+):
+    """Degrade, don't die: 68 of 74 production failures were one correlated
+    cluster-wide event, so exhausting retries must let the worker skip the round
+    and keep training rather than propagate and kill the node."""
+    path = tmp_path / "ckpt.pt"
+    calls = []
+
+    def always_fails(obj, f, *a, **kw):
+        calls.append(f)
+        raise RuntimeError("basic_ios::clear: iostream error")
+
+    monkeypatch.setattr(torch, "save", always_fails)
+
+    assert try_save(path, {"epoch": 1}, attempts=3, backoff_s=0.0) is False
+    assert len(calls) == 3
+    assert not path.exists()

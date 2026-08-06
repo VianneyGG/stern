@@ -3,9 +3,9 @@
 No wrapper class: `make_writer` returns a `SummaryWriter` or `None` (call
 sites guard with `if writer:`), and `write_result_json` is a standalone
 function. Schema parity with the What_Happens_Next repo's result JSONs is
-deliberate: both projects share the same cluster and the same
-`.claude/results/` layout, so cross-project isoFLOP / cost-per-sample
-comparisons stay meaningful.
+deliberate: both projects share the same cluster, so cross-project isoFLOP /
+cost-per-sample comparisons stay meaningful even though the JSONs now live
+under this repo's own `runs/results/`, not a shared `.claude/results/` path.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ def write_result_json(
 ) -> Path | None:
     """Write one result JSON per run. Call only on rank 0.
 
-    Schema-compatible with WHN's per-run JSONs so `.claude/results/` stays
+    Schema-compatible with WHN's per-run JSONs so `runs/results/` stays
     cross-project comparable. Merges: caller-provided `metrics`, resolved
     cfg snapshot, and environment/reproducibility fields.
 

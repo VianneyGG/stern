@@ -26,6 +26,7 @@ from typing import Any, Mapping, MutableMapping
 
 import io
 import os
+import time
 import zipfile
 
 import torch
@@ -43,6 +44,32 @@ def save(path: Path | str, payload: Mapping[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(dict(payload), tmp)
     tmp.replace(path)
+
+
+def try_save(
+    path: Path | str,
+    payload: Mapping[str, Any],
+    *,
+    attempts: int = 3,
+    backoff_s: float = 30.0,
+) -> bool:
+    """Best-effort `save()`: retries on failure, returns False instead of
+    raising once `attempts` is exhausted.
+
+    The observed production failure (NFS write errors during finalization)
+    clusters into cluster-wide events lasting minutes, not per-node blips --
+    so a caller that needs to keep training rather than die should get a
+    bool back, not an exception.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            save(path, payload)
+            return True
+        except Exception:
+            if attempt == attempts:
+                return False
+            time.sleep(backoff_s)
+    return False
 
 
 def save_best(

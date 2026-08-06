@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-from video_encoding.watcher.detectors import detect_dead, detect_quota, detect_stalled
+import json
+
+from video_encoding.watcher.detectors import (
+    detect_dead,
+    detect_nan,
+    detect_quota,
+    detect_stalled,
+)
 from video_encoding.watcher.registry import JobRecord
-from video_encoding.watcher.state import JobState
+from video_encoding.watcher.state import JobState, WatcherState
 
 REGISTRY = [
     JobRecord("1", "exp_a", "tagA", "2026-07-15T09:00:00Z", "node001"),
@@ -126,3 +133,100 @@ def test_detect_quota_flags_above_threshold():
 
 def test_detect_quota_no_flags_below_threshold():
     assert detect_quota({"home": 50.0}, threshold_pct=90) == []
+
+
+def _write_metrics(path, records):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as fh:
+        for record in records:
+            fh.write(json.dumps(record) + "\n")
+
+
+def _round_record(node, round_num, train_loss):
+    return {
+        "run_id": "run1",
+        "node": node,
+        "round": round_num,
+        "train_loss": train_loss,
+        "val_loss": 0.1,
+        "samp_s": 10.0,
+        "n_shards": 4,
+        "ts": 1000.0 + round_num,
+    }
+
+
+def test_detect_nan_flags_node_with_nan_train_loss(tmp_path):
+    _write_metrics(
+        tmp_path / "metrics" / "run1" / "nodeA.jsonl",
+        [_round_record("nodeA", 1, float("nan"))],
+    )
+    flags = detect_nan("run1", tmp_path, WatcherState())
+    assert len(flags) == 1
+    assert flags[0].subject == "nan:run1:nodeA"
+    assert flags[0].kind == "nan"
+
+
+def test_detect_nan_flags_node_with_inf_train_loss(tmp_path):
+    _write_metrics(
+        tmp_path / "metrics" / "run1" / "nodeA.jsonl",
+        [_round_record("nodeA", 1, float("inf"))],
+    )
+    flags = detect_nan("run1", tmp_path, WatcherState())
+    assert len(flags) == 1
+
+
+def test_detect_nan_ignores_node_with_normal_loss(tmp_path):
+    _write_metrics(
+        tmp_path / "metrics" / "run1" / "nodeA.jsonl",
+        [_round_record("nodeA", 1, 0.42)],
+    )
+    assert detect_nan("run1", tmp_path, WatcherState()) == []
+
+
+def test_detect_nan_uses_only_latest_round_not_a_stale_earlier_nan(tmp_path):
+    _write_metrics(
+        tmp_path / "metrics" / "run1" / "nodeA.jsonl",
+        [_round_record("nodeA", 1, float("nan")), _round_record("nodeA", 2, 0.3)],
+    )
+    assert detect_nan("run1", tmp_path, WatcherState()) == []
+
+
+def test_detect_nan_returns_empty_when_no_metrics_dir(tmp_path):
+    assert detect_nan("run1", tmp_path, WatcherState()) == []
+
+
+def test_detect_nan_skips_node_already_resolved(tmp_path):
+    _write_metrics(
+        tmp_path / "metrics" / "run1" / "nodeA.jsonl",
+        [_round_record("nodeA", 1, float("nan"))],
+    )
+    state = WatcherState()
+    state.jobs["nan:run1:nodeA"] = JobState("nan:run1:nodeA", status="resolved")
+    assert detect_nan("run1", tmp_path, state) == []
+
+
+def test_detect_nan_classifies_as_nan_after_retry_once_already_retried(tmp_path):
+    _write_metrics(
+        tmp_path / "metrics" / "run1" / "nodeA.jsonl",
+        [_round_record("nodeA", 2, float("nan"))],
+    )
+    state = WatcherState()
+    state.jobs["nan:run1:nodeA"] = JobState("nan:run1:nodeA", auto_resubmit_count=1)
+    flags = detect_nan("run1", tmp_path, state)
+    assert len(flags) == 1
+    assert flags[0].kind == "nan_after_retry"
+
+
+def test_detect_nan_skips_run_already_marked_done(tmp_path):
+    """A DONE run's workers are gone -- its last metrics line is whatever
+    was written at finish time and will never change again. Without this
+    guard, a run that happened to finish on a NaN'd round gets re-flagged
+    (and re-escalated) on every single future tick forever, observed live
+    on login-node 2026-08-06 for pool-cars-2r/node052."""
+    _write_metrics(
+        tmp_path / "metrics" / "run1" / "nodeA.jsonl",
+        [_round_record("nodeA", 5, float("nan"))],
+    )
+    state = WatcherState()
+    state.run("run1").status = "DONE"
+    assert detect_nan("run1", tmp_path, state) == []

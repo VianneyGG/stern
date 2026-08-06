@@ -336,62 +336,75 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             )
             writer.flush()
 
-        payload = ckpt_io.base_payload(
-            model=model,
-            optimizer=optimizer,
-            epoch=round_num,
-            best_val_metric=val_loss,
-            model_name="videomae_for_pretraining",
-            optimizer_name="adamw",
-        )
-        payload["n_samples"] = train_stats["samples"]
-        payload["val_loss"] = val_loss
-        payload["round"] = round_num
-        payload["samples_per_s"] = train_stats["samples_per_s_per_gpu"]
-        payload["outer_lr"] = outer_lr
-        payload["outer_momentum"] = outer_momentum
-
-        local_path = checkpoint_root / f"{run_id}.pt"
-        _t0 = time.monotonic()
-        ckpt_io.save(local_path, payload)
-        io_stats["local_save_s"] = time.monotonic() - _t0
-
-        shared_payload = {
-            k: v for k, v in payload.items() if k not in _SHARED_PAYLOAD_DROP_KEYS
-        }
-        io_stats.update(
-            push_checkpoint_and_wait(
-                shared_payload,
-                mesh_shared=mesh_shared,
-                run_id=run_id,
-                node=node,
-                round_num=round_num,
-                merge=merge,
-                sync_timeout_s=sync_timeout_s,
+        if train_stats["samples"] == 0:
+            # A worker with no shards for this round produced an untrained
+            # model -- pushing it would count toward merge quorum with
+            # train_loss=nan and corrupt the average. Skip the write/push
+            # entirely and just keep going; this is not a failure.
+            logger.warning(
+                "run_mesh_pretrain_stage: round %d fetched zero samples "
+                "(run_id=%s node=%s) -- skipping local save and push",
+                round_num,
+                run_id,
+                node,
             )
-        )
+        else:
+            payload = ckpt_io.base_payload(
+                model=model,
+                optimizer=optimizer,
+                epoch=round_num,
+                best_val_metric=val_loss,
+                model_name="videomae_for_pretraining",
+                optimizer_name="adamw",
+            )
+            payload["n_samples"] = train_stats["samples"]
+            payload["val_loss"] = val_loss
+            payload["round"] = round_num
+            payload["samples_per_s"] = train_stats["samples_per_s_per_gpu"]
+            payload["outer_lr"] = outer_lr
+            payload["outer_momentum"] = outer_momentum
 
-        # One structured line per round. The point is to separate real NFS
-        # transfer time from barrier time: only the former is what shrinking
-        # the payload can fix, and if flag_wait dominates then the whole
-        # byte-reduction premise is wrong and the round barrier is the thing
-        # to attack instead.
-        logger.info(
-            "mesh_io round=%d node=%s master_load_s=%.2f master_bytes=%d "
-            "local_save_s=%.2f pending_push_s=%.2f pending_bytes=%d "
-            "flag_wait_s=%.2f",
-            round_num,
-            node,
-            io_stats["master_load_s"],
-            io_stats["master_bytes"],
-            io_stats["local_save_s"],
-            io_stats["pending_push_s"],
-            io_stats["pending_bytes"],
-            io_stats["flag_wait_s"],
-        )
-        if writer is not None:
-            for key in ("master_load_s", "pending_push_s", "flag_wait_s"):
-                writer.add_scalar(f"round_io/{key}", io_stats[key], round_num)
+            local_path = checkpoint_root / f"{run_id}.pt"
+            _t0 = time.monotonic()
+            ckpt_io.save(local_path, payload)
+            io_stats["local_save_s"] = time.monotonic() - _t0
+
+            shared_payload = {
+                k: v for k, v in payload.items() if k not in _SHARED_PAYLOAD_DROP_KEYS
+            }
+            io_stats.update(
+                push_checkpoint_and_wait(
+                    shared_payload,
+                    mesh_shared=mesh_shared,
+                    run_id=run_id,
+                    node=node,
+                    round_num=round_num,
+                    merge=merge,
+                    sync_timeout_s=sync_timeout_s,
+                )
+            )
+
+            # One structured line per round. The point is to separate real
+            # NFS transfer time from barrier time: only the former is what
+            # shrinking the payload can fix, and if flag_wait dominates then
+            # the whole byte-reduction premise is wrong and the round
+            # barrier is the thing to attack instead.
+            logger.info(
+                "mesh_io round=%d node=%s master_load_s=%.2f master_bytes=%d "
+                "local_save_s=%.2f pending_push_s=%.2f pending_bytes=%d "
+                "flag_wait_s=%.2f",
+                round_num,
+                node,
+                io_stats["master_load_s"],
+                io_stats["master_bytes"],
+                io_stats["local_save_s"],
+                io_stats["pending_push_s"],
+                io_stats["pending_bytes"],
+                io_stats["flag_wait_s"],
+            )
+            if writer is not None:
+                for key in ("master_load_s", "pending_push_s", "flag_wait_s"):
+                    writer.add_scalar(f"round_io/{key}", io_stats[key], round_num)
 
         final_round = round_num
         print(
@@ -518,17 +531,22 @@ def push_checkpoint_and_wait(
 ) -> dict[str, float]:
     """Push `payload` to the shared pending/ dir, then (if merging) wait.
 
-    Returns `{"pending_push_s", "pending_bytes", "flag_wait_s"}` for the
-    caller's per-round I/O log -- the push and the barrier wait are the two
-    costs that have to be told apart before any NFS optimization can be
-    judged, and they are only separable here.
+    Returns `{"pending_push_s", "pending_bytes", "flag_wait_s", "pushed"}`
+    for the caller's per-round I/O log -- the push and the barrier wait are
+    the two costs that have to be told apart before any NFS optimization can
+    be judged, and they are only separable here.
 
     Writes to mesh_shared/checkpoints/pending/{run_id}_{node}.pt, with
     `model_state_dict` cast to fp16 (this shared copy only -- the caller's
-    own local checkpoint save happens before this call and keeps fp32). If
-    `merge` is False (the ab-single_node reference arm), returns immediately
-    -- no wait, the caller proceeds to the next round locally. If `merge` is
-    True, polls for
+    own local checkpoint save happens before this call and keeps fp32), via
+    `checkpoint.try_save` so a transient NFS write failure degrades instead
+    of raising: on exhausted retries this returns `pushed=False` and skips
+    the barrier entirely, leaving the caller to proceed to the next round
+    from its own weights rather than dying mid-run.
+
+    If the push succeeded and `merge` is False (the ab-single_node reference
+    arm), returns immediately -- no wait, the caller proceeds to the next
+    round locally. If the push succeeded and `merge` is True, polls for
     mesh_shared/checkpoints/flags/sync_complete_{run_id}_{round_num}.flag
     every 5s up to sync_timeout_s; on timeout, logs an ERROR naming
     run_id/round_num/node and calls sys.exit(1) -- NOT escalate.py, which
@@ -542,12 +560,23 @@ def push_checkpoint_and_wait(
     shared_payload = dict(payload)
     shared_payload["model_state_dict"] = _fp16_state_dict(payload["model_state_dict"])
     _t0 = time.monotonic()
-    ckpt_io.save(pending_path, shared_payload)
+    pushed = ckpt_io.try_save(pending_path, shared_payload)
     stats = {
         "pending_push_s": time.monotonic() - _t0,
         "pending_bytes": pending_path.stat().st_size if pending_path.exists() else 0,
         "flag_wait_s": 0.0,
+        "pushed": pushed,
     }
+
+    if not pushed:
+        logger.error(
+            "push_checkpoint_and_wait: checkpoint push failed after retries, "
+            "skipping this round's barrier (run_id=%s round_num=%d node=%s)",
+            run_id,
+            round_num,
+            node,
+        )
+        return stats
 
     if not merge:
         return stats

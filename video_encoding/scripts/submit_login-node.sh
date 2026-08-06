@@ -86,8 +86,13 @@ if ! crontab -l 2>/dev/null | grep -q "watch_training"; then
   # ~/.local/bin, where uv lives -- an unqualified "uv" here fails silently
   # every tick with no watcher.log entry at all. \$HOME/.local/bin/uv is
   # robust since cron always sets HOME for the crontab owner. cron_stderr.log
-  # captures anything that fails before our own logging can run.
-  (crontab -l 2>/dev/null; echo "* * * * * cd ${REMOTE_DIR} && \$HOME/.local/bin/uv run python -m video_encoding.scripts.watch_training >> ${REMOTE_DIR}/.claude/state/cron_stderr.log 2>&1") | crontab -
+  # captures anything that fails before our own logging can run. --no-sync is
+  # required, not optional: the venv is 9.4 GB on NFS, and without it every
+  # 60s tick re-syncs while the previous tick's sync may still be running,
+  # racing uv's own package install/uninstall and intermittently crashing
+  # watch_training.py with ModuleNotFoundError before it ever imports
+  # video_encoding (observed in production 2026-08-05).
+  (crontab -l 2>/dev/null; echo "* * * * * cd ${REMOTE_DIR} && \$HOME/.local/bin/uv run --no-sync python -m video_encoding.scripts.watch_training >> ${REMOTE_DIR}/runs/state/cron_stderr.log 2>&1") | crontab -
   echo "Installed training watcher crontab entry."
 fi
 REMOTE

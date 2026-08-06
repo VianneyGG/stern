@@ -26,16 +26,27 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from video_encoding.watcher.mesh_tick import advance_all_runs, load_run_configs
+from video_encoding.watcher.detectors import detect_nan
+from video_encoding.watcher.escalate import remediate_nan_node
+from video_encoding.watcher.mesh_tick import (
+    advance_all_runs,
+    load_run_configs,
+    sweep_orphaned_pending,
+)
 from video_encoding.watcher.squeue import refresh_squeue_snapshot
 from video_encoding.watcher.state import load_state, save_state
 from video_encoding.watcher.tick import run_full_check
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-STATE_DIR = REPO_ROOT / ".claude" / "state"
-RESULTS_DIR = REPO_ROOT / ".claude" / "results"
+STATE_DIR = REPO_ROOT / "runs" / "state"
+RESULTS_DIR = REPO_ROOT / "runs" / "results"
 LOG_PATH = STATE_DIR / "watcher.log"
 LOCK_PATH = STATE_DIR / "watch_training.lock"
+# Applies only to pending/ checkpoints whose run_id is not currently
+# configured -- an active run's own checkpoints are never touched
+# regardless of age. Generous relative to sync_timeout_s (1800s default) so
+# a slow-but-live round is never mistaken for an orphan.
+_ORPHANED_PENDING_MAX_AGE_S = 3600.0
 
 
 def main() -> int:
@@ -67,14 +78,13 @@ def main() -> int:
     # flags on their own schedule, independent of that cadence.
     run_configs = load_run_configs(STATE_DIR / "mesh_run_configs.json")
     if run_configs:
+        mesh_shared = Path(os.environ.get("MESH_SHARED", Path.home() / "stern_mesh"))
         try:
             mesh_actions = advance_all_runs(
                 run_configs,
                 state=state,
                 repo_root=REPO_ROOT,
-                mesh_shared=Path(
-                    os.environ.get("MESH_SHARED", Path.home() / "stern_mesh")
-                ),
+                mesh_shared=mesh_shared,
                 mesh_root=Path("/Data/$USER/mesh"),
                 now=now,
                 run_configs_path=STATE_DIR / "mesh_run_configs.json",
@@ -88,6 +98,45 @@ def main() -> int:
         save_state(state_path, state)  # advance_all_runs may have mutated state
         for action in mesh_actions:
             _log(f"mesh: {action}")
+
+        # Unconditional like advance_all_runs above -- catches checkpoints
+        # from runs that died before ever reaching SYNCING/DONE (the only
+        # other sweep site), independent of the full-check backoff timer.
+        swept = sweep_orphaned_pending(
+            mesh_shared / "checkpoints" / "pending",
+            {c.run_id for c in run_configs},
+            max_age_s=_ORPHANED_PENDING_MAX_AGE_S,
+        )
+        if swept:
+            _log(f"swept {swept} orphaned pending checkpoint(s)")
+
+        # Also unconditional: a NaN'd node must be excluded before the next
+        # round, not after a stalled/dead-job backoff timer says it's due.
+        # Defaults to dry-run (report only, no exclude/spawn) until the
+        # first production deploy has been observed behaving correctly.
+        nan_dry_run = (
+            os.environ.get("NAN_REMEDIATION_DRY_RUN", "true").strip().lower() != "false"
+        )
+        nan_acted = False
+        for run_config in run_configs:
+            for flag in detect_nan(run_config.run_id, mesh_shared, state):
+                node = flag.subject.split(":", 2)[2]
+                result = remediate_nan_node(
+                    flag,
+                    run_id=run_config.run_id,
+                    node=node,
+                    round_num=state.run(run_config.run_id).round,
+                    state=state,
+                    repo_root=REPO_ROOT,
+                    transcript_dir=STATE_DIR / "escalations",
+                    now=now,
+                    now_str=datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
+                    dry_run=nan_dry_run,
+                )
+                nan_acted = True
+                _log(f"nan: {flag.subject} -> {result}")
+        if nan_acted:
+            save_state(state_path, state)  # remediate_nan_node mutated state
 
     if now < state.next_full_check_at:
         return 0  # fast path -- not due yet

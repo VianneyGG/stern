@@ -13,7 +13,7 @@ from video_encoding.watcher.escalate import (
     should_escalate,
 )
 from video_encoding.watcher.registry import JobRecord
-from video_encoding.watcher.state import WatcherState
+from video_encoding.watcher.state import JobState, WatcherState
 
 
 def test_should_escalate_true_when_never_escalated():
@@ -181,3 +181,207 @@ def test_run_escalation_handles_popen_launch_failure(tmp_path):
     assert path.exists()
     assert "ERROR: failed to launch claude -p" in path.read_text()
     assert "claude: command not found" in path.read_text()
+
+
+def _fake_detached_popen(captured):
+    def _popen(cmd, *, stdout, stderr, text, cwd=None, start_new_session=None):
+        captured["cmd"] = cmd
+        captured["start_new_session"] = start_new_session
+        stdout.write("simulated claude -p transcript\n")
+        stdout.close()
+        return object()  # remediate_nan_node must never call .wait() on this
+
+    return _popen
+
+
+def test_remediate_nan_node_excludes_node_and_retries_once(tmp_path):
+    from video_encoding.watcher.escalate import remediate_nan_node
+
+    flag = Flag("nan:run1:nodeA", "nan", "nodeA: train_loss=nan round=3 run_id=run1")
+    state = WatcherState()
+    captured = {}
+
+    with patch("subprocess.Popen", side_effect=_fake_detached_popen(captured)):
+        result = remediate_nan_node(
+            flag,
+            run_id="run1",
+            node="nodeA",
+            round_num=3,
+            state=state,
+            repo_root=tmp_path,
+            transcript_dir=tmp_path / "escalations",
+            now=1000.0,
+            now_str="20260805-100000",
+        )
+
+    assert result == "retried"
+    assert "nodeA" in state.excluded_nodes
+    assert state.excluded_nodes["nodeA"].endswith("of run1")
+    assert state.jobs["nan:run1:nodeA"].auto_resubmit_count == 1
+    assert state.nan_escalations_in_flight["run1"] == 1000.0
+    assert "cmd" in captured  # claude -p was actually spawned
+
+
+def test_remediate_nan_node_never_waits_on_the_spawned_process(tmp_path):
+    from video_encoding.watcher.escalate import remediate_nan_node
+
+    flag = Flag("nan:run1:nodeA", "nan", "nodeA: train_loss=nan round=1 run_id=run1")
+    state = WatcherState()
+
+    class _NoWaitAllowed:
+        def wait(self):
+            raise AssertionError(
+                "remediate_nan_node must spawn detached, never block on .wait()"
+            )
+
+    def _popen(cmd, *, stdout, stderr, text, cwd=None, start_new_session=None):
+        stdout.write("ok\n")
+        stdout.close()
+        return _NoWaitAllowed()
+
+    with patch("subprocess.Popen", side_effect=_popen):
+        remediate_nan_node(
+            flag,
+            run_id="run1",
+            node="nodeA",
+            round_num=1,
+            state=state,
+            repo_root=tmp_path,
+            transcript_dir=tmp_path / "escalations",
+            now=1000.0,
+            now_str="20260805-100000",
+        )
+
+
+def test_remediate_nan_node_second_nan_drains_and_never_resubmits(tmp_path):
+    from video_encoding.watcher.escalate import remediate_nan_node
+
+    state = WatcherState()
+    state.jobs["nan:run1:nodeA"] = JobState("nan:run1:nodeA", auto_resubmit_count=1)
+    flag = Flag(
+        "nan:run1:nodeA", "nan_after_retry", "nodeA: train_loss=nan round=5 run_id=run1"
+    )
+
+    with patch("subprocess.Popen") as mock_popen:
+        result = remediate_nan_node(
+            flag,
+            run_id="run1",
+            node="nodeA",
+            round_num=5,
+            state=state,
+            repo_root=tmp_path,
+            transcript_dir=tmp_path / "escalations",
+            now=2000.0,
+            now_str="20260805-110000",
+        )
+
+    assert result == "drained"
+    assert "nodeA" in state.excluded_nodes  # still excluded
+    assert state.jobs["nan:run1:nodeA"].status == "resolved"
+    mock_popen.assert_not_called()
+
+
+def test_remediate_nan_node_concurrency_cap_blocks_second_simultaneous_node(tmp_path):
+    from video_encoding.watcher.escalate import remediate_nan_node
+
+    state = WatcherState()
+    captured = {}
+    flag_a = Flag("nan:run1:nodeA", "nan", "nodeA: train_loss=nan round=3 run_id=run1")
+    flag_b = Flag("nan:run1:nodeB", "nan", "nodeB: train_loss=nan round=3 run_id=run1")
+
+    with patch("subprocess.Popen", side_effect=_fake_detached_popen(captured)):
+        first = remediate_nan_node(
+            flag_a,
+            run_id="run1",
+            node="nodeA",
+            round_num=3,
+            state=state,
+            repo_root=tmp_path,
+            transcript_dir=tmp_path / "escalations",
+            now=1000.0,
+            now_str="20260805-100000",
+        )
+        with patch("subprocess.Popen") as mock_popen_second:
+            second = remediate_nan_node(
+                flag_b,
+                run_id="run1",
+                node="nodeB",
+                round_num=3,
+                state=state,
+                repo_root=tmp_path,
+                transcript_dir=tmp_path / "escalations",
+                now=1005.0,
+                now_str="20260805-100005",
+            )
+
+    assert first == "retried"
+    assert second == "capped"
+    mock_popen_second.assert_not_called()
+    # nodeB is still excluded from the round even though escalation was capped
+    assert "nodeB" in state.excluded_nodes
+    assert (
+        "nodeB" not in state.jobs
+        or state.jobs["nan:run1:nodeB"].auto_resubmit_count == 0
+    )
+
+
+def test_remediate_nan_node_concurrency_cap_clears_after_timeout(tmp_path):
+    from video_encoding.watcher.escalate import (
+        DEFAULT_NAN_CONCURRENCY_TIMEOUT_S,
+        remediate_nan_node,
+    )
+
+    state = WatcherState()
+    state.nan_escalations_in_flight["run1"] = 1000.0
+    flag = Flag("nan:run1:nodeB", "nan", "nodeB: train_loss=nan round=3 run_id=run1")
+    captured = {}
+
+    with patch("subprocess.Popen", side_effect=_fake_detached_popen(captured)):
+        result = remediate_nan_node(
+            flag,
+            run_id="run1",
+            node="nodeB",
+            round_num=3,
+            state=state,
+            repo_root=tmp_path,
+            transcript_dir=tmp_path / "escalations",
+            now=1000.0 + DEFAULT_NAN_CONCURRENCY_TIMEOUT_S + 1,
+            now_str="20260805-120000",
+        )
+
+    assert result == "retried"
+    assert "cmd" in captured
+
+
+def test_remediate_nan_node_dry_run_excludes_but_takes_no_action(tmp_path):
+    from video_encoding.watcher.escalate import remediate_nan_node
+
+    state = WatcherState()
+    flag = Flag("nan:run1:nodeA", "nan", "nodeA: train_loss=nan round=3 run_id=run1")
+    transcript_dir = tmp_path / "escalations"
+
+    with patch("subprocess.Popen") as mock_popen:
+        result = remediate_nan_node(
+            flag,
+            run_id="run1",
+            node="nodeA",
+            round_num=3,
+            state=state,
+            repo_root=tmp_path,
+            transcript_dir=transcript_dir,
+            now=1000.0,
+            now_str="20260805-100000",
+            dry_run=True,
+        )
+
+    report = transcript_dir / "nan-run1-nodeA-20260805-100000.md"
+    assert report.exists()
+    assert "DRY RUN" in report.read_text()
+    assert flag.detail in report.read_text()
+
+    assert result == "dry_run"
+    assert "nodeA" in state.excluded_nodes
+    mock_popen.assert_not_called()
+    assert state.jobs.get("nan:run1:nodeA") is None or (
+        state.jobs["nan:run1:nodeA"].auto_resubmit_count == 0
+    )

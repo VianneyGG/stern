@@ -1,6 +1,6 @@
 """Aggregate SSL sweep result JSONs into a throughput/quality table.
 
-Reads every `.claude/results/*.json` (WHN schema; written by
+Reads every `runs/results/*.json` (WHN schema; written by
 `training/tb_logger.write_result_json`), keys rows by `run_tag`, and reports:
 
 - a tidy CSV + aligned console table of config x metrics,
@@ -12,7 +12,7 @@ Stdlib only — no pandas, so it runs on a bare checkout.
 
 Usage:
   uv run python video_encoding/scripts/aggregate_sweep.py \
-      [--results-dir .claude/results] [--out sweep.csv]
+      [--results-dir runs/results] [--out sweep.csv]
 """
 
 from __future__ import annotations
@@ -94,7 +94,7 @@ def print_table(rows: list[dict], cols: list[str]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results-dir", default=".claude/results", type=Path)
+    ap.add_argument("--results-dir", default="runs/results", type=Path)
     ap.add_argument("--out", default="sweep.csv", type=Path)
     args = ap.parse_args()
 
@@ -125,7 +125,9 @@ def main() -> None:
     # comparisons are always False, so an unfiltered min() over a NaN-mixed
     # list is order-dependent and can silently pick the NaN row.
     quality = [
-        r for r in rows if isinstance(r.get("recon_loss"), (int, float))
+        r
+        for r in rows
+        if isinstance(r.get("recon_loss"), (int, float))
         and math.isfinite(r["recon_loss"])
     ]
     if quality:

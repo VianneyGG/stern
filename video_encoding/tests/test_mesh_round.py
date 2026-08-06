@@ -777,10 +777,11 @@ def test_push_checkpoint_and_wait_reports_push_and_barrier_time_separately(
         merge=True,
     )
 
-    assert set(stats) == {"pending_push_s", "pending_bytes", "flag_wait_s"}
+    assert set(stats) == {"pending_push_s", "pending_bytes", "flag_wait_s", "pushed"}
     assert stats["pending_bytes"] > 0
     assert stats["pending_push_s"] >= 0.0
     assert stats["flag_wait_s"] >= 0.0
+    assert stats["pushed"] is True
 
 
 def test_push_checkpoint_and_wait_reports_bytes_when_not_merging(tmp_path):
@@ -797,6 +798,32 @@ def test_push_checkpoint_and_wait_reports_bytes_when_not_merging(tmp_path):
 
     assert stats["pending_bytes"] > 0
     assert stats["flag_wait_s"] == 0.0
+    assert stats["pushed"] is True
+
+
+def test_push_checkpoint_and_wait_returns_pushed_false_without_raising_when_save_always_fails(
+    tmp_path, monkeypatch
+):
+    """0.1: a node that cannot write NFS must skip contributing this round,
+    not die -- and the barrier wait must never start for a push that never
+    landed."""
+    monkeypatch.setattr(mesh_round.ckpt_io, "try_save", lambda *a, **kw: False)
+    sleep_calls = []
+    monkeypatch.setattr(mesh_round.time, "sleep", lambda s: sleep_calls.append(s))
+
+    stats = push_checkpoint_and_wait(
+        {"model_state_dict": {}, "n_samples": 1},
+        mesh_shared=tmp_path,
+        run_id="r1",
+        node="nodeA",
+        round_num=0,
+        merge=True,
+        sync_timeout_s=5.0,
+    )
+
+    assert stats["pushed"] is False
+    assert stats["flag_wait_s"] == 0.0
+    assert sleep_calls == []
 
 
 def test_run_mesh_pretrain_stage_writes_one_round_metrics_line(tmp_path, monkeypatch):
@@ -863,6 +890,165 @@ def test_run_mesh_pretrain_stage_writes_one_round_metrics_line(tmp_path, monkeyp
     assert isinstance(record["val_loss"], float)
     assert record["samp_s"] >= 0.0
     assert isinstance(record["ts"], float)
+
+
+def test_run_mesh_pretrain_stage_continues_past_a_failed_push(tmp_path, monkeypatch):
+    """0.1: 74 production crashes were a node dying when its checkpoint push
+    failed. The round loop must skip a failed round's barrier and keep
+    training, not exit."""
+    torch.manual_seed(0)
+    hostname = socket.gethostname().split(".", 1)[0]
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(tmp_path / "stern_checkpoints"))
+
+    # Round 1's (0-indexed round_num=1) sync flag pre-exists so its barrier
+    # clears immediately -- this test is not about barrier waiting, only
+    # about round 0's push failure not killing the worker.
+    flag_dir = mesh_shared / "checkpoints" / "flags"
+    flag_dir.mkdir(parents=True)
+    (flag_dir / "sync_complete_run1_1.flag").touch()
+
+    real_try_save = mesh_round.ckpt_io.try_save
+    calls = []
+
+    def flaky_try_save(path, payload, **kwargs):
+        calls.append(path)
+        if len(calls) == 1:
+            return False
+        return real_try_save(path, payload, **kwargs)
+
+    monkeypatch.setattr(mesh_round.ckpt_io, "try_save", flaky_try_save)
+    monkeypatch.setattr(mesh_round.time, "sleep", lambda _s: None)
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 2,
+                "steps_per_round": 1,
+                "merge": True,
+                "outer_lr": 0.7,
+                "outer_momentum": 0.9,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+    run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+
+    # Both rounds ran to completion despite round 0's push failing outright.
+    metrics_path = mesh_shared / "metrics" / "run1" / f"{hostname}.jsonl"
+    lines = metrics_path.read_text().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["round"] == 1
+    assert json.loads(lines[1])["round"] == 2
+    assert len(calls) == 2
+
+
+def test_run_mesh_pretrain_stage_skips_push_on_zero_sample_round(tmp_path, monkeypatch):
+    """0.3: a worker that fetched no shards must not push a checkpoint of an
+    untrained model into the merge -- that previously counted toward quorum
+    with train_loss=nan. Skip the push and keep going, do not exit."""
+    torch.manual_seed(0)
+    hostname = socket.gethostname().split(".", 1)[0]
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(tmp_path / "stern_checkpoints"))
+
+    monkeypatch.setattr(
+        mesh_round,
+        "train_one_round",
+        lambda *a, **kw: {
+            "loss": float("nan"),
+            "samples": 0,
+            "samples_per_s_per_gpu": 0.0,
+        },
+    )
+
+    push_calls = []
+    monkeypatch.setattr(
+        mesh_round,
+        "push_checkpoint_and_wait",
+        lambda *a, **kw: (
+            push_calls.append(1)
+            or {
+                "pending_push_s": 0.0,
+                "pending_bytes": 0,
+                "flag_wait_s": 0.0,
+                "pushed": True,
+            }
+        ),
+    )
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 1,
+                "steps_per_round": 1,
+                "merge": True,
+                "outer_lr": 0.7,
+                "outer_momentum": 0.9,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+    result = run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+
+    assert push_calls == []
+    assert result["final_round"] == 0
+    local_path = tmp_path / "stern_checkpoints" / "run1.pt"
+    assert not local_path.exists()
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    assert list(pending_dir.glob("run1_*.pt")) == [] if pending_dir.exists() else True
 
 
 def test_append_round_metrics_swallows_unwritable_metrics_dir(tmp_path):

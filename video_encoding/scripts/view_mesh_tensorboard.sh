@@ -33,7 +33,7 @@ import json, sys
 from pathlib import Path
 
 run_id = sys.argv[1]
-state_dir = Path.home() / "stern" / ".claude" / "state"
+state_dir = Path.home() / "stern" / "runs" / "state"
 
 configs = json.loads((state_dir / "mesh_run_configs.json").read_text())
 match = next((c for c in configs if c["run_id"] == run_id), None)

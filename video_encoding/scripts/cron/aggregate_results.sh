@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # video_encoding/scripts/cron/aggregate_results.sh
-# Synthesize .claude/results/*.json into a sorted summary.tsv via a headless
+# Synthesize runs/results/*.json into a sorted summary.tsv via a headless
 # Haiku call, so the interactive (Opus) session reads one small file instead
 # of re-parsing every result JSON on every "how are runs doing" ask. Not
 # installed to crontab yet; see conf/CONFIGS.md for the rationale and the
@@ -10,8 +10,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-STATE_DIR="${REPO_ROOT}/.claude/state"
-RESULTS_DIR="${REPO_ROOT}/.claude/results"
+STATE_DIR="${REPO_ROOT}/runs/state"
+RESULTS_DIR="${REPO_ROOT}/runs/results"
 LOG="${STATE_DIR}/cron.log"
 LOCK="${STATE_DIR}/aggregate_results.lock"
 mkdir -p "${STATE_DIR}" "${RESULTS_DIR}"

@@ -7,11 +7,14 @@ never depend on wall-clock time.
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 from video_encoding.watcher.registry import JobRecord
-from video_encoding.watcher.state import JobState
+from video_encoding.watcher.state import JobState, WatcherState
 
 DEFAULT_STALL_THRESHOLD_S = 2700
 DEFAULT_QUOTA_THRESHOLD_PCT = 90
@@ -19,8 +22,10 @@ DEFAULT_QUOTA_THRESHOLD_PCT = 90
 
 @dataclass(frozen=True)
 class Flag:
-    subject: str  # slurm_job_id for dead/stalled; "quota:<location>" for quota
-    kind: str  # "dead" | "dead_after_resubmit" | "stalled" | "quota"
+    subject: (
+        str  # slurm_job_id for dead/stalled; "quota:<location>"; "nan:<run_id>:<node>"
+    )
+    kind: str  # "dead" | "dead_after_resubmit" | "stalled" | "quota" | "nan" | "nan_after_retry"
     detail: str
 
 
@@ -111,4 +116,72 @@ def detect_quota(
                     f"{location} at {pct:.1f}% (threshold {threshold_pct}%)",
                 )
             )
+    return flags
+
+
+def _last_json_line(path: Path) -> dict | None:
+    last: str | None = None
+    try:
+        with path.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    last = line
+    except OSError:
+        return None
+    if last is None:
+        return None
+    try:
+        return json.loads(last)
+    except json.JSONDecodeError:
+        return None
+
+
+def detect_nan(
+    run_id: str,
+    mesh_shared: Path,
+    state: WatcherState,
+) -> list[Flag]:
+    """Flag mesh nodes whose latest per-round metric is NaN/Inf train_loss.
+
+    Reads mesh_shared/metrics/<run_id>/<node>.jsonl (appended once per round
+    by training/mesh_round.py::_append_round_metrics) -- only the LAST line
+    per node is live; a node that NaN'd once and then recovered on a later
+    round must not keep getting flagged.
+    """
+    flags: list[Flag] = []
+    run_state = state.runs.get(run_id)
+    if run_state is not None and run_state.status == "DONE":
+        # A DONE run's workers are gone; its last metrics line is frozen at
+        # finish time and would otherwise re-flag (and re-escalate) forever.
+        return flags
+    metrics_dir = mesh_shared / "metrics" / run_id
+    if not metrics_dir.is_dir():
+        return flags
+    for node_file in sorted(metrics_dir.glob("*.jsonl")):
+        node = node_file.stem
+        subject = f"nan:{run_id}:{node}"
+        job_state = state.jobs.get(subject)
+        if job_state is not None and job_state.status == "resolved":
+            continue  # already drained -- permanently done with this node
+        record = _last_json_line(node_file)
+        if record is None:
+            continue
+        loss = record.get("train_loss")
+        if not isinstance(loss, (int, float)) or not (
+            math.isnan(loss) or math.isinf(loss)
+        ):
+            continue
+        kind = (
+            "nan_after_retry"
+            if job_state is not None and job_state.auto_resubmit_count > 0
+            else "nan"
+        )
+        flags.append(
+            Flag(
+                subject,
+                kind,
+                f"{node}: train_loss={loss} round={record.get('round')} run_id={run_id}",
+            )
+        )
     return flags

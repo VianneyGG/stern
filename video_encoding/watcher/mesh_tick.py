@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,7 +47,7 @@ from video_encoding.watcher.epoch_advance import (
     select_idle_nodes,
 )
 from video_encoding.watcher.registry import JobRecord, append_job_record
-from video_encoding.watcher.state import RunState, WatcherState
+from video_encoding.watcher.state import RunState, WatcherState, clear_run_state
 
 # Must stay well below the mesh's default per-round sync timeout
 # (videomae_mesh_ssl.yaml's mesh.sync_timeout_s: 1800.0) -- that's how long a
@@ -187,7 +188,7 @@ def advance_one_run(
     if run.status == "MERGING":
         return _do_merging(run_config, run, repo_root, mesh_shared)
     if run.status == "SYNCING":
-        return _do_syncing(run_config, run, mesh_shared, now)
+        return _do_syncing(run_config, run, state, mesh_shared, now)
     return None  # DONE, or an unrecognized status -- nothing to do
 
 
@@ -309,7 +310,7 @@ def _do_assigning(
     )
     _write_json_atomic(assignments_path, assignments)
 
-    registry_path = repo_root / ".claude" / "state" / "jobs_registry.json"
+    registry_path = repo_root / "runs" / "state" / "jobs_registry.json"
     submitted_at = datetime.now(timezone.utc).isoformat()
     for node in eligible:
         _submit_worker_job(run_config, node, repo_root, registry_path, submitted_at)
@@ -493,9 +494,31 @@ def _replenish_pool(
     or no idle node was available -- left excluded_node's shards assigned
     to a node that will never train again, silently shrinking shard
     coverage for the rest of the run.
+
+    A picked replacement only ever receives shards via excluded_node's own
+    handoff below -- if excluded_node has no entry (or an empty one) in
+    shard_assignments, a submitted replacement would start with nothing to
+    train on and crash immediately on read_my_shards, which then excludes
+    IT too and repeats the pick with the next idle node. Observed live on
+    login-node 2026-08-05 (pool-cars-2r, node066/node051 both submitted with
+    zero shard_assignments entries), so replenishment is skipped rather
+    than submitted in that case -- an under-filled pool is a safe failure
+    mode, a guaranteed-crash job is not. A missing assignments file
+    entirely (no shard-tracking started for this run yet) does not gate
+    replenishment; only a present file where excluded_node's own entry is
+    absent or empty does.
     """
     picked: list[str] = []
     replenish_note: str | None = None
+
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    assignments_path = (
+        mesh_shared / "metadata" / f"shard_assignments_{run_config.run_id}.json"
+    )
+    assignments = (
+        json.loads(assignments_path.read_text()) if assignments_path.exists() else None
+    )
+    blocks_replenish = assignments is not None and not assignments.get(excluded_node)
 
     if run_configs_path is not None:
         roster = _live_roster(run_configs_path, run_config.run_id, run_config.nodes)
@@ -508,10 +531,17 @@ def _replenish_pool(
                 tier_roster, in_use=set(roster), excluded=set(state.excluded_nodes)
             )
             picked = select_idle_nodes(candidates, deficit, idle)
-            if picked:
+            if picked and blocks_replenish:
+                replenish_note = (
+                    f"{run_config.run_id}: replenish skipped for {excluded_node} "
+                    f"-- it had no shards to hand off a replacement "
+                    f"({picked} not submitted)"
+                )
+                picked = []
+            elif picked:
                 _append_nodes_to_run_config(run_configs_path, run_config.run_id, picked)
 
-                registry_path = repo_root / ".claude" / "state" / "jobs_registry.json"
+                registry_path = repo_root / "runs" / "state" / "jobs_registry.json"
                 submitted_at = datetime.now(timezone.utc).isoformat()
                 for node in picked:
                     _submit_worker_job(
@@ -533,21 +563,15 @@ def _replenish_pool(
                 )
 
     reassign_note = None
-    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
-    assignments_path = (
-        mesh_shared / "metadata" / f"shard_assignments_{run_config.run_id}.json"
-    )
-    if assignments_path.exists():
-        assignments = json.loads(assignments_path.read_text())
-        if excluded_node in assignments:
-            placement = _invert_placement(load_shard_map(shard_map_path))
-            for node in picked:
-                assignments.setdefault(node, [])
-            assignments = reassign_failed(excluded_node, assignments, placement)
-            _write_json_atomic(assignments_path, assignments)
-            reassign_note = (
-                f"{run_config.run_id}: reassigned {excluded_node}'s shards to survivors"
-            )
+    if assignments is not None and excluded_node in assignments:
+        placement = _invert_placement(load_shard_map(shard_map_path))
+        for node in picked:
+            assignments.setdefault(node, [])
+        assignments = reassign_failed(excluded_node, assignments, placement)
+        _write_json_atomic(assignments_path, assignments)
+        reassign_note = (
+            f"{run_config.run_id}: reassigned {excluded_node}'s shards to survivors"
+        )
 
     notes = [n for n in (replenish_note, reassign_note) if n]
     return "; ".join(notes) if notes else None
@@ -648,7 +672,7 @@ def _do_merging(
         "--metrics-out",
         str(
             repo_root
-            / ".claude"
+            / "runs"
             / "results"
             / "mesh"
             / f"{run_config.run_id}_rounds.jsonl"
@@ -771,6 +795,35 @@ def _sweep_pending_checkpoints(run_id: str, mesh_shared: Path) -> int:
     return swept
 
 
+def sweep_orphaned_pending(
+    pending_dir: Path, active_run_ids: set[str], *, max_age_s: float
+) -> int:
+    """Delete pending/ checkpoints whose run_id is not among the currently
+    configured runs, once they are older than max_age_s.
+
+    Catches what _sweep_pending_checkpoints cannot: checkpoints from a run
+    that never reached SYNCING/DONE at all (killed mid-run, or dropped from
+    mesh_run_configs.json by hand) -- observed in production as 9.3 GiB of
+    orphans from five dead runs, against a 30 GiB NFS quota.
+
+    Critical guard: load_run_configs returns [] when its file is missing, so
+    an empty active_run_ids means "unknown", not "nothing is active" -- this
+    must no-op rather than delete every live checkpoint in pending/.
+    """
+    if not active_run_ids or not pending_dir.exists():
+        return 0
+    now = time.time()
+    swept = 0
+    for path in pending_dir.glob("*.pt"):
+        if any(path.name.startswith(f"{run_id}_") for run_id in active_run_ids):
+            continue
+        if now - path.stat().st_mtime < max_age_s:
+            continue
+        path.unlink(missing_ok=True)
+        swept += 1
+    return swept
+
+
 def _stage_local_merge_state_for_archive(
     run_config: MeshRunConfig, mesh_shared: Path
 ) -> None:
@@ -792,7 +845,11 @@ def _stage_local_merge_state_for_archive(
 
 
 def _do_syncing(
-    run_config: MeshRunConfig, run: RunState, mesh_shared: Path, now: float
+    run_config: MeshRunConfig,
+    run: RunState,
+    state: WatcherState,
+    mesh_shared: Path,
+    now: float,
 ) -> str:
     flag_path = (
         mesh_shared
@@ -808,6 +865,7 @@ def _do_syncing(
         _stage_local_merge_state_for_archive(run_config, mesh_shared)
         transfer_note = _transfer_results_to_node089(run_config, mesh_shared)
         swept = _sweep_pending_checkpoints(run_config.run_id, mesh_shared)
+        clear_run_state(state, run_config.run_id)
         return (
             f"{run_config.run_id}: SYNCING -> DONE "
             f"(round {run.round}/{run_config.rounds}); {transfer_note}; "
