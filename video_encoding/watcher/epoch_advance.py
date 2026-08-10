@@ -11,22 +11,39 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from video_encoding.mesh.pending_files import parse_pending_filename
 from video_encoding.watcher.state import RunState, WatcherState
 
 MISSED_ROUND_THRESHOLD = 2
 
 
-def pending_nodes(pending_dir: Path, run_id: str) -> set[str]:
+def pending_nodes(
+    pending_dir: Path, run_id: str, *, round_num: int | None = None
+) -> set[str]:
     """Nodes that have dropped a checkpoint for run_id this round.
 
-    Parses `[RUN_ID]_[NODE].pt` filenames. Files are overwritten each round
-    (peak disk bounded by node count, not round count), so a directory
-    listing always reflects only the current round's check-ins.
+    Parses `[RUN_ID]_[ROUND]_[NODE].pt` filenames (mesh/pending_files.py).
+    Files are overwritten each round (peak disk bounded by node count, not
+    round count), so a directory listing usually reflects only the current
+    round's check-ins -- except right after a timeout-forced merge clears
+    pending/ (mesh_tick._do_merging), where a straggler still finishing the
+    PRIOR round can write into it before this round's real checkpoints
+    land. `round_num` (pass the run's current `round`) excludes any such
+    leftover from the count -- mtime alone can't: a straggler necessarily
+    writes in real wall-clock time AFTER the new round already started, so
+    no mtime-relative-to-round-start filter can tell it apart from a
+    genuine current-round arrival. Only the round the file actually belongs
+    to (carried in its own name) can.
     """
     nodes: set[str] = set()
-    prefix = f"{run_id}_"
-    for entry in pending_dir.glob(f"{prefix}*.pt"):
-        nodes.add(entry.stem[len(prefix) :])
+    for entry in pending_dir.glob(f"{run_id}_*.pt"):
+        parsed = parse_pending_filename(entry.stem, run_id)
+        if parsed is None:
+            continue
+        file_round, node = parsed
+        if round_num is not None and file_round != round_num:
+            continue
+        nodes.add(node)
     return nodes
 
 

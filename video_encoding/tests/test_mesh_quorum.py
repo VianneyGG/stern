@@ -4,7 +4,11 @@ import math
 
 import pytest
 
-from video_encoding.mesh.quorum import NodeStats, ready_for_merge, token_weights
+from video_encoding.mesh.quorum import (
+    NodeStats,
+    ready_for_merge,
+    token_weights,
+)
 
 
 def test_ready_for_merge_true_once_quorum_reached_even_before_grace_expires():

@@ -231,7 +231,7 @@ def test_push_checkpoint_and_wait_returns_immediately_when_merge_false(
     )
 
     assert sleep_calls == []
-    pending = tmp_path / "checkpoints" / "pending" / "r1_nodeA.pt"
+    pending = tmp_path / "checkpoints" / "pending" / "r1_0_nodeA.pt"
     assert pending.exists()
 
 
@@ -290,7 +290,7 @@ def test_push_checkpoint_and_wait_casts_shared_payload_to_fp16(tmp_path):
     )
 
     shared = torch.load(
-        tmp_path / "checkpoints" / "pending" / "r1_nodeA.pt",
+        tmp_path / "checkpoints" / "pending" / "r1_0_nodeA.pt",
         map_location="cpu",
         weights_only=False,
     )
@@ -330,7 +330,7 @@ def test_push_checkpoint_and_wait_pushes_delta_not_weights_when_master_sd_given(
     )
 
     shared = torch.load(
-        tmp_path / "checkpoints" / "pending" / "r1_nodeA.pt",
+        tmp_path / "checkpoints" / "pending" / "r1_0_nodeA.pt",
         map_location="cpu",
         weights_only=False,
     )
@@ -360,7 +360,7 @@ def test_push_checkpoint_and_wait_keeps_full_weights_when_master_sd_is_none(tmp_
     )
 
     shared = torch.load(
-        tmp_path / "checkpoints" / "pending" / "r1_nodeA.pt",
+        tmp_path / "checkpoints" / "pending" / "r1_0_nodeA.pt",
         map_location="cpu",
         weights_only=False,
     )
@@ -497,7 +497,7 @@ def test_shared_pending_payload_drops_optimizer_state_local_keeps_it(
     assert "optimizer_name" in local_payload
 
     shared_payload = torch.load(
-        mesh_shared / "checkpoints" / "pending" / f"run1_{hostname}.pt",
+        mesh_shared / "checkpoints" / "pending" / f"run1_0_{hostname}.pt",
         map_location="cpu",
         weights_only=False,
     )
@@ -1272,6 +1272,21 @@ def test_append_round_metrics_swallows_unwritable_metrics_dir(tmp_path):
     )  # must not raise
 
     assert (mesh_shared / "metrics").is_file()  # untouched, still a plain file
+
+
+def test_append_round_metrics_includes_slurm_job_id_from_environ(tmp_path, monkeypatch):
+    monkeypatch.setenv("SLURM_JOB_ID", "987654")
+    mesh_shared = tmp_path / "mesh_shared"
+
+    mesh_round._append_round_metrics(
+        mesh_shared, "run1", "node001", 1, 0.5, 0.4, 12.0, 3
+    )
+
+    lines = (
+        (mesh_shared / "metrics" / "run1" / "node001.jsonl").read_text().splitlines()
+    )
+    record = json.loads(lines[0])
+    assert record["slurm_job_id"] == "987654"
 
 
 def _run_with_step_capture(tmp_path, monkeypatch, *, mesh_cfg, rates):

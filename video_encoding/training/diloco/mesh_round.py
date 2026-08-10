@@ -51,9 +51,9 @@ from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.compile_utils import maybe_compile
 from video_encoding.mesh.outer_step import pseudo_gradient, to_fp32_state_dict
 from video_encoding.mesh.pacing import steps_for_budget, update_rate_ema
+from video_encoding.mesh.pending_files import pending_filename
 from video_encoding.mesh.quantize import quantize_with_error_feedback
 from video_encoding.training.pretrain import _scaled_lr, _train_epoch_ssl
-from video_encoding.training.tb_logger import make_writer
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,7 @@ def _append_round_metrics(
         "samp_s": samp_s,
         "n_shards": n_shards,
         "ts": time.time(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
     }
     metrics_path = mesh_shared / "metrics" / run_id / f"{node}.jsonl"
     try:
@@ -258,7 +259,6 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         masker = RandomTubeMasking(mask_ratio=float(cfg.model.mask_ratio))
 
     master_path = mesh_shared / "checkpoints" / run_id / "master.pt"
-    writer = make_writer(checkpoint_root / "tb", rank=0)
 
     last_train_loss = float("nan")
     final_round = -1
@@ -376,14 +376,6 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
 
         val_loss = evaluate_val_loss(model, val_dataset, device, masker, amp)
 
-        if writer is not None:
-            writer.add_scalar("round/recon_loss", train_stats["loss"], round_num)
-            writer.add_scalar("round/val_loss", val_loss, round_num)
-            writer.add_scalar(
-                "round/samples_per_s", train_stats["samples_per_s_per_gpu"], round_num
-            )
-            writer.flush()
-
         if train_stats["samples"] == 0:
             # A worker with no shards for this round produced an untrained
             # model -- pushing it would count toward merge quorum with
@@ -457,9 +449,6 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
                 io_stats["pending_bytes"],
                 io_stats["flag_wait_s"],
             )
-            if writer is not None:
-                for key in ("master_load_s", "pending_push_s", "flag_wait_s"):
-                    writer.add_scalar(f"round_io/{key}", io_stats[key], round_num)
 
         final_round = round_num
         print(
@@ -477,9 +466,6 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             train_stats["samples_per_s_per_gpu"],
             len(train_shard_names),
         )
-
-    if writer is not None:
-        writer.close()
 
     return {
         "stage": "mesh_pretrain",
@@ -594,11 +580,15 @@ def push_checkpoint_and_wait(
     the two costs that have to be told apart before any NFS optimization can
     be judged, and they are only separable here.
 
-    Writes to mesh_shared/checkpoints/pending/{run_id}_{node}.pt via
-    `checkpoint.try_save` so a transient NFS write failure degrades instead
-    of raising: on exhausted retries this returns `pushed=False` and skips
-    the barrier entirely, leaving the caller to proceed to the next round
-    from its own weights rather than dying mid-run.
+    Writes to mesh_shared/checkpoints/pending/{run_id}_{round_num}_{node}.pt
+    (mesh/pending_files.pending_filename -- the round segment is what lets
+    every reader tell this round's submission apart from a straggler still
+    pushing a prior round's checkpoint after that round's merge already
+    cleared pending/) via `checkpoint.try_save` so a transient NFS write
+    failure degrades instead of raising: on exhausted retries this returns
+    `pushed=False` and skips the barrier entirely, leaving the caller to
+    proceed to the next round from its own weights rather than dying
+    mid-run.
 
     When `master_sd` is given (every round this worker had a master to load,
     i.e. every round but round 0), pushes `master_sd - model_state_dict`
@@ -624,7 +614,12 @@ def push_checkpoint_and_wait(
     the normal cron path.
     """
     mesh_shared = Path(mesh_shared)
-    pending_path = mesh_shared / "checkpoints" / "pending" / f"{run_id}_{node}.pt"
+    pending_path = (
+        mesh_shared
+        / "checkpoints"
+        / "pending"
+        / pending_filename(run_id, round_num, node)
+    )
     pending_path.parent.mkdir(parents=True, exist_ok=True)
     shared_payload = dict(payload)
     if master_sd is not None:

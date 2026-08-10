@@ -29,6 +29,9 @@ from pathlib import Path
 import torch
 
 from video_encoding.mesh.assignment import assign_locality_first, reassign_failed
+from video_encoding.mesh.pending_files import (
+    pending_files_for_round,
+)
 from video_encoding.mesh.quorum import ready_for_merge
 from video_encoding.mesh.scoring import (
     NodeInfo,
@@ -349,7 +352,7 @@ def _do_running(
         return f"{run_config.run_id}: RUNNING -> DONE (merge=False, single-node arm)"
 
     pending_dir = mesh_shared / "checkpoints" / "pending"
-    if pending_nodes(pending_dir, run_config.run_id):
+    if pending_nodes(pending_dir, run_config.run_id, round_num=run.round):
         run.status = "AWAITING_CHECKPOINTS"
         return f"{run_config.run_id}: RUNNING -> AWAITING_CHECKPOINTS"
     return None  # no-op -- job health is tick.py's job, not this module's
@@ -359,20 +362,24 @@ def _do_running(
 
 
 def _round_elapsed_s(
-    pending_dir: Path, run_id: str, now: float, round_started_at: float
+    pending_dir: Path, run_id: str, round_num: int, now: float, round_started_at: float
 ) -> float:
     """Seconds since this round's earliest checkpoint arrived, or since the
     round started if none have arrived yet.
 
-    pending/{run_id}_{node}.pt files are overwritten every round (see
-    epoch_advance.pending_nodes' docstring), so their mtimes always reflect
-    only the current round's check-ins. But if the whole pool dies before a
-    single node checks in, there are no files to read mtimes from at all --
-    falling back to `now - round_started_at` (RunState.round_started_at, set
-    whenever a round starts) is what lets the AWAITING_CHECKPOINTS timeout
-    still fire in that case, instead of reading a permanent 0.0.
+    Scoped to `round_num` (mesh/pending_files.pending_files_for_round) so a
+    straggler finishing the PRIOR round -- who can write into pending/ after
+    a timeout-forced merge clears it (mesh_tick._do_merging), before this
+    round's real checkpoints land -- can't anchor this clock to its own
+    early arrival. mtime can't make that distinction on its own: the
+    straggler necessarily writes in real wall-clock time AFTER this round
+    already started. If the whole pool dies before a single current-round
+    node checks in, there are no files to read mtimes from at all --
+    falling back to `now - round_started_at` is what lets the
+    AWAITING_CHECKPOINTS timeout still fire in that case too, instead of
+    reading a permanent 0.0.
     """
-    files = list(pending_dir.glob(f"{run_id}_*.pt"))
+    files = pending_files_for_round(pending_dir, run_id, round_num)
     if not files:
         return now - round_started_at
     return now - min(f.stat().st_mtime for f in files)
@@ -388,7 +395,7 @@ def _do_awaiting_checkpoints(
     run_configs_path: Path | None,
 ) -> str | None:
     pending_dir = mesh_shared / "checkpoints" / "pending"
-    checked_in = pending_nodes(pending_dir, run_config.run_id)
+    checked_in = pending_nodes(pending_dir, run_config.run_id, round_num=run.round)
     eligible = set(eligible_nodes(state, run_config.nodes))
 
     if checked_in >= eligible:
@@ -400,7 +407,7 @@ def _do_awaiting_checkpoints(
         )
 
     elapsed = _round_elapsed_s(
-        pending_dir, run_config.run_id, now, run.round_started_at
+        pending_dir, run_config.run_id, run.round, now, run.round_started_at
     )
 
     if run_config.quorum_k is not None:
@@ -417,8 +424,9 @@ def _do_awaiting_checkpoints(
             # haven't crashed, they just haven't finished yet, and get
             # another chance next round. Still a partial merge from
             # run_outer_step's point of view, so timeout_forced stays True
-            # (2.2's token weighting will replace this bias; until then it
-            # gets the same renormalization any partial merge does).
+            # (2.2: run_config.weighting="token" -- run_outer_step.py's
+            # _token_weights -- corrects the bias this used to carry via
+            # plain renormalization; run quorum-configured pools with it).
             run.status = "MERGING"
             run.timeout_forced = True
             return (
@@ -630,8 +638,13 @@ def _bootstrap_master(pending_dir: Path, run_id: str, master_path: Path) -> None
     lexicographically first pending filename) to the initial master --
     mirrors mesh_round.py's own cold-start contract, where a worker with no
     master.pt on disk trains from a freshly-initialized model.
+
+    Scoped to round 0 (mesh/pending_files.pending_files_for_round): nothing
+    else leaves master.pt missing, so the very first merge is always round
+    0's -- and scoping here for the same reason every other pending/ reader
+    now does (see _round_elapsed_s) rather than trusting an unscoped glob.
     """
-    candidates = sorted(pending_dir.glob(f"{run_id}_*.pt"))
+    candidates = sorted(pending_files_for_round(pending_dir, run_id, 0))
     if not candidates:
         return
     payload = torch.load(candidates[0], map_location="cpu", weights_only=False)
@@ -675,6 +688,7 @@ def _do_merging(
     local_dir = _mesh_local_root() / run_config.run_id
     momentum_path = local_dir / "outer_momentum.pt"
     residual_path = local_dir / "broadcast_residual.pt"
+    tb_dir = local_dir / "tb"
     local_dir.mkdir(parents=True, exist_ok=True)
     if not master_path.exists():
         _bootstrap_master(pending_dir, run_config.run_id, master_path)
@@ -719,6 +733,8 @@ def _do_merging(
             / "mesh"
             / f"{run_config.run_id}_rounds.jsonl"
         ),
+        "--tb-dir",
+        str(tb_dir),
     ]
     if run.timeout_forced:
         cmd.append("--timeout-forced")

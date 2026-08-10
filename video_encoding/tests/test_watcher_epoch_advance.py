@@ -13,11 +13,18 @@ from video_encoding.watcher.state import WatcherState, load_state, save_state
 
 
 def test_pending_nodes_reads_checkpoint_filenames(tmp_path):
-    (tmp_path / "RUN1_node001.pt").write_text("x")
-    (tmp_path / "RUN1_node002.pt").write_text("x")
-    (tmp_path / "RUN2_node089.pt").write_text("x")
+    (tmp_path / "RUN1_0_node001.pt").write_text("x")
+    (tmp_path / "RUN1_0_node002.pt").write_text("x")
+    (tmp_path / "RUN2_0_node089.pt").write_text("x")
 
     assert pending_nodes(tmp_path, "RUN1") == {"node001", "node002"}
+
+
+def test_pending_nodes_scopes_to_round_num_when_given(tmp_path):
+    (tmp_path / "RUN1_0_node001.pt").write_text("x")
+    (tmp_path / "RUN1_1_node002.pt").write_text("x")
+
+    assert pending_nodes(tmp_path, "RUN1", round_num=1) == {"node002"}
 
 
 def test_one_missed_round_does_not_exclude():

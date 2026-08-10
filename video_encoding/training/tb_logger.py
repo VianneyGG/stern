@@ -108,6 +108,106 @@ def _env_snapshot() -> dict[str, Any]:
     }
 
 
+def write_mesh_round_scalars(
+    writer,
+    mesh_shared: Path,
+    run_id: str,
+    last_round: int,
+) -> int:
+    """Replay not-yet-flushed mesh rounds from every node's JSONL onto `writer`.
+
+    Nodes are discovered by globbing `mesh_shared/metrics/<run_id>/*.jsonl`
+    (no fixed roster) -- run_outer_step.py's merge only ever sees the
+    contributors of the round it just merged, but a node that missed
+    quorum still has its own JSONL and should still show up here.
+
+    Each node's `_append_round_metrics` (training/diloco/mesh_round.py)
+    record uses a 1-based `round`; scalars are written at 0-based step
+    `round - 1` to match run_outer_step.py's own `--round`.
+
+    The *newest* round observed across all nodes is always held back one
+    call, never flushed immediately: a worker only appends its JSONL
+    record for round R after the merge for round R has already run (it's
+    blocked in a post-push barrier the merge itself releases), so a fast
+    node's round-R record can land before a straggler's. Holding the
+    newest round back gives every node one more merge cycle (~one round)
+    to catch up before that round's scalars (including the pool mean) are
+    finalized. Once flushed a round is never revisited, so a node that
+    never reports for a round simply isn't counted in that round's pool
+    mean -- this is monitoring, not the source of truth (the JSONL
+    itself, on NFS, is unaffected and still has every record).
+
+    Returns the highest round number flushed this call, or `last_round`
+    unchanged if nothing new was flushed. The caller persists this as the
+    next call's `last_round`.
+    """
+    metrics_dir = mesh_shared / "metrics" / run_id
+    per_round: dict[int, dict[str, dict[str, Any]]] = {}
+    for jsonl_path in sorted(metrics_dir.glob("*.jsonl")):
+        node = jsonl_path.stem
+        try:
+            lines = jsonl_path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            round_ = record.get("round")
+            if not isinstance(round_, int) or round_ <= last_round:
+                continue
+            per_round.setdefault(round_, {})[node] = record
+
+    if not per_round:
+        return last_round
+
+    newest_round = max(per_round)
+    rounds_to_flush = sorted(r for r in per_round if r < newest_round)
+
+    new_last_round = last_round
+    for round_ in rounds_to_flush:
+        step = round_ - 1
+        train_losses: list[float] = []
+        val_losses: list[float] = []
+        samp_s_total = 0.0
+        pool_job_id: float | None = None
+        for node, record in sorted(per_round[round_].items()):
+            writer.add_scalar(
+                f"mesh_round/{node}/train_loss", record["train_loss"], step
+            )
+            writer.add_scalar(f"mesh_round/{node}/val_loss", record["val_loss"], step)
+            writer.add_scalar(f"mesh_round/{node}/samp_s", record["samp_s"], step)
+            train_losses.append(record["train_loss"])
+            val_losses.append(record["val_loss"])
+            samp_s_total += record["samp_s"]
+            job_id = record.get("slurm_job_id")
+            if job_id is not None and str(job_id).isdigit():
+                writer.add_scalar(
+                    f"mesh_round/{node}/slurm_job_id", float(job_id), step
+                )
+                if pool_job_id is None:
+                    pool_job_id = float(job_id)
+        if pool_job_id is not None:
+            writer.add_scalar("mesh_round/pool/slurm_job_id", pool_job_id, step)
+        if train_losses:
+            writer.add_scalar(
+                "mesh_round/pool/train_loss_mean",
+                sum(train_losses) / len(train_losses),
+                step,
+            )
+        if val_losses:
+            writer.add_scalar(
+                "mesh_round/pool/val_loss_mean",
+                sum(val_losses) / len(val_losses),
+                step,
+            )
+        writer.add_scalar("mesh_round/pool/samp_s_sum", samp_s_total, step)
+        new_last_round = round_
+
+    return new_last_round
+
+
 def _git_sha() -> str | None:
     try:
         return subprocess.check_output(

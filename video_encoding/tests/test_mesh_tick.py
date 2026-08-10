@@ -184,7 +184,7 @@ def test_running_transitions_on_first_pending_checkpoint(tmp_path):
     mesh_shared = tmp_path / "mesh_shared"
     pending_dir = mesh_shared / "checkpoints" / "pending"
     pending_dir.mkdir(parents=True)
-    (pending_dir / "RUN1_node001.pt").write_text("x")
+    (pending_dir / "RUN1_0_node001.pt").write_text("x")
 
     run_config = _run_config()
     state = WatcherState()
@@ -208,7 +208,7 @@ def test_awaiting_checkpoints_transitions_when_all_arrive(tmp_path):
     pending_dir = mesh_shared / "checkpoints" / "pending"
     pending_dir.mkdir(parents=True)
     for node in _NODES:
-        (pending_dir / f"RUN1_{node}.pt").write_text("x")
+        (pending_dir / f"RUN1_0_{node}.pt").write_text("x")
 
     run_config = _run_config()
     state = WatcherState()
@@ -234,7 +234,7 @@ def test_awaiting_checkpoints_proceeds_on_timeout_with_partial_set(tmp_path):
     # Only 2 of 3 nodes checked in; node003 never showed up.
     old_mtime = 1000.0
     for node in ("node001", "node002"):
-        path = pending_dir / f"RUN1_{node}.pt"
+        path = pending_dir / f"RUN1_0_{node}.pt"
         path.write_text("x")
         os.utime(path, (old_mtime, old_mtime))
 
@@ -317,6 +317,58 @@ def test_awaiting_checkpoints_times_out_when_zero_checkpoints_ever_arrive(tmp_pa
     assert action is not None
 
 
+def test_awaiting_checkpoints_ignores_stale_straggler_from_prior_round(tmp_path):
+    """Regression: a timeout-forced merge clears pending/ (_do_merging) but a
+    straggler still finishing the OLD round's training can push its
+    checkpoint into pending/ AFTER the new round has already started -- it's
+    a separate SLURM process, still mid-training, so its arrival is
+    necessarily in real wall-clock time AFTER round_started_at, never
+    before (_do_merging clears pending/ before stamping round_started_at
+    for the new round, so an mtime-before-round-start straggler is not a
+    scenario that can occur in production). mtime alone can't tell this
+    straggler's round-0 checkpoint apart from a genuine round-1 arrival;
+    only the round number carried in the filename (mesh/pending_files.py)
+    can -- without it, the straggler's node name would silently complete
+    the illusion of full round-1 arrival one node early, merging a stale
+    checkpoint into what should be a fresh round's average."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    round_started_at = 1740.0
+
+    # node001's stale round-0 checkpoint, pushed shortly after round 1
+    # officially started.
+    stale = pending_dir / "RUN1_0_node001.pt"
+    stale.write_text("x")
+    os.utime(stale, (round_started_at + 10.0, round_started_at + 10.0))
+
+    # node002 and node003 have genuinely submitted round 1; node001 hasn't.
+    for node in ("node002", "node003"):
+        path = pending_dir / f"RUN1_1_{node}.pt"
+        path.write_text("x")
+        os.utime(path, (round_started_at + 50.0, round_started_at + 50.0))
+
+    run_config = _run_config()  # quorum_k=None: plain ROUND_TIMEOUT_S path
+    state = WatcherState()
+    state.run("RUN1").status = "AWAITING_CHECKPOINTS"
+    state.run("RUN1").round = 1
+    state.run("RUN1").round_started_at = round_started_at
+
+    action = advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=round_started_at + 150.0,  # nowhere near ROUND_TIMEOUT_S (900s)
+    )
+
+    # Only 2 of 3 nodes have genuinely checked in for round 1 -- node001's
+    # stale round-0 leftover must not count, so this must not merge yet.
+    assert state.run("RUN1").status == "AWAITING_CHECKPOINTS"
+    assert action is None
+
+
 def test_awaiting_checkpoints_merges_early_when_quorum_reached_before_full_arrival(
     tmp_path,
 ):
@@ -329,7 +381,7 @@ def test_awaiting_checkpoints_merges_early_when_quorum_reached_before_full_arriv
     pending_dir = mesh_shared / "checkpoints" / "pending"
     pending_dir.mkdir(parents=True)
     for node in ("node001", "node002"):  # 2 of 3 -- node003 still training
-        (pending_dir / f"RUN1_{node}.pt").write_text("x")
+        (pending_dir / f"RUN1_0_{node}.pt").write_text("x")
 
     run_config = _run_config(quorum_k=2, grace_s=900.0)
     state = WatcherState()
@@ -359,7 +411,7 @@ def test_awaiting_checkpoints_quorum_configured_still_waits_below_quorum(tmp_pat
     mesh_shared = tmp_path / "mesh_shared"
     pending_dir = mesh_shared / "checkpoints" / "pending"
     pending_dir.mkdir(parents=True)
-    (pending_dir / "RUN1_node001.pt").write_text("x")  # only 1 of 3
+    (pending_dir / "RUN1_0_node001.pt").write_text("x")  # only 1 of 3
 
     run_config = _run_config(quorum_k=2, grace_s=900.0)
     state = WatcherState()
@@ -389,7 +441,7 @@ def test_awaiting_checkpoints_quorum_configured_falls_back_to_exclusion_after_gr
     pending_dir = mesh_shared / "checkpoints" / "pending"
     pending_dir.mkdir(parents=True)
     old_mtime = 1000.0
-    path = pending_dir / "RUN1_node001.pt"
+    path = pending_dir / "RUN1_0_node001.pt"
     path.write_text("x")
     os.utime(path, (old_mtime, old_mtime))
 
@@ -469,6 +521,38 @@ def test_merging_calls_run_outer_step_with_correct_args(tmp_path):
     assert cmd[outer_momentum_idx + 1] == "0.9"
     weighting_idx = cmd.index("--weighting")
     assert cmd[weighting_idx + 1] == "data"
+
+
+def test_merging_passes_tb_dir_matching_local_dir(tmp_path):
+    """TB scalars land in the same watcher-local run directory as the
+    momentum/residual buffers -- run_outer_step.py derives its mesh_shared
+    root from --pending-dir itself, so mesh_tick.py only needs to pass
+    --tb-dir."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+
+    run_config = _run_config(outer_lr=0.7, outer_momentum=0.9, weighting="data")
+    state = WatcherState()
+    state.run("RUN1").status = "MERGING"
+
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as m:
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    cmd = m.call_args[0][0]
+    tb_dir = Path(cmd[cmd.index("--tb-dir") + 1])
+    momentum = Path(cmd[cmd.index("--momentum") + 1])
+    assert tb_dir.parent == momentum.parent
+    assert tb_dir.name == "tb"
 
 
 def test_merging_passes_metrics_out_pointing_at_results_mesh_run_id(tmp_path):
@@ -564,7 +648,7 @@ def test_awaiting_checkpoints_timeout_branch_sets_timeout_forced_flag(tmp_path):
     pending_dir.mkdir(parents=True)
     old_mtime = 1000.0
     for node in ("node001", "node002"):
-        path = pending_dir / f"RUN1_{node}.pt"
+        path = pending_dir / f"RUN1_0_{node}.pt"
         path.write_text("x")
         os.utime(path, (old_mtime, old_mtime))
 
@@ -594,7 +678,7 @@ def test_awaiting_checkpoints_full_arrival_clears_a_stale_timeout_forced_flag(
     pending_dir = mesh_shared / "checkpoints" / "pending"
     pending_dir.mkdir(parents=True)
     for node in _NODES:
-        (pending_dir / f"RUN1_{node}.pt").write_text("x")
+        (pending_dir / f"RUN1_0_{node}.pt").write_text("x")
 
     run_config = _run_config()
     state = WatcherState()
@@ -624,7 +708,7 @@ def test_merging_bootstraps_master_from_pending_when_missing(tmp_path):
     pending_dir = mesh_shared / "checkpoints" / "pending"
     pending_dir.mkdir(parents=True)
     for node in _NODES:
-        _write_pending_checkpoint(pending_dir / f"RUN1_{node}.pt")
+        _write_pending_checkpoint(pending_dir / f"RUN1_0_{node}.pt")
 
     run_config = _run_config()
     state = WatcherState()
@@ -662,7 +746,7 @@ def test_merging_bootstraps_master_upcasts_fp16_pending_to_fp32(tmp_path):
     pending_dir.mkdir(parents=True)
     torch.save(
         {"model_state_dict": {"w": torch.ones(2).half()}, "n_samples": 100},
-        pending_dir / "RUN1_node001.pt",
+        pending_dir / "RUN1_0_node001.pt",
     )
 
     run_config = _run_config()
@@ -997,7 +1081,7 @@ def test_advance_all_runs_skips_done_runs(tmp_path):
     mesh_shared = tmp_path / "mesh_shared"
     pending_dir = mesh_shared / "checkpoints" / "pending"
     pending_dir.mkdir(parents=True)
-    (pending_dir / "RUN2_node001.pt").write_text("x")
+    (pending_dir / "RUN2_0_node001.pt").write_text("x")
 
     done_config = _run_config(run_id="RUN1")
     running_config = _run_config(run_id="RUN2")
@@ -1038,7 +1122,7 @@ def test_advance_all_runs_cascades_through_multiple_ready_transitions(tmp_path):
     pending_dir = mesh_shared / "checkpoints" / "pending"
     pending_dir.mkdir(parents=True)
     for node in _NODES:
-        _write_pending_checkpoint(pending_dir / f"RUN1_{node}.pt")
+        _write_pending_checkpoint(pending_dir / f"RUN1_1_{node}.pt")
 
     run_config = _run_config(rounds=2)
     state = WatcherState()
@@ -1066,7 +1150,7 @@ def test_advance_all_runs_stops_at_first_blocking_state(tmp_path):
     pending_dir = mesh_shared / "checkpoints" / "pending"
     pending_dir.mkdir(parents=True)
     for node in ("node001", "node002"):  # node003 never checked in
-        _write_pending_checkpoint(pending_dir / f"RUN1_{node}.pt")
+        _write_pending_checkpoint(pending_dir / f"RUN1_0_{node}.pt")
 
     run_config = _run_config()
     state = WatcherState()
@@ -1636,7 +1720,7 @@ def test_do_awaiting_checkpoints_triggers_replenish_on_new_exclusion(tmp_path):
     pending_dir.mkdir(parents=True)
     old_mtime = 1000.0
     for node in ("node001", "node002"):
-        path = pending_dir / f"RUN1_{node}.pt"
+        path = pending_dir / f"RUN1_0_{node}.pt"
         path.write_text("x")
         os.utime(path, (old_mtime, old_mtime))
 
@@ -1724,7 +1808,7 @@ def test_do_awaiting_checkpoints_does_not_double_pick_same_node_for_simultaneous
     pending_dir.mkdir(parents=True)
     old_mtime = 1000.0
     for node in ("node001", "node002"):
-        path = pending_dir / f"RUN1_{node}.pt"
+        path = pending_dir / f"RUN1_0_{node}.pt"
         path.write_text("x")
         os.utime(path, (old_mtime, old_mtime))
 

@@ -19,12 +19,19 @@ mesh:
   outer_momentum: 0.9
   sync_timeout_s: 1800.0
   # Per-node pacing (mesh/pacing.py). null keeps the uniform steps_per_round
-  # above for every node. Set it and each node instead trains what fits in
-  # this many seconds at its own measured rate, so rounds finish together
-  # instead of the fast nodes idling at the barrier (measured: 19.1% of all
-  # mesh wall-clock, over 1455 rounds). 960s ~= 9600 steps at the observed
-  # median 9.91 steps/s, so total work per round is roughly unchanged.
-  round_budget_s: null
+  # above for every node; each node instead trains what fits in this many
+  # seconds at its own measured rate, so rounds finish together instead of
+  # the fast nodes idling at the barrier (measured: 19.1% of all mesh
+  # wall-clock, over 1455 rounds). Deliberately well under
+  # watcher/mesh_tick.py's ROUND_TIMEOUT_S=900.0 (not this file's config --
+  # a hardcoded module constant): a node paced to a local-training budget
+  # anywhere near 900s would routinely miss the watcher's AWAITING_CHECKPOINTS
+  # deadline before it even finishes training, since that 900s also has to
+  # cover checkpoint push + merge + up to ~60s of cron tick-granularity slop
+  # on top of local training. 750s leaves that margin; 9600 steps at the
+  # observed median 9.91 steps/s would need ~970s, so this also slightly
+  # reduces steps/round for paced nodes, not just redistributes them.
+  round_budget_s: 750.0
   # Clamps as fractions of steps_per_round: the floor stops a degraded node
   # contributing a round of mostly-noise, the ceiling stops one bad rate
   # estimate stalling the mesh it was meant to unblock.

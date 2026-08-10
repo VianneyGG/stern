@@ -39,9 +39,15 @@ from video_encoding.mesh.outer_step import (
     pseudo_gradient,
     to_fp32_state_dict,
 )
+from video_encoding.mesh.pending_files import (
+    parse_pending_filename,
+    pending_files_for_round,
+)
 from video_encoding.mesh.quantize import quantize_with_error_feedback
+from video_encoding.mesh.quorum import NodeStats, token_weights
+from video_encoding.training.tb_logger import make_writer, write_mesh_round_scalars
 
-WEIGHTING_CHOICES = ("data", "inverse_loss")
+WEIGHTING_CHOICES = ("data", "inverse_loss", "token")
 
 # Dtype master.pt is written in for workers to read back. "fp32" is the
 # historical behaviour and stays the default: switching to "fp16" halves the
@@ -53,9 +59,9 @@ BROADCAST_DTYPE_CHOICES = ("fp32", "fp16")
 
 
 def _load_worker_checkpoints(
-    pending_dir: Path, run_id: str
+    pending_dir: Path, run_id: str, *, round_num: int | None = None
 ) -> dict[str, dict[str, Any]]:
-    """Load this run's `{run_id}_*.pt` in `pending_dir`, keyed by filename stem.
+    """Load this run's pending checkpoints, keyed by node name.
 
     `pending_dir` is ONE flat directory shared by every concurrent run
     (mesh_tick.py's _do_merging builds `checkpoints/pending` with no
@@ -66,9 +72,13 @@ def _load_worker_checkpoints(
     was the one path that was not, so the scoping is mandatory here rather
     than a defaulted convenience.
 
-    The literal `_` between run_id and the node name is what keeps
-    "pool-fish" from matching "pool-fish-5r_..." -- the same delimiter
-    argument mesh_tick.py's _clean_stale_run_artifacts docstring makes.
+    Filenames are `{run_id}_{round}_{node}.pt` (mesh/pending_files.py). When
+    `round_num` is given, only that round's files are read -- a straggler
+    that finished a PRIOR round late (after that round's own merge already
+    cleared pending/) must not get averaged into a DIFFERENT round's merge
+    just because its file happened to still be sitting in the directory.
+    `round_num=None` keeps every matching file regardless of round (the
+    caller's choice, e.g. a cold-start bootstrap with nothing else to go on).
 
     Validates `n_samples` and exactly one of `model_state_dict` (round 0, or
     a pre-3.2/merge=False push -- full weights, nothing to diff against yet)
@@ -77,15 +87,22 @@ def _load_worker_checkpoints(
     checkpoint fails before any merge math runs rather than surfacing as a
     confusing KeyError deep in `average_deltas`.
     """
-    files = sorted(pending_dir.glob(f"{run_id}_*.pt"))
+    if round_num is not None:
+        files = sorted(pending_files_for_round(pending_dir, run_id, round_num))
+    else:
+        files = sorted(pending_dir.glob(f"{run_id}_*.pt"))
     if not files:
         raise ValueError(
             f"merge_round: no pending checkpoints found for run_id={run_id!r} "
-            f"in {pending_dir}"
+            f"round_num={round_num!r} in {pending_dir}"
         )
 
     checkpoints: dict[str, dict[str, Any]] = {}
     for f in files:
+        parsed = parse_pending_filename(f.stem, run_id)
+        if parsed is None:
+            continue  # not this run_id's pattern (or predates round-tagging)
+        _, node = parsed
         payload = torch.load(f, map_location="cpu", weights_only=False)
         if "n_samples" not in payload:
             raise ValueError(
@@ -103,7 +120,13 @@ def _load_worker_checkpoints(
         payload = dict(payload)
         state_key = "model_state_dict" if has_model else "delta_state_dict"
         payload[state_key] = to_fp32_state_dict(payload[state_key])
-        checkpoints[f.stem] = payload
+        checkpoints[node] = payload
+    if not checkpoints:
+        raise ValueError(
+            f"merge_round: no pending checkpoints found for run_id={run_id!r} "
+            f"round_num={round_num!r} in {pending_dir} (found files, but none "
+            "parsed as this run_id's pending-file pattern)"
+        )
     return checkpoints
 
 
@@ -126,6 +149,20 @@ def _inverse_loss_weights(checkpoints: dict[str, dict[str, Any]]) -> dict[str, f
     return {name: v / total for name, v in inv.items()}
 
 
+def _token_weights(checkpoints: dict[str, dict[str, Any]]) -> dict[str, float]:
+    stats: dict[str, NodeStats] = {}
+    for name, ckpt in checkpoints.items():
+        if "n_steps" not in ckpt:
+            raise ValueError(
+                f"merge_round: checkpoint for '{name}' is missing required key "
+                "'n_steps', needed for weighting='token'"
+            )
+        stats[name] = NodeStats(
+            c_tokens=int(ckpt["n_samples"]), c_steps=int(ckpt["n_steps"])
+        )
+    return token_weights(stats)
+
+
 def _compute_alphas(
     checkpoints: dict[str, dict[str, Any]], weighting: str
 ) -> dict[str, float]:
@@ -135,6 +172,8 @@ def _compute_alphas(
         )
     if weighting == "inverse_loss":
         return _inverse_loss_weights(checkpoints)
+    if weighting == "token":
+        return _token_weights(checkpoints)
     raise ValueError(
         f"merge_round: unknown weighting scheme {weighting!r}, expected one of "
         f"{WEIGHTING_CHOICES}"
@@ -209,6 +248,52 @@ def _append_merge_metrics(
         )
 
 
+def _write_tb_scalars(
+    *,
+    tb_dir: Path,
+    pending_dir: Path,
+    run_id: str,
+    round_num: int,
+    n_workers: int,
+    timeout_forced: bool,
+) -> None:
+    """Write this merge's contributor scalars, then replay any backlogged
+    per-round scalars from the JSONL. Never raises -- diagnostics must
+    never fail an otherwise-successful merge, same rule
+    _append_merge_metrics follows for --metrics-out.
+
+    mesh_shared is derived from pending_dir (always
+    mesh_shared/checkpoints/pending, see watcher/mesh_tick.py::_do_merging)
+    rather than taking its own flag -- one less thing for callers to keep
+    in sync.
+    """
+    mesh_shared = pending_dir.parent.parent
+    last_round_path = tb_dir.parent / "tb_last_round.txt"
+    try:
+        last_round = (
+            int(last_round_path.read_text().strip()) if last_round_path.exists() else 0
+        )
+        writer = make_writer(tb_dir, rank=0)
+        if writer is None:
+            return
+        writer.add_scalar("mesh_merge/n_contributors", n_workers, round_num)
+        writer.add_scalar(
+            "mesh_merge/timeout_forced", 1.0 if timeout_forced else 0.0, round_num
+        )
+        new_last_round = write_mesh_round_scalars(
+            writer, mesh_shared, run_id, last_round
+        )
+        writer.flush()
+        writer.close()
+        if new_last_round != last_round:
+            last_round_path.write_text(str(new_last_round))
+    except Exception as exc:  # noqa: BLE001 -- must never fail the merge
+        print(
+            f"run_outer_step: WARNING failed to write TB scalars to {tb_dir}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def merge_round(
     pending_dir: Path,
     master_path: Path,
@@ -249,7 +334,7 @@ def merge_round(
     master_sd: StateDict = to_fp32_state_dict(master_payload["model_state_dict"])
     current_master_version = master_payload.get("master_version")
 
-    checkpoints = _load_worker_checkpoints(pending_dir, run_id)
+    checkpoints = _load_worker_checkpoints(pending_dir, run_id, round_num=round_num)
     checkpoints, stale = filter_stale_deltas(checkpoints, current_master_version)
     if stale:
         print(
@@ -373,6 +458,15 @@ def main(argv: list[str] | None = None) -> int:
             "full check-in -- recorded verbatim into --metrics-out."
         ),
     )
+    parser.add_argument(
+        "--tb-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Write this round's TensorBoard scalars here. Omit to skip "
+            "(back-compat, no file created)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -399,6 +493,16 @@ def main(argv: list[str] | None = None) -> int:
             run_id=args.run_id,
             round_num=args.round_num,
             result=result,
+            timeout_forced=args.timeout_forced,
+        )
+
+    if args.tb_dir is not None:
+        _write_tb_scalars(
+            tb_dir=args.tb_dir,
+            pending_dir=args.pending_dir,
+            run_id=args.run_id,
+            round_num=args.round_num,
+            n_workers=result["n_workers"],
             timeout_forced=args.timeout_forced,
         )
 

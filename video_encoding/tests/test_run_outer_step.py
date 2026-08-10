@@ -32,7 +32,7 @@ def test_cli_invocation_as_module_actually_runs(tmp_path):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100)
 
     result = subprocess.run(
         [
@@ -78,6 +78,7 @@ def _write_worker(
     v: float,
     *,
     n_samples: int | None = 100,
+    n_steps: int | None = None,
     val_loss: float = 1.0,
     round_: int = 1,
     omit_n_samples: bool = False,
@@ -89,6 +90,8 @@ def _write_worker(
     }
     if not omit_n_samples:
         payload["n_samples"] = n_samples
+    if n_steps is not None:
+        payload["n_steps"] = n_steps
     torch.save(payload, path)
 
 
@@ -113,8 +116,8 @@ def test_merge_with_lr1_momentum0_reproduces_weighted_average(tmp_path):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.0, n_samples=100)
-    _write_worker(pending_dir / "run1_b.pt", 2.0, n_samples=100)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.0, n_samples=100)
+    _write_worker(pending_dir / "run1_0_b.pt", 2.0, n_samples=100)
 
     merge_round(
         pending_dir,
@@ -140,7 +143,7 @@ def test_merge_round_reads_delta_state_dict_directly_when_present(tmp_path):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker_delta(pending_dir / "run1_a.pt", 1.0, n_samples=100)
+    _write_worker_delta(pending_dir / "run1_0_a.pt", 1.0, n_samples=100)
 
     merge_round(
         pending_dir,
@@ -165,8 +168,8 @@ def test_merge_round_mixes_delta_and_full_weight_checkpoints_in_one_round(tmp_pa
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker_delta(pending_dir / "run1_a.pt", 1.0, n_samples=100)
-    _write_worker(pending_dir / "run1_b.pt", 0.0, n_samples=100)  # equivalent delta
+    _write_worker_delta(pending_dir / "run1_0_a.pt", 1.0, n_samples=100)
+    _write_worker(pending_dir / "run1_0_b.pt", 0.0, n_samples=100)  # equivalent delta
 
     result = merge_round(
         pending_dir,
@@ -189,10 +192,12 @@ def test_merge_round_drops_a_checkpoint_pushed_against_a_stale_master(tmp_path):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0, master_version=5)
-    _write_worker_delta(pending_dir / "run1_a.pt", 1.0, n_samples=100, master_version=5)
+    _write_worker_delta(
+        pending_dir / "run1_0_a.pt", 1.0, n_samples=100, master_version=5
+    )
     # Stale: computed against an older master, must be dropped, not merged in.
     _write_worker_delta(
-        pending_dir / "run1_b.pt", 999.0, n_samples=100, master_version=4
+        pending_dir / "run1_0_b.pt", 999.0, n_samples=100, master_version=4
     )
 
     result = merge_round(
@@ -204,7 +209,7 @@ def test_merge_round_drops_a_checkpoint_pushed_against_a_stale_master(tmp_path):
         momentum=0.0,
     )
 
-    assert set(result["alphas"]) == {"run1_a"}
+    assert set(result["alphas"]) == {"a"}
     merged = torch.load(master_path, weights_only=False)["model_state_dict"]
     assert merged["w"][0, 0].item() == pytest.approx(0.0)
 
@@ -216,8 +221,8 @@ def test_alphas_follow_sample_counts_not_val_loss(tmp_path):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=300, val_loss=9.0)
-    _write_worker(pending_dir / "run1_b.pt", 0.5, n_samples=100, val_loss=0.1)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=300, val_loss=9.0)
+    _write_worker(pending_dir / "run1_0_b.pt", 0.5, n_samples=100, val_loss=0.1)
 
     result = merge_round(
         pending_dir,
@@ -229,8 +234,8 @@ def test_alphas_follow_sample_counts_not_val_loss(tmp_path):
         weighting="data",
     )
 
-    assert result["alphas"]["run1_a"] == pytest.approx(0.75)
-    assert result["alphas"]["run1_b"] == pytest.approx(0.25)
+    assert result["alphas"]["a"] == pytest.approx(0.75)
+    assert result["alphas"]["b"] == pytest.approx(0.25)
 
 
 def test_momentum_buffer_is_written_and_reloaded(tmp_path, capsys):
@@ -240,7 +245,7 @@ def test_momentum_buffer_is_written_and_reloaded(tmp_path, capsys):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 1.1, n_samples=100)
+    _write_worker(pending_dir / "run1_0_a.pt", 1.1, n_samples=100)
 
     merge_round(
         pending_dir,
@@ -284,7 +289,7 @@ def test_checkpoint_with_neither_state_dict_key_is_rejected_loudly(tmp_path):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    torch.save({"n_samples": 100}, pending_dir / "run1_a.pt")
+    torch.save({"n_samples": 100}, pending_dir / "run1_0_a.pt")
 
     with pytest.raises(ValueError, match="exactly one of"):
         merge_round(
@@ -306,7 +311,7 @@ def test_checkpoint_with_both_state_dict_keys_is_rejected_loudly(tmp_path):
     _write_master(master_path, 1.0)
     torch.save(
         {"model_state_dict": _sd(0.5), "delta_state_dict": _sd(0.5), "n_samples": 100},
-        pending_dir / "run1_a.pt",
+        pending_dir / "run1_0_a.pt",
     )
 
     with pytest.raises(ValueError, match="exactly one of"):
@@ -327,7 +332,7 @@ def test_checkpoint_without_n_samples_is_rejected_loudly(tmp_path):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, omit_n_samples=True)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, omit_n_samples=True)
 
     with pytest.raises(ValueError, match="n_samples"):
         merge_round(
@@ -368,12 +373,12 @@ def test_load_worker_checkpoints_upcasts_fp16_to_fp32(tmp_path):
             "model_state_dict": {"w": torch.ones(2, 2).half()},
             "n_samples": 100,
         },
-        pending_dir / "run1_a.pt",
+        pending_dir / "run1_0_a.pt",
     )
 
     checkpoints = _load_worker_checkpoints(pending_dir, "run1")
 
-    assert checkpoints["run1_a"]["model_state_dict"]["w"].dtype == torch.float32
+    assert checkpoints["a"]["model_state_dict"]["w"].dtype == torch.float32
 
 
 def test_inverse_loss_weighting_is_available_as_an_option(tmp_path):
@@ -383,8 +388,8 @@ def test_inverse_loss_weighting_is_available_as_an_option(tmp_path):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100, val_loss=1.0)
-    _write_worker(pending_dir / "run1_b.pt", 0.5, n_samples=100, val_loss=3.0)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100, val_loss=1.0)
+    _write_worker(pending_dir / "run1_0_b.pt", 0.5, n_samples=100, val_loss=3.0)
 
     result = merge_round(
         pending_dir,
@@ -396,7 +401,7 @@ def test_inverse_loss_weighting_is_available_as_an_option(tmp_path):
         weighting="inverse_loss",
     )
 
-    assert result["alphas"]["run1_a"] > result["alphas"]["run1_b"]
+    assert result["alphas"]["a"] > result["alphas"]["b"]
 
 
 def test_inverse_loss_weighting_rejects_nan_val_loss(tmp_path):
@@ -413,8 +418,10 @@ def test_inverse_loss_weighting_rejects_nan_val_loss(tmp_path):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100, val_loss=1.0)
-    _write_worker(pending_dir / "run1_b.pt", 0.5, n_samples=100, val_loss=float("nan"))
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100, val_loss=1.0)
+    _write_worker(
+        pending_dir / "run1_0_b.pt", 0.5, n_samples=100, val_loss=float("nan")
+    )
 
     with pytest.raises(ValueError, match="non-finite val_loss"):
         merge_round(
@@ -425,6 +432,61 @@ def test_inverse_loss_weighting_rejects_nan_val_loss(tmp_path):
             lr=0.7,
             momentum=0.9,
             weighting="inverse_loss",
+        )
+
+
+def test_token_weighting_prefers_fewer_steps_per_sample_over_equal_data_weights(
+    tmp_path,
+):
+    """mesh/quorum.py's token_weights ("quantity x quality", Decoupled DiLoCo
+    2.2) must actually change the merge outcome vs weighting="data": two
+    nodes with equal n_samples but different n_steps are NOT equal under
+    token weighting -- the one that needed fewer steps to process the same
+    data (a healthier, better-fed worker) gets more say."""
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100, n_steps=50)
+    _write_worker(pending_dir / "run1_0_b.pt", 0.5, n_samples=100, n_steps=200)
+
+    result = merge_round(
+        pending_dir,
+        master_path,
+        momentum_path,
+        run_id="run1",
+        lr=0.7,
+        momentum=0.9,
+        weighting="token",
+    )
+
+    assert result["alphas"]["a"] > result["alphas"]["b"]
+
+
+def test_token_weighting_rejects_missing_n_steps(tmp_path):
+    """n_steps is optional for weighting='data'/'inverse_loss' (they never
+    read it), but weighting='token' needs it -- must fail loud rather than
+    silently falling back to an unweighted or wrong merge, matching the
+    n_samples/val_loss validation pattern above."""
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100)  # no n_steps
+
+    with pytest.raises(ValueError, match="n_steps"):
+        merge_round(
+            pending_dir,
+            master_path,
+            momentum_path,
+            run_id="run1",
+            lr=0.7,
+            momentum=0.9,
+            weighting="token",
         )
 
 
@@ -441,11 +503,11 @@ def test_merge_ignores_other_runs_checkpoints_in_the_shared_pending_dir(tmp_path
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "runA_a.pt", 0.0, n_samples=100)
-    _write_worker(pending_dir / "runA_b.pt", 2.0, n_samples=100)
+    _write_worker(pending_dir / "runA_0_a.pt", 0.0, n_samples=100)
+    _write_worker(pending_dir / "runA_0_b.pt", 2.0, n_samples=100)
     # A concurrent run and a finished run's leftovers, same directory.
-    _write_worker(pending_dir / "runB_a.pt", 99.0, n_samples=100)
-    _write_worker(pending_dir / "dead-run_z.pt", -99.0, n_samples=100)
+    _write_worker(pending_dir / "runB_0_a.pt", 99.0, n_samples=100)
+    _write_worker(pending_dir / "dead-run_0_z.pt", -99.0, n_samples=100)
 
     result = merge_round(
         pending_dir,
@@ -458,7 +520,7 @@ def test_merge_ignores_other_runs_checkpoints_in_the_shared_pending_dir(tmp_path
     )
 
     assert result["n_workers"] == 2
-    assert set(result["alphas"]) == {"runA_a", "runA_b"}
+    assert set(result["alphas"]) == {"a", "b"}
     # lr=1, momentum=0 over deltas 1.0 and -1.0 -> master unchanged at 1.0.
     # If runB/dead-run leaked in, this lands nowhere near 1.0.
     merged = torch.load(master_path, weights_only=False)["model_state_dict"]
@@ -472,7 +534,7 @@ def test_merge_raises_when_only_other_runs_checkpoints_are_present(tmp_path):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "runB_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "runB_0_a.pt", 0.5, n_samples=100)
 
     with pytest.raises(ValueError, match="no pending"):
         merge_round(
@@ -496,8 +558,8 @@ def test_run_id_scoping_does_not_match_hyphen_suffixed_sibling_runs(tmp_path):
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "pool-fish_a.pt", 0.5, n_samples=100)
-    _write_worker(pending_dir / "pool-fish-5r_a.pt", 9.0, n_samples=100)
+    _write_worker(pending_dir / "pool-fish_0_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "pool-fish-5r_0_a.pt", 9.0, n_samples=100)
 
     result = merge_round(
         pending_dir,
@@ -509,7 +571,7 @@ def test_run_id_scoping_does_not_match_hyphen_suffixed_sibling_runs(tmp_path):
         weighting="data",
     )
 
-    assert set(result["alphas"]) == {"pool-fish_a"}
+    assert set(result["alphas"]) == {"a"}
 
 
 def test_broadcast_dtype_fp32_is_the_default_and_keeps_master_fp32(tmp_path):
@@ -517,7 +579,7 @@ def test_broadcast_dtype_fp32_is_the_default_and_keeps_master_fp32(tmp_path):
     pending_dir.mkdir()
     master_path = tmp_path / "master.pt"
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100)
 
     merge_round(
         pending_dir,
@@ -537,7 +599,7 @@ def test_broadcast_dtype_fp16_halves_master_and_still_merges(tmp_path):
     pending_dir.mkdir()
     master_path = tmp_path / "master.pt"
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "run1_1_a.pt", 0.5, n_samples=100)
 
     merge_round(
         pending_dir,
@@ -577,7 +639,7 @@ def test_merge_round_stamps_master_version_from_round_num(tmp_path):
     pending_dir.mkdir()
     master_path = tmp_path / "master.pt"
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "run1_3_a.pt", 0.5, n_samples=100)
 
     merge_round(
         pending_dir,
@@ -598,7 +660,7 @@ def test_merge_round_stamps_none_master_version_when_round_num_is_none(tmp_path)
     pending_dir.mkdir()
     master_path = tmp_path / "master.pt"
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100)
 
     merge_round(
         pending_dir,
@@ -669,7 +731,7 @@ def test_missing_momentum_past_round_zero_is_fatal(tmp_path):
     pending_dir.mkdir()
     master_path = tmp_path / "master.pt"
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "run1_3_a.pt", 0.5, n_samples=100)
 
     with pytest.raises(ValueError, match="momentum"):
         merge_round(
@@ -688,7 +750,7 @@ def test_missing_momentum_at_round_zero_still_only_warns(tmp_path, capsys):
     pending_dir.mkdir()
     master_path = tmp_path / "master.pt"
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100)
 
     merge_round(
         pending_dir,
@@ -708,7 +770,7 @@ def test_missing_momentum_past_round_zero_can_be_overridden(tmp_path):
     pending_dir.mkdir()
     master_path = tmp_path / "master.pt"
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "run1_3_a.pt", 0.5, n_samples=100)
 
     result = merge_round(
         pending_dir,
@@ -755,8 +817,8 @@ def test_metrics_out_writes_one_line_with_contributors_matching_alphas(tmp_path)
     metrics_out = tmp_path / "results" / "run1_rounds.jsonl"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.0, n_samples=100)
-    _write_worker(pending_dir / "run1_b.pt", 2.0, n_samples=100)
+    _write_worker(pending_dir / "run1_7_a.pt", 0.0, n_samples=100)
+    _write_worker(pending_dir / "run1_7_b.pt", 2.0, n_samples=100)
 
     rc = main(
         _cli_argv(
@@ -783,7 +845,7 @@ def test_metrics_out_writes_one_line_with_contributors_matching_alphas(tmp_path)
     assert record["round"] == 7
     assert record["n_contributors"] == 2
     assert record["contributors"] == sorted(record["alphas"])
-    assert set(record["alphas"]) == {"run1_a", "run1_b"}
+    assert set(record["alphas"]) == {"a", "b"}
     assert record["timeout_forced"] is False
     assert isinstance(record["ts"], float)
 
@@ -798,7 +860,7 @@ def test_metrics_out_omitted_creates_no_file(tmp_path):
     results_dir = tmp_path / "results"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100)
 
     rc = main(_cli_argv(pending_dir, master_path, momentum_path, "run1"))
 
@@ -814,7 +876,7 @@ def test_metrics_out_records_timeout_forced_flag(tmp_path):
     metrics_out = tmp_path / "run1_rounds.jsonl"
 
     _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_a.pt", 0.5, n_samples=100)
+    _write_worker(pending_dir / "run1_1_a.pt", 0.5, n_samples=100)
 
     rc = main(
         _cli_argv(
@@ -836,3 +898,196 @@ def test_metrics_out_records_timeout_forced_flag(tmp_path):
     assert rc == 0
     record = json.loads(metrics_out.read_text().splitlines()[0])
     assert record["timeout_forced"] is True
+
+
+class _RecordingWriter:
+    def __init__(self):
+        self.calls = []
+
+    def add_scalar(self, tag, value, step):
+        self.calls.append((tag, value, step))
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_tb_dir_writes_merge_contributor_scalars_and_replays_jsonl(
+    tmp_path, monkeypatch
+):
+    pending_dir = tmp_path / "mesh_shared" / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+    tb_dir = tmp_path / "tb"
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_2_a.pt", 0.0, n_samples=100)
+    _write_worker(pending_dir / "run1_2_b.pt", 2.0, n_samples=100)
+
+    replay_calls = []
+    monkeypatch.setattr(
+        "video_encoding.scripts.run_outer_step.write_mesh_round_scalars",
+        lambda writer, mesh_shared, run_id, last_round: (
+            replay_calls.append((mesh_shared, run_id, last_round)) or 0
+        ),
+    )
+    recording_writer = _RecordingWriter()
+    monkeypatch.setattr(
+        "video_encoding.scripts.run_outer_step.make_writer",
+        lambda log_dir, rank=0: recording_writer,
+    )
+
+    rc = main(
+        _cli_argv(
+            pending_dir,
+            master_path,
+            momentum_path,
+            "run1",
+            extra=[
+                "--round",
+                "2",
+                "--allow-missing-momentum",
+                "--tb-dir",
+                str(tb_dir),
+            ],
+        )
+    )
+
+    assert rc == 0
+    assert replay_calls == [(pending_dir.parent.parent, "run1", 0)]
+    tags = {c[0]: c for c in recording_writer.calls}
+    assert tags["mesh_merge/n_contributors"] == ("mesh_merge/n_contributors", 2, 2)
+    assert tags["mesh_merge/timeout_forced"] == ("mesh_merge/timeout_forced", 0.0, 2)
+
+
+def test_tb_dir_persists_last_round_sidecar_after_replay(tmp_path, monkeypatch):
+    pending_dir = tmp_path / "mesh_shared" / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+    tb_dir = tmp_path / "tb"
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100)
+
+    monkeypatch.setattr(
+        "video_encoding.scripts.run_outer_step.write_mesh_round_scalars",
+        lambda writer, mesh_shared, run_id, last_round: 3,
+    )
+
+    rc = main(
+        _cli_argv(
+            pending_dir,
+            master_path,
+            momentum_path,
+            "run1",
+            extra=[
+                "--round",
+                "0",
+                "--allow-missing-momentum",
+                "--tb-dir",
+                str(tb_dir),
+            ],
+        )
+    )
+
+    assert rc == 0
+    assert (tb_dir.parent / "tb_last_round.txt").read_text().strip() == "3"
+
+
+def test_tb_dir_reads_existing_sidecar_as_starting_last_round(tmp_path, monkeypatch):
+    pending_dir = tmp_path / "mesh_shared" / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+    tb_dir = tmp_path / "tb"
+    tb_dir.parent.mkdir(parents=True, exist_ok=True)
+    (tb_dir.parent / "tb_last_round.txt").write_text("5")
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100)
+
+    seen = []
+    monkeypatch.setattr(
+        "video_encoding.scripts.run_outer_step.write_mesh_round_scalars",
+        lambda writer, mesh_shared, run_id, last_round: (
+            seen.append(last_round) or last_round
+        ),
+    )
+
+    rc = main(
+        _cli_argv(
+            pending_dir,
+            master_path,
+            momentum_path,
+            "run1",
+            extra=[
+                "--round",
+                "0",
+                "--allow-missing-momentum",
+                "--tb-dir",
+                str(tb_dir),
+            ],
+        )
+    )
+
+    assert rc == 0
+    assert seen == [5]
+
+
+def test_tb_dir_write_failure_does_not_fail_the_merge(tmp_path, monkeypatch, capsys):
+    pending_dir = tmp_path / "mesh_shared" / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+    tb_dir = tmp_path / "tb"
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100)
+
+    def _raise(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("video_encoding.scripts.run_outer_step.make_writer", _raise)
+
+    rc = main(
+        _cli_argv(
+            pending_dir,
+            master_path,
+            momentum_path,
+            "run1",
+            extra=[
+                "--round",
+                "0",
+                "--allow-missing-momentum",
+                "--tb-dir",
+                str(tb_dir),
+            ],
+        )
+    )
+
+    assert rc == 0
+    assert "run_outer_step" in capsys.readouterr().err
+    merged = torch.load(master_path, weights_only=False)["model_state_dict"]
+    # lr=0.7, momentum=0.9 over a nonzero delta -- master must have moved,
+    # proving the merge itself completed despite the TB write raising.
+    assert merged["w"][0, 0].item() != pytest.approx(1.0)
+
+
+def test_tb_dir_omitted_creates_no_tb_directory(tmp_path):
+    pending_dir = tmp_path / "mesh_shared" / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+    tb_dir = tmp_path / "tb"
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100)
+
+    rc = main(_cli_argv(pending_dir, master_path, momentum_path, "run1"))
+
+    assert rc == 0
+    assert not tb_dir.exists()
