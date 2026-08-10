@@ -1413,3 +1413,67 @@ def test_local_payload_records_steps_for_the_merge_weighting(tmp_path, monkeypat
     assert (
         payload["n_samples"] == captured[-1] * 3
     )  # distinct from n_steps, not a stand-in for it
+
+
+def test_run_mesh_pretrain_stage_reproducible_across_ambient_rng_state(
+    tmp_path, monkeypatch
+):
+    """Production never calls torch.manual_seed before this function runs, so
+    two cold starts with identical cfg currently produce different recon_loss
+    depending on whatever RNG state the process happened to be in (model init
+    + RandomTubeMasking sampling both draw from it). run_mesh_pretrain_stage
+    must reseed from cfg.train.seed itself so cold-start sweep cells are
+    comparable. Proven here by deliberately setting DIFFERENT ambient seeds
+    right before two otherwise-identical cold starts and asserting identical
+    results -- if the function doesn't reseed internally, the two ambient
+    seeds diverge and this fails."""
+
+    def _cold_start_recon_loss(subdir: str, ambient_seed: int) -> float:
+        torch.manual_seed(ambient_seed)
+        hostname = socket.gethostname().split(".", 1)[0]
+        root = tmp_path / subdir
+        mesh_root = root / "mesh_root"
+        shard_name = _write_shard(mesh_root, "clip0", n_frames=4)
+        mesh_shared = root / "mesh_shared"
+        assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+        assignments_path.parent.mkdir(parents=True)
+        assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+        shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+        shard_map_path.write_text(json.dumps({}))
+        checkpoint_root = root / "stern_checkpoints"
+
+        monkeypatch.setenv("MESH_RUN_ID", "run1")
+        monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+        monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+        monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+        monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+        monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+
+        cfg = DictConfig(
+            {
+                "model": _tiny_cfg(),
+                "train": {
+                    "seed": 42,
+                    "amp": "off",
+                    "accum_steps": 1,
+                    "grad_clip": 0.0,
+                    "weight_decay": 0.0,
+                    "learning_rate": 1e-3,
+                },
+                "preprocess": {"window": {"overlap": 0.0}},
+                "mesh": {
+                    "rounds": 1,
+                    "steps_per_round": 1,
+                    "merge": False,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "sync_timeout_s": 5.0,
+                },
+            }
+        )
+        result = run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+        return result["recon_loss"]
+
+    loss_a = _cold_start_recon_loss("a", ambient_seed=111)
+    loss_b = _cold_start_recon_loss("b", ambient_seed=222)
+    assert loss_a == loss_b

@@ -28,23 +28,34 @@ import json
 import sys
 from pathlib import Path
 
-path, run_id, active_csv, rounds, lr, mom = sys.argv[1:7]
+argv = sys.argv[1:]
+path, run_id, active_csv, rounds, lr, mom = argv[:6]
+# launch_item always passes 8 args to REGISTER_CMD, even when quorum_k/
+# weighting/extra_overrides are the empty string -- so "argv[7] is present
+# but empty" must default the same way bash's ${7:-data} does (empty
+# counts as unset), not just "argv[7] is absent".
+quorum_k = argv[6] if len(argv) > 6 else ""
+weighting = (argv[7] if len(argv) > 7 else "") or "data"
+extra_overrides = argv[8] if len(argv) > 8 else ""
 path = Path(path)
 cfgs = json.loads(path.read_text()) if path.exists() else []
 cfgs = [c for c in cfgs if c["run_id"] != run_id]
-cfgs.append(
-    {
-        "run_id": run_id,
-        "experiment": "videomae_mesh_ssl",
-        "nodes": active_csv.split(","),
-        "n_shards": 260,
-        "outer_lr": float(lr),
-        "outer_momentum": float(mom),
-        "weighting": "data",
-        "rounds": int(rounds),
-        "merge": True,
-    }
-)
+entry = {
+    "run_id": run_id,
+    "experiment": "videomae_mesh_ssl",
+    "nodes": active_csv.split(","),
+    "n_shards": 260,
+    "outer_lr": float(lr),
+    "outer_momentum": float(mom),
+    "weighting": weighting,
+    "rounds": int(rounds),
+    "merge": True,
+}
+if quorum_k:
+    entry["quorum_k"] = int(quorum_k)
+if extra_overrides:
+    entry["extra_overrides"] = extra_overrides.split()
+cfgs.append(entry)
 tmp = path.with_suffix(path.suffix + ".tmp")
 tmp.write_text(json.dumps(cfgs, indent=2))
 tmp.replace(path)
@@ -107,6 +118,7 @@ class Sweep:
         self.register_cmd = self.bin / "register.sh"
         self.sinfo_cmd = self.bin / "sinfo"
         self.stall_s = "3600"
+        self.deadline_epoch: str | None = None
         (self.state / f"mesh_pool_ready_{TIER}.txt").write_text("\n".join(NODES) + "\n")
         (self.state / f"mesh_pool_active_{TIER}.txt").write_text(",".join(NODES) + "\n")
         self.set_watcher({})
@@ -184,6 +196,8 @@ class Sweep:
             STUB_SINFO_OUT=str(self.sinfo_out),
             STUB_SQUEUE_OUT=str(self.squeue_out),
         )
+        if self.deadline_epoch is not None:
+            env["SWEEP_DEADLINE_EPOCH"] = self.deadline_epoch
         return env
 
     def run(self, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -493,4 +507,95 @@ def test_nodes_running_our_jobs_count_as_available(sweep):
         entry = wait_until(lambda: _registered(sweep, "run_a"))
     assert entry["nodes"] == NODES
     assert "16/16 pool nodes available" in sweep.log()
+    assert "launch" not in sweep.call_log()
+
+
+def test_cars_is_a_valid_tier(tmp_path):
+    # Isolated SWEEP_REPO_ROOT with no queue file -- must not pick up the
+    # real repo's runs/state/sweep_queue_cars.txt (Task 6 creates that one
+    # for actual use), just prove "cars" clears the tier-validity check.
+    env = dict(os.environ, SWEEP_REPO_ROOT=str(tmp_path))
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "cars"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    assert result.returncode != 0
+    assert "unknown tier" not in result.stderr
+    assert "no queue file" in result.stderr
+
+
+def test_quorum_k_weighting_and_extra_overrides_reach_register(sweep):
+    sweep.set_queue(["run_a 40 0.6 0.9 8 token train.accum_steps=128"])
+    sweep.set_watcher({"run_a": {"status": "RUNNING", "round": 1}})
+    with sweep.running():
+        entry = wait_until(lambda: _registered(sweep, "run_a"))
+    assert entry["quorum_k"] == 8
+    assert entry["weighting"] == "token"
+    assert entry["extra_overrides"] == ["train.accum_steps=128"]
+
+
+def test_legacy_four_field_queue_line_still_works(sweep):
+    """Regression: fish/birds' existing sweep_queue_*.txt files use the old
+    4-column format ('run_id rounds outer_lr outer_momentum') -- adding the
+    3 new optional fields must not require rewriting those files."""
+    sweep.set_queue(["run_a 25 0.7 0.9"])
+    sweep.set_watcher({"run_a": {"status": "RUNNING", "round": 1}})
+    with sweep.running():
+        entry = wait_until(lambda: _registered(sweep, "run_a"))
+    assert "quorum_k" not in entry
+    assert entry["weighting"] == "data"
+
+
+def test_full_launch_fallback_errors_instead_of_silently_dropping_overrides(sweep):
+    """Below-quorum availability that never recovers must still error out
+    eventually, after exhausting retries -- not fall back to launch_mesh_pool.sh
+    (silently dropping quorum_k/token weighting/extra_overrides) and not hang
+    forever."""
+    sweep.set_cluster(idle=NODES[:10], mine=[])  # stays below quorum forever
+    sweep.set_queue(["run_a 25 0.7 0.9 8 token train.accum_steps=128"])
+    sweep.set_watcher({"run_a": {"status": "RUNNING", "round": 1}})
+    with sweep.running() as proc:
+        wait_until(lambda: proc.poll() is not None, timeout=30)
+    assert proc.returncode != 0
+    assert "retrying in" in sweep.log()
+    assert "cannot full-launch" in sweep.log()
+    assert "launch" not in sweep.call_log()
+    assert not sweep.configs_path.exists()
+
+
+def test_transient_shortage_retries_then_succeeds_once_pool_recovers(sweep):
+    """Cars historically sees 15/16 nodes report per round, comfortably above
+    the 13-node full-launch threshold -- but not guaranteed. A cell that needs
+    quorum_k/weighting/extra_overrides must survive one below-quorum poll by
+    retrying, rather than erroring out (or silently full-launching) on the
+    first bad reading."""
+    sweep.set_cluster(idle=NODES[:10], mine=[])
+    sweep.set_queue(["run_a 40 0.6 0.9 8 token train.accum_steps=128"])
+    sweep.set_watcher({"run_a": {"status": "RUNNING", "round": 1}})
+    with sweep.running():
+        wait_until(lambda: "retrying in" in sweep.log())
+        sweep.set_cluster(idle=NODES, mine=[])
+        entry = wait_until(lambda: _registered(sweep, "run_a"), timeout=30)
+    assert entry["quorum_k"] == 8
+    assert entry["weighting"] == "token"
+    assert entry["extra_overrides"] == ["train.accum_steps=128"]
+    assert "launch" not in sweep.call_log()
+
+
+def test_deadline_reached_exits_before_starting_the_next_item(sweep):
+    """SWEEP_DEADLINE_EPOCH is optional and unset by default -- existing
+    fish/birds usage (which never sets it) is unaffected. When set and
+    already past, the drain loop must exit cleanly before launching anything,
+    matching the design's tail-cut convention (whatever hasn't started by the
+    deadline is dropped, not pre-shrunk)."""
+    sweep.deadline_epoch = str(int(time.time()) - 1)
+    sweep.set_queue(["run_a 25 0.7 0.9", "run_b 30 0.45 0.8"])
+    with sweep.running() as proc:
+        assert proc.wait(timeout=20) == 0
+    assert "deadline" in sweep.log()
+    assert not sweep.configs_path.exists()
+    assert "register" not in sweep.call_log()
     assert "launch" not in sweep.call_log()

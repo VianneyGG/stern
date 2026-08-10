@@ -17,6 +17,7 @@ from video_encoding.watcher.mesh_tick import (
     _submit_worker_job,
     advance_all_runs,
     advance_one_run,
+    load_run_configs,
     sweep_orphaned_pending,
 )
 from video_encoding.watcher.state import WatcherState
@@ -65,6 +66,34 @@ def test_meshrunconfig_broadcast_dtype_defaults_to_fp16():
     -- the unbiased error-feedback path already exists, this only flips
     which dtype a run gets when it doesn't ask."""
     assert _run_config().broadcast_dtype == "fp16"
+
+
+def test_meshrunconfig_extra_overrides_defaults_to_empty_list():
+    assert _run_config().extra_overrides == []
+
+
+def test_meshrunconfig_extra_overrides_round_trips_through_load_run_configs(tmp_path):
+    path = tmp_path / "mesh_run_configs.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": ["node001"],
+                    "n_shards": 9,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                    "extra_overrides": ["train.accum_steps=128", "train.lr_mult=1.5"],
+                }
+            ]
+        )
+    )
+    configs = load_run_configs(path)
+    assert configs[0].extra_overrides == ["train.accum_steps=128", "train.lr_mult=1.5"]
 
 
 def _seed_shard_map(mesh_shared) -> None:
@@ -1238,6 +1267,69 @@ def test_submit_worker_job_overrides_compose_against_real_experiment_config(tmp_
         )
     assert cfg.mesh.merge is True
     assert cfg.mesh.start_round == 0
+
+
+def test_submit_worker_job_appends_extra_overrides(tmp_path):
+    run_config = _run_config(extra_overrides=["train.accum_steps=128"])
+    registry_path = tmp_path / "jobs_registry.json"
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 557\n")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        _submit_worker_job(
+            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+        )
+    submitted_cmd = mock_run.call_args[0][0]
+    assert "train.accum_steps=128" in submitted_cmd
+
+
+def test_submit_worker_job_omits_extra_overrides_when_unset(tmp_path):
+    run_config = _run_config()  # extra_overrides defaults to []
+    registry_path = tmp_path / "jobs_registry.json"
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 558\n")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        _submit_worker_job(
+            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+        )
+    submitted_cmd = mock_run.call_args[0][0]
+    assert submitted_cmd[-1] == "+mesh.start_round=0"
+
+
+def test_submit_worker_job_extra_override_composes_against_real_experiment_config(
+    tmp_path,
+):
+    """Same regression class as
+    test_submit_worker_job_overrides_compose_against_real_experiment_config
+    (production crash: '+' on an already-existing key), but for the new
+    extra_overrides path -- train.accum_steps has no '+' prefix in the
+    override string, matching conf/train/ssl.yaml already defining it."""
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    run_config = _run_config(extra_overrides=["train.accum_steps=128"])
+    registry_path = tmp_path / "jobs_registry.json"
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 559\n")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        _submit_worker_job(
+            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+        )
+    submitted_cmd = mock_run.call_args[0][0]
+    overrides = [
+        a for a in submitted_cmd if a.startswith("+") or a.startswith("train.")
+    ]
+
+    conf_dir = Path(__file__).resolve().parents[1] / "conf"
+    with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
+        cfg = compose(
+            config_name="config",
+            overrides=[f"experiment={run_config.experiment}", *overrides],
+        )
+    assert cfg.train.accum_steps == 128
 
 
 def test_replenish_pool_noop_when_deficit_zero(tmp_path):

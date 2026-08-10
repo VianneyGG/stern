@@ -233,6 +233,14 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         overlap=overlap,
     )
 
+    # Production never seeds torch before this function runs (the only
+    # manual_seed call in the whole training path is pretrain.py's Stage-2
+    # branch), so model init and RandomTubeMasking's torch.rand/torch.randperm
+    # calls were previously left to whatever RNG state the process happened
+    # to be in -- making cold-start runs statistically incomparable to each
+    # other. Reseed from cfg.train.seed here, right before the first RNG
+    # consumer, so two cold starts with the same cfg are reproducible.
+    torch.manual_seed(int(cfg.train.get("seed", 42)))
     model = VideoMAEForPreTraining(cfg.model).to(device)
     # No DDP on this path (single-GPU worker, see module docstring), so
     # compile happens directly on the raw model -- no wrap_ddp ordering to

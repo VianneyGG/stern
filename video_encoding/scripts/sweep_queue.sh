@@ -4,19 +4,27 @@
 # the in-flight run DONE, launch the next queued config (within one poll).
 # Run under nohup on login-node, one instance per tier.
 #
-# Usage: sweep_queue.sh <fish|birds>
+# Usage: sweep_queue.sh <fish|birds|cars>
 #
-#   queue  runs/state/sweep_queue_<tier>.txt -- "run_id rounds outer_lr
-#          outer_momentum" per line ('#' comments allowed), read ONCE at start
-#          and drained top-down.
-#   stop   touch runs/state/sweep_queue_<tier>.stop to exit cleanly at the
-#          next poll, leaving the in-flight run alone.
+#   queue     runs/state/sweep_queue_<tier>.txt -- "run_id rounds outer_lr
+#             outer_momentum [quorum_k] [weighting] [extra_overrides]" per
+#             line ('#' comments allowed), read ONCE at start and drained
+#             top-down. The last 3 fields are optional; extra_overrides (if
+#             present) is everything remaining on the line, space-separated
+#             raw Hydra override tokens (e.g. "train.accum_steps=128
+#             train.lr_mult=1.5").
+#   stop      touch runs/state/sweep_queue_<tier>.stop to exit cleanly at the
+#             next poll, leaving the in-flight run alone.
+#   deadline  SWEEP_DEADLINE_EPOCH=<unix ts> (optional, unset by default):
+#             once reached, exit before starting the next queued item
+#             instead of draining until the queue empties -- same tail-cut
+#             convention as a manual stop-file touch, timed automatically.
 set -euo pipefail
 
-TIER="${1:?usage: sweep_queue.sh <fish|birds>}"
+TIER="${1:?usage: sweep_queue.sh <fish|birds|cars>}"
 case "${TIER}" in
-  fish|birds) ;;
-  *) echo "ERROR: unknown tier '${TIER}' -- expected fish|birds" >&2; exit 1 ;;
+  fish|birds|cars) ;;
+  *) echo "ERROR: unknown tier '${TIER}' -- expected fish|birds|cars" >&2; exit 1 ;;
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,6 +36,8 @@ REGISTER_CMD="${SWEEP_REGISTER_CMD:-${REPO_ROOT}/video_encoding/scripts/register
 SINFO="${SWEEP_SINFO:-sinfo}"
 SQUEUE="${SWEEP_SQUEUE:-squeue}"
 STALL_S="${SWEEP_STALL_S:-1800}"
+AVAIL_RETRIES="${SWEEP_AVAIL_RETRIES:-6}"
+DEADLINE_EPOCH="${SWEEP_DEADLINE_EPOCH:-}"
 
 # launch_mesh_pool.sh writes runs/state/* through RELATIVE paths, so the
 # fallback path is only correct with cwd at the repo root -- which a nohup'd
@@ -165,28 +175,63 @@ PYEOF
 }
 
 launch_item() {
-  local run_id="$1" rounds="$2" outer_lr="$3" outer_momentum="$4" avail n_avail n_pool
+  local run_id="$1" rounds="$2" outer_lr="$3" outer_momentum="$4"
+  local quorum_k="$5" weighting="$6" extra_overrides="$7"
+  local avail n_avail n_pool attempt probe_failed
   local params="rounds=${rounds} outer_lr=${outer_lr} outer_momentum=${outer_momentum}"
-  if [[ -f "${READY_FILE}" && -f "${ACTIVE_FILE}" ]]; then
-    n_pool=$(active_nodes | wc -l)
-    if ! avail=$(available_nodes); then
-      log "full launch ${run_id} (${params}) -- sinfo/squeue error, availability unknown"
-    else
-      n_avail=$(awk 'NF' <<< "${avail}" | wc -l)
-      # Reseeding costs 30-60 min and a pool that just finished a run is
-      # already seeded; below 13/16 the lost shard coverage is worse than the
-      # reseed. Register only the available subset: an unavailable node never
-      # checks in and burns a full 900s round timeout before being excluded.
-      if [[ "${n_avail}" -ge "${QUORUM}" ]]; then
-        log "register-only ${run_id} (${params}) -- ${n_avail}/${n_pool} pool nodes available"
-        "${REGISTER_CMD}" "${run_id}" "$(paste -sd, <<< "${avail}")" \
-          "${rounds}" "${outer_lr}" "${outer_momentum}"
-        return 0
-      fi
-      log "full launch ${run_id} (${params}) -- only ${n_avail}/${n_pool} pool nodes available"
-    fi
-  else
+  local needs_overrides=0
+  [[ -n "${quorum_k}" || -n "${weighting}" || -n "${extra_overrides}" ]] && needs_overrides=1
+
+  if [[ ! -f "${READY_FILE}" || ! -f "${ACTIVE_FILE}" ]]; then
     log "full launch ${run_id} (${params}) -- no seeded pool recorded for ${TIER}"
+    if [[ "${needs_overrides}" -eq 1 ]]; then
+      log "ERROR ${run_id}: cannot full-launch -- launch_mesh_pool.sh has no way to carry quorum_k/weighting/extra_overrides through, and this run needs at least one of them"
+      return 1
+    fi
+    "${LAUNCH_CMD}" "${TIER}" "${run_id}" "${rounds}" "${outer_lr}" "${outer_momentum}"
+    return $?
+  fi
+
+  n_pool=$(active_nodes | wc -l)
+  n_avail=0
+  probe_failed=0
+  for attempt in $(seq 1 "${AVAIL_RETRIES}"); do
+    if ! avail=$(available_nodes); then
+      probe_failed=1
+      log "full launch ${run_id} (${params}) -- sinfo/squeue error, availability unknown"
+      break
+    fi
+    n_avail=$(awk 'NF' <<< "${avail}" | wc -l)
+    # Reseeding costs 30-60 min and a pool that just finished a run is
+    # already seeded; below 13/16 the lost shard coverage is worse than the
+    # reseed. Register only the available subset: an unavailable node never
+    # checks in and burns a full 900s round timeout before being excluded.
+    if [[ "${n_avail}" -ge "${QUORUM}" ]]; then
+      log "register-only ${run_id} (${params}) -- ${n_avail}/${n_pool} pool nodes available"
+      "${REGISTER_CMD}" "${run_id}" "$(paste -sd, <<< "${avail}")" \
+        "${rounds}" "${outer_lr}" "${outer_momentum}" \
+        "${quorum_k}" "${weighting}" "${extra_overrides}"
+      return 0
+    fi
+    # Below quorum. A dip is routine on cars (15/16 nodes report per round
+    # historically) -- only worth retrying (instead of falling straight
+    # through to full-launch) when this cell actually needs the overrides
+    # full-launch can't carry; a plain fish/birds cell keeps today's
+    # immediate-fallback behavior unchanged.
+    if [[ "${needs_overrides}" -eq 1 && "${attempt}" -lt "${AVAIL_RETRIES}" ]]; then
+      log "${run_id}: only ${n_avail}/${n_pool} available (need ${QUORUM}), retrying in ${POLL_S}s (attempt ${attempt}/${AVAIL_RETRIES})"
+      sleep "${POLL_S}"
+      continue
+    fi
+    break
+  done
+
+  if [[ "${probe_failed}" -eq 0 ]]; then
+    log "full launch ${run_id} (${params}) -- only ${n_avail}/${n_pool} pool nodes available"
+  fi
+  if [[ "${needs_overrides}" -eq 1 ]]; then
+    log "ERROR ${run_id}: cannot full-launch -- launch_mesh_pool.sh has no way to carry quorum_k/weighting/extra_overrides through, and this run needs at least one of them"
+    return 1
   fi
   "${LAUNCH_CMD}" "${TIER}" "${run_id}" "${rounds}" "${outer_lr}" "${outer_momentum}"
 }
@@ -237,12 +282,19 @@ mapfile -t ITEMS < <(awk '{sub(/#.*/, "")} NF' "${QUEUE_FILE}")
 log "start -- ${#ITEMS[@]} queued item(s) from ${QUEUE_FILE}"
 
 for item in "${ITEMS[@]}"; do
-  read -r run_id rounds outer_lr outer_momentum <<< "${item}"
+  read -r run_id rounds outer_lr outer_momentum quorum_k weighting extra_overrides <<< "${item}"
   if [[ -e "${STOP_FILE}" ]]; then
     log "stop file present -- exiting before ${run_id}"
     exit 0
   fi
-  launch_item "${run_id}" "${rounds}" "${outer_lr}" "${outer_momentum}"
+  if [[ -n "${DEADLINE_EPOCH}" && "$(date +%s)" -ge "${DEADLINE_EPOCH}" ]]; then
+    log "deadline ${DEADLINE_EPOCH} reached -- exiting before ${run_id}"
+    exit 0
+  fi
+  if ! launch_item "${run_id}" "${rounds}" "${outer_lr}" "${outer_momentum}" \
+      "${quorum_k}" "${weighting}" "${extra_overrides}"; then
+    exit 1
+  fi
   if ! wait_for_done "${run_id}"; then
     log "stop file present -- exiting, ${run_id} left running"
     exit 0

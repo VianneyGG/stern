@@ -45,7 +45,7 @@ class DropPath(nn.Module):
         keep = 1.0 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         mask = torch.rand(shape, dtype=x.dtype, device=x.device)
-        mask = torch.floor(mask + keep)
+        mask = torch.floor(mask + keep) # binary mask: 1 with prob `keep`, 0 with prob `drop_prob`
         return x / keep * mask
 
 
@@ -127,7 +127,7 @@ class VideoMAEEncoder(nn.Module):
         self.token_grid = (n_tubelets, grid, grid)
         num_tokens = n_tubelets * grid * grid
         self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, self.embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02) # 
 
         dropout = float(model_cfg.get("dropout", 0.0))
         drop_path_rate = float(model_cfg.get("drop_path_rate", 0.0))

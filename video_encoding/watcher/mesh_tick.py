@@ -22,7 +22,7 @@ import os
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -109,6 +109,15 @@ class MeshRunConfig:
     # ROUND_TIMEOUT_S's role for quorum-configured runs).
     quorum_k: int | None = None
     grace_s: float = ROUND_TIMEOUT_S
+    # Raw Hydra override strings (no '+'/'mesh.' prefixing assumed --
+    # e.g. "train.accum_steps=128") appended verbatim to every
+    # _submit_worker_job sbatch call for this run, on both initial
+    # assignment and later replenishment. Empty by default since every
+    # run registered before this field existed has no value for it in
+    # its on-disk JSON. list (not tuple): matches what json.loads produces,
+    # so a value round-tripped through mesh_run_configs.json and one
+    # constructed directly in Python have the same type.
+    extra_overrides: list[str] = field(default_factory=list)
 
 
 def load_run_configs(path: Path) -> list[MeshRunConfig]:
@@ -263,6 +272,7 @@ def _submit_worker_job(
         f"mesh.rounds={run_config.rounds}",
         f"+mesh.start_round={start_round}",
     ]
+    cmd.extend(run_config.extra_overrides)
     try:
         result = subprocess.run(
             cmd, cwd=repo_root, capture_output=True, text=True, timeout=300

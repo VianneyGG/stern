@@ -97,3 +97,67 @@ def test_re_registering_the_same_run_id_replaces_not_appends(script, tmp_path):
     assert len(cfgs) == 1
     assert cfgs[0]["quorum_k"] == 8
     assert cfgs[0]["nodes"] == ["a", "b", "c", "d"]
+
+
+def test_registers_extra_overrides_when_provided(script, tmp_path):
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "RUN1",
+            "a,b,c",
+            "10",
+            "0.7",
+            "0.9",
+            "8",
+            "token",
+            "train.accum_steps=128 train.lr_mult=1.5",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    cfgs = json.loads(
+        (tmp_path / "runs" / "state" / "mesh_run_configs.json").read_text()
+    )
+    assert cfgs[0]["extra_overrides"] == [
+        "train.accum_steps=128",
+        "train.lr_mult=1.5",
+    ]
+
+
+def test_omits_extra_overrides_key_when_not_provided(script, tmp_path):
+    result = subprocess.run(
+        ["bash", str(script), "RUN1", "a,b,c", "10", "0.7", "0.9", "8", "token"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    cfgs = json.loads(
+        (tmp_path / "runs" / "state" / "mesh_run_configs.json").read_text()
+    )
+    assert "extra_overrides" not in cfgs[0]
+
+
+def test_rejects_a_malformed_extra_override(script, tmp_path):
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "RUN1",
+            "a,b,c",
+            "10",
+            "0.7",
+            "0.9",
+            "8",
+            "token",
+            "not_a_key_value_pair",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "not_a_key_value_pair" in result.stderr
+    assert not (tmp_path / "runs" / "state" / "mesh_run_configs.json").exists()
