@@ -25,82 +25,13 @@ import torch
 from omegaconf import DictConfig
 from torch import nn
 
+from video_encoding.models.ViT.block import BlockConfig, ViTBlock
+from video_encoding.models.ViT.patch_embed import TubeletEmbed
+from video_encoding.models.ViT.registers import RegisterTokens
+
 # Standard ImageNet normalisation (frames arrive as HxWx3 uint8).
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
-class DropPath(nn.Module):
-    """Per-sample stochastic depth: drops the whole residual branch for a
-    random subset of samples in the batch, scaling survivors by 1/keep so
-    the expected output is unchanged (standard inverted-dropout scaling)."""
-
-    def __init__(self, drop_prob: float = 0.0) -> None:
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.drop_prob == 0.0 or not self.training:
-            return x
-        keep = 1.0 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        mask = torch.rand(shape, dtype=x.dtype, device=x.device)
-        mask = torch.floor(mask + keep) # binary mask: 1 with prob `keep`, 0 with prob `drop_prob`
-        return x / keep * mask
-
-
-class TubeletEmbed(nn.Module):
-    """`(B, C, T, H, W)` -> `(B, N, embed_dim)` via a Conv3d over tubelets."""
-
-    def __init__(
-        self, *, in_channels: int, embed_dim: int, tubelet_size: int, patch_size: int
-    ):
-        super().__init__()
-        self.proj = nn.Conv3d(
-            in_channels,
-            embed_dim,
-            kernel_size=(tubelet_size, patch_size, patch_size),
-            stride=(tubelet_size, patch_size, patch_size),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)  # (B, D, T', H', W')
-        return x.flatten(2).transpose(1, 2)  # (B, N, D), N = T'*H'*W'
-
-
-class Block(nn.Module):
-    """Pre-norm ViT block: `x + DropPath(MHSA(norm(x)))` then `x + DropPath(MLP(norm(x)))`."""
-
-    def __init__(
-        self,
-        *,
-        embed_dim: int,
-        num_heads: int,
-        mlp_ratio: float,
-        dropout: float,
-        drop_path_rate: float = 0.0,
-    ):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim, num_heads, dropout=dropout, batch_first=True
-        )
-        self.norm2 = nn.LayerNorm(embed_dim)
-        hidden = int(embed_dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, embed_dim),
-            nn.Dropout(dropout),
-        )
-        self.drop_path = DropPath(drop_path_rate)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm1(x)
-        x = x + self.drop_path(self.attn(h, h, h, need_weights=False)[0])
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
 
 
 class VideoMAEEncoder(nn.Module):
@@ -127,7 +58,7 @@ class VideoMAEEncoder(nn.Module):
         self.token_grid = (n_tubelets, grid, grid)
         num_tokens = n_tubelets * grid * grid
         self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, self.embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02) # 
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)  #
 
         dropout = float(model_cfg.get("dropout", 0.0))
         drop_path_rate = float(model_cfg.get("drop_path_rate", 0.0))
@@ -137,13 +68,30 @@ class VideoMAEEncoder(nn.Module):
             if depth > 1
             else [0.0] * depth
         )
+
+        norm_type = str(model_cfg.get("norm_type", "layernorm"))
+        mlp_type = str(model_cfg.get("mlp_type", "gelu"))
+        qk_norm = bool(model_cfg.get("qk_norm", False))
+        layer_scale_init = model_cfg.get("layer_scale_init", None)
+        layer_scale_init = (
+            float(layer_scale_init) if layer_scale_init is not None else None
+        )
+        num_registers = int(model_cfg.get("num_registers", 0))
+        self.registers = RegisterTokens(self.embed_dim, num_registers)
+
         self.blocks = nn.ModuleList(
-            Block(
-                embed_dim=self.embed_dim,
-                num_heads=int(model_cfg.num_heads),
-                mlp_ratio=float(model_cfg.mlp_ratio),
-                dropout=dropout,
-                drop_path_rate=dpr[i],
+            ViTBlock(
+                BlockConfig(
+                    embed_dim=self.embed_dim,
+                    num_heads=int(model_cfg.num_heads),
+                    mlp_ratio=float(model_cfg.mlp_ratio),
+                    dropout=dropout,
+                    drop_path_rate=dpr[i],
+                    norm_type=norm_type,
+                    mlp_type=mlp_type,
+                    qk_norm=qk_norm,
+                    layer_scale_init=layer_scale_init,
+                )
             )
             for i in range(depth)
         )
@@ -170,8 +118,10 @@ class VideoMAEEncoder(nn.Module):
                 "tubelet_size/patch_size"
             )
         x = x + self.pos_embed
+        x = self.registers.prepend(x)
         for block in self.blocks:
             x = block(x)
+        x = self.registers.strip(x)
         return self.norm(x).mean(dim=1)
 
     def forward_tokens(
@@ -188,8 +138,10 @@ class VideoMAEEncoder(nn.Module):
         """
         # Gather visible tokens from the batch
         x = x[:, keep_indices, :]  # (B, num_kept, D)
+        x = self.registers.prepend(x)
         for block in self.blocks:
             x = block(x)
+        x = self.registers.strip(x)
         return self.norm(x)
 
 

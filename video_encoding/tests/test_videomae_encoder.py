@@ -69,7 +69,7 @@ def test_regressor_on_real_encoder_returns_bounded_va():
 
 
 def test_drop_path_zeroes_and_scales_samples():
-    from video_encoding.models.videomaev2.encoder import DropPath
+    from video_encoding.models.ViT.droppath import DropPath
 
     torch.manual_seed(0)
     dp = DropPath(drop_prob=0.5)
@@ -84,7 +84,7 @@ def test_drop_path_zeroes_and_scales_samples():
 
 
 def test_drop_path_is_identity_at_zero_rate_and_in_eval():
-    from video_encoding.models.videomaev2.encoder import DropPath
+    from video_encoding.models.ViT.droppath import DropPath
 
     x = torch.randn(10, 4)
 
@@ -103,3 +103,42 @@ def test_encoder_scales_drop_path_linearly_across_blocks():
     assert rates[0] == pytest.approx(0.0)
     assert rates[-1] == pytest.approx(0.2)
     assert rates == sorted(rates)
+
+
+def test_encoder_builds_from_config_missing_all_new_axis_fields():
+    """Historical stored configs (pre-dating this refactor) have none of the
+    new keys -- the encoder must still build with today's exact defaults."""
+    cfg = _tiny_cfg()  # no norm_type/mlp_type/qk_norm/layer_scale_init/num_registers
+    encoder = VideoMAEEncoder(cfg)
+    assert encoder.registers.num_registers == 0
+    out = encoder(torch.randn(2, 3, 4, 16, 16))
+    assert out.shape == (2, 32)
+
+
+def test_encoder_respects_new_axis_overrides():
+    cfg = _tiny_cfg(
+        norm_type="rmsnorm",
+        mlp_type="swiglu",
+        qk_norm=True,
+        layer_scale_init=1e-5,
+    )
+    encoder = VideoMAEEncoder(cfg)
+    out = encoder(torch.randn(2, 3, 4, 16, 16))
+    assert out.shape == (2, 32)
+
+
+def test_encoder_with_registers_pooled_output_shape_unaffected():
+    cfg = _tiny_cfg(num_registers=2)
+    encoder = VideoMAEEncoder(cfg)
+    assert encoder.registers.num_registers == 2
+    out = encoder(torch.randn(2, 3, 4, 16, 16))
+    assert out.shape == (2, 32)  # registers stripped before pooling
+
+
+def test_forward_tokens_excludes_registers_from_returned_tokens():
+    cfg = _tiny_cfg(num_registers=2)
+    encoder = VideoMAEEncoder(cfg)
+    x = encoder.patch_embed(torch.randn(2, 3, 4, 16, 16)) + encoder.pos_embed
+    keep_indices = torch.arange(4)  # keep 4 of the 8 patch tokens
+    out = encoder.forward_tokens(x, keep_indices)
+    assert out.shape == (2, 4, 32)  # 4 kept patch tokens, no registers leaked through

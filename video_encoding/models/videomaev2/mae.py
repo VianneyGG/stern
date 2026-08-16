@@ -15,8 +15,8 @@ import torch
 from omegaconf import DictConfig
 from torch import nn
 
+from video_encoding.models.ViT.block import BlockConfig, ViTBlock
 from video_encoding.models.videomaev2.encoder import (
-    Block,
     VideoMAEEncoder,
     _IMAGENET_MEAN,
     _IMAGENET_STD,
@@ -56,11 +56,13 @@ class VideoMAEForPreTraining(nn.Module):
 
         decoder_dropout = float(model_cfg.get("dropout", 0.0))
         self.decoder_blocks = nn.ModuleList(
-            Block(
-                embed_dim=self.decoder_embed_dim,
-                num_heads=int(model_cfg.decoder_num_heads),
-                mlp_ratio=float(model_cfg.get("mlp_ratio", 4.0)),
-                dropout=decoder_dropout,
+            ViTBlock(
+                BlockConfig(
+                    embed_dim=self.decoder_embed_dim,
+                    num_heads=int(model_cfg.decoder_num_heads),
+                    mlp_ratio=float(model_cfg.get("mlp_ratio", 4.0)),
+                    dropout=decoder_dropout,
+                )
             )
             for _ in range(int(model_cfg.decoder_depth))
         )
