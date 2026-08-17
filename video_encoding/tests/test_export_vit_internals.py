@@ -202,7 +202,7 @@ def test_load_encoder_missing_checkpoint_raises_file_not_found(tmp_path):
         "convention. ViTBlock's attn is now SelfAttention (single-tensor input, "
         "no average_attn_weights kwarg) -- known, deferred to the follow-up "
         "change that updates this diagnostics script's block-internals access "
-        "(see docs/plans/2026-08-16-videomae-vit-block-rewrite.md)."
+        "(see docs/superpowers/plans/2026-08-16-videomae-vit-block-rewrite.md)."
     ),
     strict=True,
 )

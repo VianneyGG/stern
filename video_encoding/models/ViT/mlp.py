@@ -22,14 +22,18 @@ class GELUMlp(nn.Module):
 
 
 class SwiGLUMlp(nn.Module):
-    """SwiGLU feedforward (Shazeer 2020): gated SiLU activation. Hidden dim
-    matches GELUMlp's embed_dim*mlp_ratio (not the 2/3-scaled convention some
-    SwiGLU implementations use), so ablations compare at equal mlp_ratio
-    rather than equal parameter count."""
+    """SwiGLU feedforward (Shazeer 2020): gated SiLU activation.
+
+    Hidden dim carries the standard 2/3 correction: SwiGLU spends three
+    projections (gate, up, down) where GELUMlp spends two, so an uncorrected
+    embed_dim*mlp_ratio would hand this variant 1.5x the parameters and turn
+    `mlp_type` into a capacity confound instead of an activation ablation.
+    At 2/3 the two variants are weight-matched at equal mlp_ratio.
+    """
 
     def __init__(self, embed_dim: int, mlp_ratio: float, dropout: float = 0.0):
         super().__init__()
-        hidden = int(embed_dim * mlp_ratio)
+        hidden = int(embed_dim * mlp_ratio * 2 / 3)
         self.gate = nn.Linear(embed_dim, hidden)
         self.up = nn.Linear(embed_dim, hidden)
         self.down = nn.Linear(hidden, embed_dim)

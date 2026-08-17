@@ -25,11 +25,14 @@ from pathlib import Path
 from typing import Any, Mapping, MutableMapping
 
 import io
+import logging
 import os
 import time
 import zipfile
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def save(path: Path | str, payload: Mapping[str, Any]) -> None:
@@ -140,7 +143,21 @@ def load(
     raw_model = unwrap(model)
     state_dict = ckpt["model_state_dict"]
     state_dict = _strip_orig_mod_prefix(state_dict)
-    raw_model.load_state_dict(state_dict, strict=False)
+    load_result = raw_model.load_state_dict(state_dict, strict=False)
+    if load_result.missing_keys or load_result.unexpected_keys:
+        # strict=False intentionally tolerates key differences (e.g. LoRA vs.
+        # non-LoRA runs sharing most keys) -- but a silent tolerance is
+        # indistinguishable from a real architecture-drift bug (e.g. a block
+        # internals rewrite renaming attention/MLP parameters) without this
+        # log line. Mirrors the equivalent guard in
+        # training/diloco/mesh_round.py's master-checkpoint load.
+        logger.warning(
+            "checkpoint.load: state_dict key mismatch loading %s -- "
+            "missing=%s unexpected=%s",
+            path,
+            load_result.missing_keys,
+            load_result.unexpected_keys,
+        )
 
     start_epoch = int(ckpt.get("epoch", -1)) + 1
     best_metric = ckpt.get("best_val_metric", ckpt.get("best_val_accuracy"))

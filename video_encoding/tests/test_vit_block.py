@@ -104,3 +104,116 @@ def test_block_runs_with_layer_scale():
     assert isinstance(block.layer_scale1, LayerScale)
     out = block(torch.randn(2, 5, 16))
     assert out.shape == (2, 5, 16)
+
+
+@pytest.mark.parametrize("norm_type", ["rmsnorm", "centerednorm"])
+def test_non_default_norm_type_changes_block_output(norm_type):
+    """The shape-only smoke test above would still pass if norm_type were
+    silently ignored (e.g. always falling through to LayerNorm) -- this
+    proves the axis actually changes what the block computes. Norm-layer
+    params (weight/bias) are deterministic at init (no RNG draws) for every
+    variant here, so seeding before each construction gives attn/mlp
+    identical weights across both blocks -- any output difference is
+    attributable to the norm layer alone."""
+    embed_dim, num_heads, mlp_ratio = 16, 4, 2.0
+    x = torch.randn(2, 5, embed_dim)
+
+    torch.manual_seed(0)
+    default_block = ViTBlock(
+        BlockConfig(embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
+    )
+    torch.manual_seed(0)
+    variant_block = ViTBlock(
+        BlockConfig(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            norm_type=norm_type,
+        )
+    )
+
+    default_block.eval()
+    variant_block.eval()
+    with torch.no_grad():
+        default_out = default_block(x)
+        variant_out = variant_block(x)
+
+    assert not torch.allclose(default_out, variant_out)
+
+
+def test_swiglu_mlp_type_changes_block_output():
+    embed_dim, num_heads, mlp_ratio = 16, 4, 2.0
+    x = torch.randn(2, 5, embed_dim)
+
+    torch.manual_seed(0)
+    gelu_block = ViTBlock(
+        BlockConfig(embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
+    )
+    torch.manual_seed(0)
+    swiglu_block = ViTBlock(
+        BlockConfig(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            mlp_type="swiglu",
+        )
+    )
+
+    gelu_block.eval()
+    swiglu_block.eval()
+    with torch.no_grad():
+        gelu_out = gelu_block(x)
+        swiglu_out = swiglu_block(x)
+
+    assert not torch.allclose(gelu_out, swiglu_out)
+
+
+def test_qk_norm_changes_block_output():
+    embed_dim, num_heads, mlp_ratio = 16, 4, 2.0
+    x = torch.randn(2, 5, embed_dim)
+
+    torch.manual_seed(0)
+    plain_block = ViTBlock(
+        BlockConfig(embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
+    )
+    torch.manual_seed(0)
+    qk_norm_block = ViTBlock(
+        BlockConfig(
+            embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qk_norm=True
+        )
+    )
+
+    plain_block.eval()
+    qk_norm_block.eval()
+    with torch.no_grad():
+        plain_out = plain_block(x)
+        qk_norm_out = qk_norm_block(x)
+
+    assert not torch.allclose(plain_out, qk_norm_out)
+
+
+def test_layer_scale_changes_block_output():
+    embed_dim, num_heads, mlp_ratio = 16, 4, 2.0
+    x = torch.randn(2, 5, embed_dim)
+
+    torch.manual_seed(0)
+    off_block = ViTBlock(
+        BlockConfig(embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
+    )
+    torch.manual_seed(0)
+    scaled_block = ViTBlock(
+        BlockConfig(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            layer_scale_init=1e-5,
+        )
+    )
+
+    off_block.eval()
+    scaled_block.eval()
+    with torch.no_grad():
+        off_out = off_block(x)
+        scaled_out = scaled_block(x)
+
+    assert not torch.allclose(off_out, scaled_out)

@@ -96,6 +96,16 @@ class VideoMAEEncoder(nn.Module):
             for i in range(depth)
         )
         self.norm = nn.LayerNorm(self.embed_dim)
+        # Pre-rewrite, attention's in_proj/out_proj weights came from
+        # nn.MultiheadAttention's own default init (xavier_uniform_ on the raw
+        # in_proj_weight Parameter, which self.apply() never reached since it
+        # wasn't wrapped in an nn.Linear). SelfAttention's qkv/proj ARE plain
+        # nn.Linear, so they now get trunc_normal_(std=0.02) below like every
+        # other Linear -- a real, one-time shift in the fresh-init weight
+        # distribution. Harmless for checkpoint-resumed runs (checkpoint.py
+        # warns on any key mismatch); a fresh cold-start run's early loss
+        # curve will differ from a pre-rewrite baseline for this reason, not
+        # because of the block-internals ablation axes.
         self.apply(self._init_weights)
 
     @staticmethod

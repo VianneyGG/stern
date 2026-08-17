@@ -9,8 +9,10 @@ from omegaconf import OmegaConf
 
 from video_encoding.models.videomaev2.encoder import VideoMAEEncoder
 from video_encoding.training.checkpoint import (
+    load,
     load_checkpoint_file,
     load_encoder_state,
+    save,
     try_save,
 )
 
@@ -116,8 +118,10 @@ def test_try_save_writes_payload_and_reports_success(tmp_path):
 
     assert try_save(path, payload, backoff_s=0.0) is True
     assert path.exists()
-    assert torch.equal(torch.load(path, weights_only=False)["model_state_dict"]["w"],
-                       payload["model_state_dict"]["w"])
+    assert torch.equal(
+        torch.load(path, weights_only=False)["model_state_dict"]["w"],
+        payload["model_state_dict"]["w"],
+    )
 
 
 def test_try_save_recovers_when_a_write_fails_once(tmp_path, monkeypatch):
@@ -158,3 +162,69 @@ def test_try_save_returns_false_instead_of_raising_when_all_attempts_fail(
     assert try_save(path, {"epoch": 1}, attempts=3, backoff_s=0.0) is False
     assert len(calls) == 3
     assert not path.exists()
+
+
+def test_load_warns_on_state_dict_key_mismatch(tmp_path, caplog):
+    """strict=False on the model load must not be silent: a key mismatch
+    (e.g. an architecture rewrite renaming parameters) should log a warning
+    identifying exactly which keys were missing/unexpected, mirroring the
+    equivalent guard in training/diloco/mesh_round.py's master-checkpoint
+    load -- without it, a resumed run silently reinitializes the mismatched
+    submodules with no signal that anything went wrong."""
+    donor = VideoMAEEncoder(OmegaConf.merge(_tiny_cfg(in_channels=3), {"depth": 3}))
+    target = VideoMAEEncoder(
+        _tiny_cfg(in_channels=3)
+    )  # depth=2, per _tiny_cfg's default
+
+    path = tmp_path / "ckpt.pt"
+    save(
+        path,
+        {
+            "model_name": "videomae_encoder",
+            "model_state_dict": donor.state_dict(),
+            "epoch": 0,
+        },
+    )
+
+    with caplog.at_level("WARNING"):
+        load(
+            path,
+            model=target,
+            optimizer=None,
+            scheduler=None,
+            device="cpu",
+            expected_model_name="videomae_encoder",
+            expected_optimizer_name=None,
+        )
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "blocks.2." in message  # depth-3 donor's extra block is unexpected
+
+
+def test_load_does_not_warn_when_state_dicts_match(tmp_path, caplog):
+    donor = VideoMAEEncoder(_tiny_cfg(in_channels=3))
+    target = VideoMAEEncoder(_tiny_cfg(in_channels=3))
+
+    path = tmp_path / "ckpt.pt"
+    save(
+        path,
+        {
+            "model_name": "videomae_encoder",
+            "model_state_dict": donor.state_dict(),
+            "epoch": 0,
+        },
+    )
+
+    with caplog.at_level("WARNING"):
+        load(
+            path,
+            model=target,
+            optimizer=None,
+            scheduler=None,
+            device="cpu",
+            expected_model_name="videomae_encoder",
+            expected_optimizer_name=None,
+        )
+
+    assert len(caplog.records) == 0

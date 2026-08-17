@@ -79,6 +79,7 @@ def test_drop_path_zeroes_and_scales_samples():
 
     row_sums = out.sum(dim=1)
     assert torch.all((row_sums == 0.0) | (row_sums == 8.0))  # 0 or scaled by 1/keep=2.0
+    assert row_sums.max().item() == 8.0  # confirms scaling happened, not all-zeroed
     zeroed_frac = (row_sums == 0.0).float().mean().item()
     assert 0.3 < zeroed_frac < 0.7  # ~50% with 200 samples, seeded
 
@@ -91,10 +92,12 @@ def test_drop_path_is_identity_at_zero_rate_and_in_eval():
     dp = DropPath(drop_prob=0.5)
     dp.eval()
     assert torch.equal(dp(x), x)  # eval mode -> always identity
+    assert dp(x).sub(x).abs().max().item() == 0.0
 
     dp2 = DropPath(drop_prob=0.0)
     dp2.train()
     assert torch.equal(dp2(x), x)  # zero rate -> always identity
+    assert dp2(x).sub(x).abs().max().item() == 0.0
 
 
 def test_encoder_scales_drop_path_linearly_across_blocks():

@@ -25,15 +25,10 @@ class BlockConfig:
     layer_scale_init: float | None = None
 
 
-BLOCK_DEFAULTS = dict(
-    norm_type="layernorm", mlp_type="gelu", qk_norm=False, layer_scale_init=None
-)
-
-
 class ViTBlock(nn.Module):
     """Pre-norm ViT block: x + LayerScale(DropPath(Attn(norm(x)))) then
     x + LayerScale(DropPath(MLP(norm(x)))). Every sub-component is swappable
-    via BlockConfig; BLOCK_DEFAULTS reproduces the original
+    via BlockConfig; BlockConfig's own field defaults reproduce the original
     nn.MultiheadAttention + LayerNorm + GELU block exactly (see
     test_vit_block.py's parity test)."""
 
