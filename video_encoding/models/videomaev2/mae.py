@@ -81,11 +81,20 @@ class VideoMAEForPreTraining(nn.Module):
         self.encoder_to_decoder = nn.Linear(self.embed_dim, self.decoder_embed_dim)
 
         # Prediction head: reconstruct patch pixels
-        # Output shape: (B, num_masked, 3 * patch_size^2) for MAE-style reconstruction
+        # Output shape: (B, num_masked, out_frames * 3 * patch_size^2), where
+        # out_frames tracks target_mode (1 under time_avg, tubelet_size under per_frame).
         self.patch_size = int(model_cfg.patch_size)
         self.tubelet_size = int(model_cfg.tubelet_size)
+        self.target_mode = str(model_cfg.get("target_mode", "time_avg"))
+        if self.target_mode not in ("time_avg", "per_frame"):
+            raise ValueError(
+                f"unknown target_mode {self.target_mode!r}: expected time_avg|per_frame"
+            )
+        # per_frame keeps one patch per tubelet *frame*, so intra-tubelet motion
+        # survives into the target instead of being averaged away.
+        out_frames = self.tubelet_size if self.target_mode == "per_frame" else 1
         self.predict_head = nn.Linear(
-            self.decoder_embed_dim, 3 * self.patch_size * self.patch_size
+            self.decoder_embed_dim, out_frames * 3 * self.patch_size * self.patch_size
         )
 
     def forward(
@@ -158,16 +167,16 @@ class VideoMAEForPreTraining(nn.Module):
         return pred, target
 
     def _patchify_targets(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Reconstruction target: per-tubelet, time-averaged, per-patch z-scored
-        pixel patches (official VideoMAE recipe -- z-scoring makes the loss
-        invariant to a patch's absolute brightness/contrast, matching the
-        signal the shallow decoder can actually recover).
+        """Reconstruction target: per-tubelet, per-patch z-scored pixel patches
+        (official VideoMAE recipe -- z-scoring makes the loss invariant to a
+        patch's absolute brightness/contrast, matching the signal the shallow
+        decoder can actually recover).
 
-        predict_head outputs one patch of `3*patch_size^2` values per token
-        (not `tubelet_size` frames worth), so the target must match: average
-        pixel values over each tubelet's temporal frames, then patchify
-        spatially, then z-score each patch independently. Token order matches
-        TubeletEmbed's (T', H', W') layout.
+        predict_head's width tracks target_mode: under time_avg it outputs one
+        patch of `3*patch_size^2` values per token (tubelet frames averaged
+        together); under per_frame it outputs `tubelet_size` such patches, so
+        the target keeps one patch per tubelet frame instead. Token order
+        matches TubeletEmbed's (T', H', W') layout.
         """
         B, C, T, H, W = pixel_values.shape
         mean = torch.tensor(
@@ -182,12 +191,16 @@ class VideoMAEForPreTraining(nn.Module):
         h_prime = H // self.patch_size
         w_prime = W // self.patch_size
 
-        x = pixel_values.view(B, C, t_prime, self.tubelet_size, H, W).mean(dim=3)
-        x = x.view(B, C, t_prime, h_prime, self.patch_size, w_prime, self.patch_size)
-        x = x.permute(0, 2, 3, 5, 1, 4, 6)  # (B, T', H', W', C, patch, patch)
-        x = x.reshape(
-            B, t_prime * h_prime * w_prime, C * self.patch_size * self.patch_size
-        )
+        ts, ps_ = self.tubelet_size, self.patch_size
+        x = pixel_values.view(B, C, t_prime, ts, H, W)
+        if self.target_mode == "time_avg":
+            x = x.mean(dim=3, keepdim=True)
+        n_frames = x.shape[3]  # 1 under time_avg, tubelet_size under per_frame
+        x = x.view(B, C, t_prime, n_frames, h_prime, ps_, w_prime, ps_)
+        # -> (B, T', H', W', frame, C, ps, ps): frame-major within a token, so
+        # collapsing to the time-averaged layout is .view(B, N, f, -1).mean(2)
+        x = x.permute(0, 2, 4, 6, 3, 1, 5, 7)
+        x = x.reshape(B, t_prime * h_prime * w_prime, n_frames * C * ps_ * ps_)
 
         mu = x.mean(dim=-1, keepdim=True)
         sigma = x.std(dim=-1, keepdim=True)

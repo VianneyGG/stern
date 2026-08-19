@@ -19,3 +19,8 @@ ddp:
   nccl_env: {}
 pretrain_encoder_path: null   # path to Stage 1 SSL best.pt; null = train VA head + encoder from scratch
 freeze_backbone: false        # true = frozen-encoder probe (only the VA head trains); false = end-to-end fine-tune
+temporal_condition: normal    # normal | shuffled | frozen. Track P's control: shuffled
+                              # destroys frame order while keeping every frame, so a CCC
+                              # drop isolates temporal order from the domain gap.
+probe_pred_dir: runs/results/probe_veatic   # where dump_probe_predictions writes its .npz
+probe_checkpoint_label: latest              # names the .npz; paired with temporal_condition

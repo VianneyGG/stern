@@ -174,3 +174,56 @@ def test_wds_shards_root_takes_priority_over_frames_root(tmp_path, monkeypatch):
 
     ds = SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.0)
     assert len(ds) == 1
+
+
+def test_frame_stride_widens_the_cached_window_span(tmp_path, monkeypatch):
+    """H3: with stride 1 a tubelet spans two adjacent frames. The dataset must
+    actually sample further apart when asked, in the frame-cache path."""
+    frames_root = tmp_path / "frames"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_frames(frames_root / "id00012/vid1/001", n=24)
+
+    monkeypatch.setenv("VOXMINI_FRAMES_ROOT", str(frames_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(
+        dataset, num_frames=8, image_size=224, overlap=0.0, frame_stride=3
+    )
+    # span = (8-1)*3 + 1 = 22, so 24 frames hold exactly one window
+    assert len(ds) == 1
+    assert ds._items[0][1] == [0, 3, 6, 9, 12, 15, 18, 21]
+
+
+def test_frame_stride_widens_the_shard_window_span(tmp_path, monkeypatch):
+    """The same, in the WebDataset shard path -- the one production actually
+    uses. The two branches build indices separately and can drift apart."""
+    shards_root = tmp_path / "shards"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_shard(shards_root, "id00012/vid1/001", n_frames=24)
+
+    monkeypatch.delenv("VOXMINI_FRAMES_ROOT", raising=False)
+    monkeypatch.setenv("VOXMINI_SHARDS_ROOT", str(shards_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(
+        dataset, num_frames=8, image_size=224, overlap=0.0, frame_stride=3
+    )
+    assert len(ds) == 1
+    assert ds._items[0][1] == [0, 3, 6, 9, 12, 15, 18, 21]
+
+
+def test_default_stride_leaves_existing_windows_untouched(tmp_path, monkeypatch):
+    """The back-compat guard: every run predating frame_stride must be
+    reproducible, so the default must change no index."""
+    frames_root = tmp_path / "frames"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_frames(frames_root / "id00012/vid1/001", n=24)
+    monkeypatch.setenv("VOXMINI_FRAMES_ROOT", str(frames_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    default = SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.5)
+    explicit = SSLWindowDataset(
+        dataset, num_frames=16, image_size=224, overlap=0.5, frame_stride=1
+    )
+    assert [i[1] for i in default._items] == [i[1] for i in explicit._items]
+    assert [i[1] for i in default._items] == [list(range(0, 16)), list(range(8, 24))]

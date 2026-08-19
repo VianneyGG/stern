@@ -1,7 +1,9 @@
 import torch
+from omegaconf import DictConfig
 
 from eval.ccc import ccc_loss
 from video_encoding.models.videomaev2.regressor import LinearVAHead
+from video_encoding.training.train import _temporal_transform
 
 
 def test_linear_va_head_output_shape():
@@ -49,3 +51,19 @@ def test_ccc_loss_decreases_with_gradient_descent():
     final_loss = ccc_loss(head(x), target).item()
 
     assert final_loss < initial_loss
+
+
+class TestTemporalTransformFromConfig:
+    def test_defaults_to_no_transform(self):
+        """Absent config means today's behaviour, so no existing probe changes."""
+        assert _temporal_transform(DictConfig({"train": {"seed": 0}})) is None
+
+    def test_normal_is_no_transform(self):
+        cfg = DictConfig({"train": {"seed": 0, "temporal_condition": "normal"}})
+        assert _temporal_transform(cfg) is None
+
+    def test_shuffled_returns_a_window_transform(self):
+        cfg = DictConfig({"train": {"seed": 3, "temporal_condition": "shuffled"}})
+        fn = _temporal_transform(cfg)
+        window = torch.randn(3, 16, 8, 8)
+        assert fn(window).shape == window.shape

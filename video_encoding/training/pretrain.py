@@ -27,7 +27,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 from video_encoding.data.loaders import build_ssl_loader
 from video_encoding.data.ssl_windows import SSLWindowDataset
 from video_encoding.models.videomaev2.masking import (
+    MixedTubeFrameMasking,
     MotionGuidedTubeMasking,
+    RandomFrameMasking,
     RandomTubeMasking,
 )
 from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
@@ -40,6 +42,25 @@ from video_encoding.training.ddp.ddp import (
 )
 from video_encoding.training.loop_utils import set_sampler_epoch
 from video_encoding.training.tb_logger import make_writer, write_result_json
+
+
+def _build_masker(cfg: DictConfig):
+    """Select the masking strategy from config.
+
+    `motion_mask` predates `mask_type` and stays authoritative, so no existing
+    config changes meaning when `mask_type` is absent.
+    """
+    ratio = float(cfg.model.mask_ratio)
+    if bool(cfg.model.get("motion_mask", False)):
+        return MotionGuidedTubeMasking(mask_ratio=ratio)
+    mask_type = str(cfg.model.get("mask_type", "tube"))
+    if mask_type == "tube":
+        return RandomTubeMasking(mask_ratio=ratio)
+    if mask_type == "frame":
+        return RandomFrameMasking(mask_ratio=ratio)
+    if mask_type == "mixed":
+        return MixedTubeFrameMasking(mask_ratio=ratio)
+    raise ValueError(f"unknown mask_type {mask_type!r}: expected tube|frame|mixed")
 
 
 def run_pretrain_stage(
@@ -75,6 +96,7 @@ def run_pretrain_stage(
         num_frames=int(cfg.model.num_frames),
         image_size=int(cfg.model.image_size),
         overlap=float(cfg.preprocess.window.overlap),
+        frame_stride=int(cfg.preprocess.window.get("frame_stride", 1)),
     )
     train_loader = _make_ssl_loader(
         dataset,
@@ -130,10 +152,7 @@ def run_pretrain_stage(
     writer = make_writer(checkpoint_root / "tb", rank=rank)
     result: dict = {}
 
-    if bool(cfg.model.get("motion_mask", False)):
-        masker = MotionGuidedTubeMasking(mask_ratio=float(cfg.model.mask_ratio))
-    else:
-        masker = RandomTubeMasking(mask_ratio=float(cfg.model.mask_ratio))
+    masker = _build_masker(cfg)
 
     max_steps = int(cfg.train.get("max_steps", 0))
     accum_steps = int(cfg.train.get("accum_steps", 1))

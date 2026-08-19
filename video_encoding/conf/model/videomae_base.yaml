@@ -26,5 +26,12 @@ decoder_embed_dim: 256
 decoder_num_heads: 8
 mask_ratio: 0.9   # mask 90% of tubelets, keep 10% for visible encoding
 motion_mask: false        # true -> mask highest-motion tubelets instead of random ones
+mask_type: tube           # tube | frame | mixed; ignored when motion_mask is true.
+                          # frame/mixed hide whole timesteps, removing tube masking's
+                          # guarantee that a masked column is visible at another t
+target_mode: time_avg     # time_avg | per_frame. per_frame keeps one patch per tubelet
+                          # frame instead of averaging them, widening predict_head to
+                          # tubelet_size*3*patch^2. Checkpoints are NOT interchangeable
+                          # between modes -- predict_head shapes differ.
 decoder_mask_ratio: 0.0   # V2 dual masking: fraction of masked tokens the decoder skips reconstructing (0.0 = reconstruct all, V1 behavior)
                           # >0.0 makes masked-token count data-dependent (torch.randperm-sliced in mae.py forward) -> breaks torch.compile's static-shape assumption; re-benchmark train.compile if enabling this

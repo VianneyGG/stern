@@ -5,5 +5,12 @@ detector: retinaface
 window:
   len_s: 2.0          # D9 default — confirm against Aff-Wild2 annotation granularity before locking
   overlap: 0.5
+  frame_stride: 1     # sample every n-th frame. 1 = consecutive frames, so at
+                      # tubelet_size 2 a tubelet spans ~80ms at 25fps and there
+                      # is very little inter-frame change for the objective to
+                      # model. Widen (2, 4) to test whether motion blindness is a
+                      # sampling-rate problem rather than an objective one; measure
+                      # first with scripts.diag_motion_budget, which reports the
+                      # destroyed-variance budget per stride.
   scales: [1.0, 2.0, 4.0]  # candidate window lengths for the D9 ablation sweep (REPO_SETUP.md §4); not consumed by code yet — override via 'preprocess.window.len_s=X' for a single run, or '-m preprocess.window.len_s=1,2,4' for a multirun sweep across these values
 va_range: [-1.0, 1.0]  # harmonisation target, see common/data/harmonise.py

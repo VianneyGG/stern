@@ -45,21 +45,33 @@ def make_windows(
     return windows
 
 
-def window_starts(n_frames: int, window_len: int, overlap: float) -> list[int]:
+def window_starts(
+    n_frames: int, window_len: int, overlap: float, frame_stride: int = 1
+) -> list[int]:
     """Start indices of `window_len`-long windows over `n_frames` with `overlap`.
 
     Frame-index analogue of `make_windows` (which slices arrays): used to align
     a fixed `num_frames` model window with its label rows without decoding the
     whole clip into memory first. Trailing partial windows are dropped.
+
+    `frame_stride` samples every n-th frame, so a window covers
+    `(window_len - 1) * frame_stride + 1` frames of wall-clock time while still
+    yielding `window_len` frames to the model. Overlap and the trailing-window
+    bound both apply to that span, not to `window_len`, otherwise strided
+    windows would overlap despite `overlap=0`. Default 1 leaves every existing
+    window unchanged.
     """
     if not 0.0 <= overlap < 1.0:
         raise ValueError(f"overlap must be in [0, 1), got {overlap}")
     if window_len <= 0:
         raise ValueError(f"window_len must be positive, got {window_len}")
-    step = int(round(window_len * (1 - overlap)))
+    if frame_stride <= 0:
+        raise ValueError(f"frame_stride must be positive, got {frame_stride}")
+    span = (window_len - 1) * frame_stride + 1
+    step = int(round(span * (1 - overlap)))
     if step <= 0:
         raise ValueError(f"overlap={overlap} produced a non-positive step")
-    return list(range(0, n_frames - window_len + 1, step))
+    return list(range(0, n_frames - span + 1, step))
 
 
 def build_frame_windows(
@@ -68,6 +80,7 @@ def build_frame_windows(
     num_frames: int,
     overlap: float,
     n_frames: int | None = None,
+    frame_stride: int = 1,
 ) -> list[tuple[list[Path], list[int]]]:
     """List `clip_dir`'s frame files and build `(frame_files, idx)` windows.
 
@@ -82,7 +95,7 @@ def build_frame_windows(
     frame_files = list_frame_files(clip_dir)
     n = len(frame_files) if n_frames is None else n_frames
     windows = []
-    for start in window_starts(n, num_frames, overlap):
-        idx = list(range(start, start + num_frames))
+    for start in window_starts(n, num_frames, overlap, frame_stride):
+        idx = list(range(start, start + num_frames * frame_stride, frame_stride))
         windows.append((frame_files, idx))
     return windows

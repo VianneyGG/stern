@@ -30,12 +30,23 @@ from torch.utils.data.distributed import DistributedSampler
 
 from eval.ccc import ccc_loss, concordance_correlation_coefficient
 from video_encoding.data.loaders import build_probe_loader
-from video_encoding.data.probe_windows import VAWindowDataset
+from video_encoding.data.probe_windows import VAWindowDataset, make_temporal_transform
 from video_encoding.models import VideoMAEVARegressor
 from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.ddp.ddp import setup_ddp, teardown_ddp, wrap_ddp
 from video_encoding.training.loop_utils import set_sampler_epoch
 from video_encoding.training.tb_logger import make_writer, write_result_json
+
+
+def _temporal_transform(cfg: DictConfig):
+    """Build the probe's temporal-condition transform from config.
+
+    Defaults to "normal" (no transform), so an existing probe config is
+    unchanged.
+    """
+    return make_temporal_transform(
+        str(cfg.train.get("temporal_condition", "normal")), int(cfg.train.seed)
+    )
 
 
 def run_train_stage(
@@ -57,6 +68,7 @@ def run_train_stage(
         image_size=int(cfg.model.image_size),
         overlap=float(cfg.preprocess.window.overlap),
         va_range=tuple(cfg.dataset.va_range),
+        transform=_temporal_transform(cfg),
     )
     train_loader, val_loader = _split_loaders(
         dataset,

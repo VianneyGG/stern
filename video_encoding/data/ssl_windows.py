@@ -47,6 +47,7 @@ class SSLWindowDataset(Dataset):
         num_frames: int,
         image_size: int,
         overlap: float,
+        frame_stride: int = 1,
     ):
         self._num_frames = num_frames
         self._image_size = image_size
@@ -67,15 +68,24 @@ class SSLWindowDataset(Dataset):
                         entry = shard_index[clip_key]
                         shard_path = Path(shards_root) / entry["shard"]
                         for start in window_starts(
-                            entry["num_frames"], num_frames, overlap
+                            entry["num_frames"], num_frames, overlap, frame_stride
                         ):
-                            idx = list(range(start, start + num_frames))
+                            idx = list(
+                                range(
+                                    start,
+                                    start + num_frames * frame_stride,
+                                    frame_stride,
+                                )
+                            )
                             self._items.append(((shard_path, clip_key), idx))
                     elif cache_root:
                         cache_dir = Path(cache_root) / Path(clip_path).with_suffix("")
                         self._items.extend(
                             build_frame_windows(
-                                cache_dir, num_frames=num_frames, overlap=overlap
+                                cache_dir,
+                                num_frames=num_frames,
+                                overlap=overlap,
+                                frame_stride=frame_stride,
                             )
                         )
                     else:

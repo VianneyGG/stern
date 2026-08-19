@@ -19,13 +19,19 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.utils.data
 from omegaconf import OmegaConf
 from PIL import Image
 
 from data.labels import write_label_csv
 from data.manifest import ManifestRecord
 from video_encoding.data.loaders import LabelledDataset
-from video_encoding.data.probe_windows import VAWindowDataset
+from video_encoding.data.probe_windows import (
+    VAWindowDataset,
+    freeze_frames,
+    make_temporal_transform,
+    shuffle_frames,
+)
 from video_encoding.models.videomaev2.encoder import preprocess_window
 
 NUM_FRAMES = 4
@@ -264,3 +270,101 @@ def test_getitem_returns_model_ready_shapes_and_dtypes(tmp_path):
     assert pixel_values.dtype == torch.float32
     assert label.shape == (2,)
     assert label.dtype == torch.float32
+
+
+class TestShuffleFrames:
+    def test_preserves_the_frame_multiset(self):
+        """Shuffling must change order and nothing else -- that is what makes it
+        a clean control for the domain gap."""
+        window = torch.randn(3, 16, 8, 8)
+        out = shuffle_frames(window, torch.Generator().manual_seed(0))
+        a = torch.stack(sorted(window.unbind(dim=1), key=lambda f: float(f.sum())))
+        b = torch.stack(sorted(out.unbind(dim=1), key=lambda f: float(f.sum())))
+        torch.testing.assert_close(a, b)
+
+    def test_changes_the_order(self):
+        window = torch.arange(16).float().view(1, 16, 1, 1).expand(3, 16, 8, 8)
+        out = shuffle_frames(window.clone(), torch.Generator().manual_seed(0))
+        assert not torch.equal(out, window)
+
+    def test_is_deterministic_for_a_generator_seed(self):
+        window = torch.randn(3, 16, 8, 8)
+        a = shuffle_frames(window, torch.Generator().manual_seed(5))
+        b = shuffle_frames(window, torch.Generator().manual_seed(5))
+        torch.testing.assert_close(a, b)
+
+
+class TestFreezeFrames:
+    def test_every_frame_equals_the_source(self):
+        window = torch.randn(3, 16, 8, 8)
+        out = freeze_frames(window, index=4)
+        for t in range(16):
+            torch.testing.assert_close(out[:, t], window[:, 4])
+
+    def test_default_index_is_the_middle_frame(self):
+        window = torch.randn(3, 16, 8, 8)
+        torch.testing.assert_close(freeze_frames(window)[:, 0], window[:, 8])
+
+
+class TestMakeTemporalTransform:
+    def test_normal_is_no_transform(self):
+        assert make_temporal_transform("normal", seed=0) is None
+
+    def test_shuffled_and_frozen_return_callables(self):
+        window = torch.randn(3, 16, 8, 8)
+        for condition in ("shuffled", "frozen"):
+            fn = make_temporal_transform(condition, seed=0)
+            assert fn(window).shape == window.shape
+
+    def test_unknown_condition_raises(self):
+        with pytest.raises(ValueError, match="temporal condition"):
+            make_temporal_transform("banana", seed=0)
+
+
+class TestShuffleTransformAcrossDataLoaderWorkers:
+    """make_temporal_transform closed over one torch.Generator. DataLoader forks
+    its workers after the dataset is built, so every worker inherited identical
+    generator state and replayed the same permutation sequence -- the shuffle
+    stayed a valid shuffle, but its diversity dropped by a factor of
+    num_workers and the run was only reproducible if worker assignment was.
+
+    The condition is the control the whole temporal-order gate rests on, so its
+    randomness should not be an artefact of the loader's worker count.
+    """
+
+    def _perms(self, monkeypatch, worker_id, n=6, seed=0):
+        class _Info:
+            id = worker_id
+
+        monkeypatch.setattr(
+            torch.utils.data, "get_worker_info", lambda: _Info(), raising=False
+        )
+        transform = make_temporal_transform("shuffled", seed)
+        window = torch.arange(8).view(1, 8, 1, 1).float()
+        return [transform(window).flatten().tolist() for _ in range(n)]
+
+    def test_two_workers_draw_different_permutation_streams(self, monkeypatch):
+        a = self._perms(monkeypatch, 0)
+        b = self._perms(monkeypatch, 1)
+        assert a != b
+
+    def test_a_worker_is_reproducible_for_a_seed(self, monkeypatch):
+        assert self._perms(monkeypatch, 3) == self._perms(monkeypatch, 3)
+
+    def test_the_seed_still_changes_the_stream(self, monkeypatch):
+        assert self._perms(monkeypatch, 0, seed=0) != self._perms(
+            monkeypatch, 0, seed=1
+        )
+
+    def test_it_works_outside_a_worker_process(self, monkeypatch):
+        """num_workers=0 is the single-process path; get_worker_info is None."""
+        monkeypatch.setattr(
+            torch.utils.data, "get_worker_info", lambda: None, raising=False
+        )
+        transform = make_temporal_transform("shuffled", 0)
+        window = torch.arange(8).view(1, 8, 1, 1).float()
+        assert sorted(transform(window).flatten().tolist()) == list(range(8))
+
+    def test_every_draw_is_still_a_permutation(self, monkeypatch):
+        for perm in self._perms(monkeypatch, 2, n=10):
+            assert sorted(perm) == list(range(8))

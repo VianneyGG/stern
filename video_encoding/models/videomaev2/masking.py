@@ -76,6 +76,102 @@ class RandomTubeMasking:
         return keep_indices, mask_indices
 
 
+class RandomFrameMasking:
+    """Mask whole timesteps, then top up with scattered tokens.
+
+    The complement of tube masking. Tube masking leaves every masked spatial
+    column visible at every *other* timestep, so a model can solve the task by
+    pooling its own column over time and never learn temporal structure. Here
+    whole timesteps are hidden, so reconstructing them requires predicting
+    across time.
+
+    `min_visible_timesteps` bounds how far that goes. Without it the production
+    geometry (T'=8, mask_ratio 0.9) hides int(0.9*8) = 7 of 8 timesteps, leaving
+    the encoder a single frame -- that is not "no guaranteed temporal twin", it
+    is single-frame MAE plus seven-step extrapolation, and it confounds the
+    factorial: a worse score could equally mean the encoder was starved of
+    input rather than that temporal modelling is hard. One token per surviving
+    timestep is also held back from the scattered top-up, so the floor is a
+    guarantee and not merely likely.
+
+    The remaining budget is taken as scattered tokens from the surviving
+    timesteps, so the total masked count matches RandomTubeMasking and the two
+    are comparable at a fixed token budget. The reserved tokens cap that budget:
+    at mask_ratio 1.0 the count falls short by `min_visible_timesteps`, because
+    masking everything and keeping a visible timestep cannot both hold.
+    """
+
+    def __init__(self, mask_ratio: float = 0.9, min_visible_timesteps: int = 2):
+        self.mask_ratio = mask_ratio
+        self.min_visible_timesteps = min_visible_timesteps
+
+    def __call__(
+        self,
+        pixel_values: "torch.Tensor | None",
+        grid: tuple[int, int, int],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del pixel_values  # unused: random masking doesn't look at content
+        T, H, W = grid
+        n_spatial = H * W
+        n_tokens = T * n_spatial
+        n_mask = round(self.mask_ratio * n_tokens)
+
+        n_full = min(int(self.mask_ratio * T), max(0, T - self.min_visible_timesteps))
+
+        masked = torch.zeros(n_tokens, dtype=torch.bool, device=device)
+        order = torch.randperm(T, device=device)
+        full_t, survivor_t = order[:n_full], order[n_full:]
+        spatial = torch.arange(n_spatial, device=device)
+        flat = ((full_t * n_spatial)[:, None] + spatial[None, :]).reshape(-1)
+        masked[flat] = True
+
+        # One token per surviving timestep is exempt from the top-up below.
+        reserved = torch.zeros(n_tokens, dtype=torch.bool, device=device)
+        keep_one = torch.randint(n_spatial, (survivor_t.numel(),), device=device)
+        reserved[survivor_t * n_spatial + keep_one] = True
+
+        n_extra = n_mask - int(masked.sum())
+        if n_extra > 0:
+            candidates = (~masked & ~reserved).nonzero(as_tuple=True)[0]
+            pick = torch.randperm(candidates.numel(), device=device)[:n_extra]
+            masked[candidates[pick]] = True
+
+        # nonzero returns ascending indices, matching RandomTubeMasking's sort.
+        return (~masked).nonzero(as_tuple=True)[0], masked.nonzero(as_tuple=True)[0]
+
+
+class MixedTubeFrameMasking:
+    """Per-call coin flip between tube and frame-level masking.
+
+    Used rather than pure frame masking for the factorial's mask arm: pure frame
+    masking removes the spatial-inpainting signal entirely, changing more than
+    one variable. Mixing preserves tube masking half the time and removes only
+    the *guarantee* of a visible temporal twin.
+    """
+
+    def __init__(
+        self,
+        mask_ratio: float = 0.9,
+        p_frame: float = 0.5,
+        min_visible_timesteps: int = 2,
+    ):
+        self.mask_ratio = mask_ratio
+        self.p_frame = p_frame
+        self._tube = RandomTubeMasking(mask_ratio)
+        self._frame = RandomFrameMasking(mask_ratio, min_visible_timesteps)
+
+    def __call__(
+        self,
+        pixel_values: "torch.Tensor | None",
+        grid: tuple[int, int, int],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if float(torch.rand(1, device=device)) < self.p_frame:
+            return self._frame(pixel_values, grid, device)
+        return self._tube(pixel_values, grid, device)
+
+
 class MotionGuidedTubeMasking:
     """Tube masking biased toward high-motion spatial tubelets: patches with
     large frame-to-frame pixel change are preferentially masked, forcing the

@@ -7,16 +7,72 @@ Mirrors SSLWindowDataset (video_encoding/data/ssl_windows.py) but:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.utils.data
 from torch.utils.data import Dataset
 
 from data.labels import load_per_frame_va
 from video_encoding.data.frame_decoder import list_frame_files, read_frames_at
 from video_encoding.data.windows import build_frame_windows
 from video_encoding.models.videomaev2.encoder import preprocess_window
+
+
+def shuffle_frames(window: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    """Randomly permute a window's frames along T.
+
+    The control that makes the temporal-order probe interpretable: it destroys
+    temporal order while preserving every frame, so a CCC drop cannot be blamed
+    on the domain gap or the missing face-crop stage.
+    """
+    perm = torch.randperm(window.shape[1], generator=generator)
+    return window[:, perm]
+
+
+def freeze_frames(window: torch.Tensor, index: int | None = None) -> torch.Tensor:
+    """Replace every frame with one source frame (default: the middle one).
+
+    Reported as a secondary reference point rather than the gate -- unlike
+    shuffling, this changes the content distribution as well as the order.
+    """
+    t = window.shape[1]
+    i = t // 2 if index is None else index
+    return window[:, i : i + 1].expand_as(window).clone()
+
+
+def make_temporal_transform(
+    condition: str, seed: int
+) -> Callable[[torch.Tensor], torch.Tensor] | None:
+    """Build the per-window transform for one probe condition."""
+    if condition == "normal":
+        return None
+    if condition == "shuffled":
+        # One generator per DataLoader worker, created on first use inside that
+        # worker. A single closed-over generator is copied at fork, so every
+        # worker would replay the same permutation sequence -- still a valid
+        # shuffle, but with 1/num_workers of the diversity and reproducible only
+        # if worker assignment was. This condition is the control the temporal
+        # gate rests on, so its randomness must not depend on the loader.
+        generators: dict[int, torch.Generator] = {}
+
+        def _shuffle(window: torch.Tensor) -> torch.Tensor:
+            info = torch.utils.data.get_worker_info()
+            worker_id = 0 if info is None else int(info.id)
+            generator = generators.get(worker_id)
+            if generator is None:
+                generator = torch.Generator().manual_seed(seed + 1_000_003 * worker_id)
+                generators[worker_id] = generator
+            return shuffle_frames(window, generator)
+
+        return _shuffle
+    if condition == "frozen":
+        return freeze_frames
+    raise ValueError(
+        f"unknown temporal condition {condition!r}: expected normal|shuffled|frozen"
+    )
 
 
 class VAWindowDataset(Dataset):
@@ -37,9 +93,11 @@ class VAWindowDataset(Dataset):
         image_size: int,
         overlap: float,
         va_range: tuple[float, float],
+        transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ):
         self._num_frames = num_frames
         self._image_size = image_size
+        self._transform = transform
         self._items: list[tuple[list[Path], list[int], np.ndarray]] = []
         skipped: list[str] = []
         for record in labelled_dataset.records:
@@ -81,4 +139,7 @@ class VAWindowDataset(Dataset):
         frame_files, idx, label = self._items[i]
         frames = read_frames_at(frame_files, idx, size=self._image_size)
         pixel_values = preprocess_window(frames, self._num_frames, self._image_size)
-        return pixel_values.squeeze(0), torch.from_numpy(label)
+        window = pixel_values.squeeze(0)
+        if self._transform is not None:
+            window = self._transform(window)
+        return window, torch.from_numpy(label)
