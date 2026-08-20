@@ -21,6 +21,7 @@ optimizer fresh but keeps the model weights.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping
 
@@ -254,6 +255,40 @@ def base_payload(
     }
 
 
+_LEGACY_RENAMES = (
+    (".attn.in_proj_", ".attn.qkv."),
+    (".attn.out_proj.", ".attn.proj."),
+)
+_LEGACY_MLP = re.compile(r"\.mlp\.(\d+)\.")
+
+
+def remap_legacy_attention_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
+    """Rename pre-ViT-refactor parameter keys onto the current module layout.
+
+    The refactor replaced nn.MultiheadAttention with ViTAttention and wrapped
+    the MLP's nn.Sequential in a `net` attribute. Every checkpoint written
+    before it -- including pool-cars-best-120r, the run the motion probes score
+    -- shares only 77 of 205 keys with the current model and would otherwise
+    load as 128 unexpected + 129 missing keys.
+
+    This is a pure rename. ViTAttention's (qkv, proj) parameters mirror
+    nn.MultiheadAttention's (in_proj, out_proj) shapes and ordering exactly, so
+    the tensors transfer 1:1 with no reshaping -- the numerical guarantee is
+    test_vit_attention.py's parity test, which copies weights across by these
+    same names.
+
+    Idempotent, so callers may apply it unconditionally rather than sniffing
+    the checkpoint's vintage.
+    """
+    remapped = {}
+    for key, value in state_dict.items():
+        for old, new in _LEGACY_RENAMES:
+            key = key.replace(old, new)
+        key = _LEGACY_MLP.sub(r".mlp.net.\1.", key)
+        remapped[key] = value
+    return remapped
+
+
 def load_encoder_state(
     encoder: torch.nn.Module, state_dict: Mapping[str, Any]
 ) -> tuple[list[str], list[str]]:
@@ -287,6 +322,25 @@ def load_encoder_state(
     return list(result.missing_keys), list(result.unexpected_keys)
 
 
+def _remap_payload(payload: dict) -> dict:
+    """Apply the legacy key rename to a loaded checkpoint's model weights.
+
+    Both payload shapes in circulation are handled: a dict carrying a
+    "model_state_dict" entry, and a bare state dict -- train.py and
+    dump_probe_predictions.py both fall back to the payload itself via
+    .get("model_state_dict", ckpt). Sibling entries (optimizer state, round,
+    epoch) are left untouched.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if "model_state_dict" in payload:
+        payload["model_state_dict"] = remap_legacy_attention_keys(
+            payload["model_state_dict"]
+        )
+        return payload
+    return remap_legacy_attention_keys(payload)
+
+
 def load_checkpoint_file(path: Path | str) -> dict:
     """torch.load a checkpoint, transparently supporting an unzipped PyTorch
     archive directory (data.pkl, data/, version, ...) alongside a normal
@@ -295,10 +349,14 @@ def load_checkpoint_file(path: Path | str) -> dict:
     A directory is repacked into an in-memory ZIP (ZIP_STORED, no compression)
     so torch.load can consume it -- useful for checkpoints synced off the
     cluster as an extracted directory rather than the single .pt file.
+
+    Pre-ViT-refactor parameter names are remapped on the way out, so every
+    consumer reads one key layout regardless of when the checkpoint was
+    written. See remap_legacy_attention_keys.
     """
     p = Path(path)
     if not p.is_dir():
-        return torch.load(p, map_location="cpu", weights_only=False)
+        return _remap_payload(torch.load(p, map_location="cpu", weights_only=False))
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
         for root, _, files in os.walk(str(p)):
@@ -310,4 +368,4 @@ def load_checkpoint_file(path: Path | str) -> dict:
                 with open(fpath, "rb") as fh:
                     zf.writestr(zi, fh.read())
     buf.seek(0)
-    return torch.load(buf, map_location="cpu", weights_only=False)
+    return _remap_payload(torch.load(buf, map_location="cpu", weights_only=False))

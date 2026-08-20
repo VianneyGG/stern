@@ -8,10 +8,12 @@ import torch
 from omegaconf import OmegaConf
 
 from video_encoding.models.videomaev2.encoder import VideoMAEEncoder
+from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
 from video_encoding.training.checkpoint import (
     load,
     load_checkpoint_file,
     load_encoder_state,
+    remap_legacy_attention_keys,
     save,
     try_save,
 )
@@ -228,3 +230,167 @@ def test_load_does_not_warn_when_state_dicts_match(tmp_path, caplog):
         )
 
     assert len(caplog.records) == 0
+
+
+class TestRemapLegacyAttentionKeys:
+    """The ViT refactor renamed attention and MLP parameters. Checkpoints
+    trained before it (every run through pool-cars-best-120r) share only 77 of
+    205 keys with the current model, so probing them needs a rename shim.
+
+    The key names below are copied verbatim from
+    ~/stern_mesh/checkpoints/pool-cars-best-120r/master.pt -- ground truth from
+    a real checkpoint, not from inverting the mapping under test, which would
+    make these assertions tautological.
+    """
+
+    def test_renames_the_fused_qkv_projection(self):
+        out = remap_legacy_attention_keys(
+            {
+                "encoder.blocks.0.attn.in_proj_weight": torch.zeros(3, 1),
+                "encoder.blocks.0.attn.in_proj_bias": torch.zeros(3),
+            }
+        )
+        assert set(out) == {
+            "encoder.blocks.0.attn.qkv.weight",
+            "encoder.blocks.0.attn.qkv.bias",
+        }
+
+    def test_weight_and_bias_do_not_get_crossed(self):
+        """A rename table that mapped in_proj_* onto the wrong target would
+        still produce the right key set, so bind each tensor to its value."""
+        out = remap_legacy_attention_keys(
+            {
+                "encoder.blocks.0.attn.in_proj_weight": torch.full((3, 1), 7.0),
+                "encoder.blocks.0.attn.in_proj_bias": torch.full((3,), 9.0),
+            }
+        )
+        assert out["encoder.blocks.0.attn.qkv.weight"].flatten()[0] == 7.0
+        assert out["encoder.blocks.0.attn.qkv.bias"].flatten()[0] == 9.0
+
+    def test_renames_the_output_projection(self):
+        out = remap_legacy_attention_keys(
+            {"decoder_blocks.0.attn.out_proj.weight": torch.zeros(1)}
+        )
+        assert list(out) == ["decoder_blocks.0.attn.proj.weight"]
+
+    def test_renames_the_sequential_mlp_into_its_net_submodule(self):
+        out = remap_legacy_attention_keys(
+            {
+                "decoder_blocks.0.mlp.0.weight": torch.zeros(1),
+                "decoder_blocks.0.mlp.3.bias": torch.zeros(1),
+            }
+        )
+        assert set(out) == {
+            "decoder_blocks.0.mlp.net.0.weight",
+            "decoder_blocks.0.mlp.net.3.bias",
+        }
+
+    def test_leaves_unrelated_keys_untouched(self):
+        keys = {
+            "encoder.pos_embed": torch.zeros(1),
+            "encoder.patch_embed.proj.weight": torch.zeros(1),
+            "encoder.blocks.0.norm1.weight": torch.zeros(1),
+            "mask_token": torch.zeros(1),
+        }
+        assert set(remap_legacy_attention_keys(keys)) == set(keys)
+
+    def test_is_idempotent_on_already_current_keys(self):
+        """Re-running the shim on a current checkpoint must be a no-op, so the
+        loader can apply it unconditionally without sniffing the format."""
+        current = {
+            "encoder.blocks.0.attn.qkv.weight": torch.zeros(1),
+            "encoder.blocks.0.attn.proj.bias": torch.zeros(1),
+            "encoder.blocks.0.mlp.net.0.weight": torch.zeros(1),
+        }
+        once = remap_legacy_attention_keys(current)
+        assert set(once) == set(current)
+        assert set(remap_legacy_attention_keys(once)) == set(current)
+
+    def test_a_remapped_legacy_checkpoint_loads_into_the_current_model(self):
+        """End to end: the only key the shim cannot supply is the registers
+        tensor, which the refactor added. At num_registers=0 it is an empty
+        (1, 0, D) parameter that prepend/strip treat as a no-op, so leaving it
+        at init changes no computation."""
+        cfg = OmegaConf.load("video_encoding/conf/model/videomae_base.yaml")
+        model = VideoMAEForPreTraining(cfg)
+
+        inverse = {
+            ".attn.qkv.": ".attn.in_proj_",
+            ".attn.proj.": ".attn.out_proj.",
+            ".mlp.net.": ".mlp.",
+        }
+        legacy = {}
+        for key, value in model.state_dict().items():
+            if key == "encoder.registers.tokens":
+                continue
+            for new, old in inverse.items():
+                key = key.replace(new, old)
+            legacy[key] = value
+
+        result = model.load_state_dict(
+            remap_legacy_attention_keys(legacy), strict=False
+        )
+        assert result.unexpected_keys == []
+        assert result.missing_keys == ["encoder.registers.tokens"]
+        assert model.encoder.registers.tokens.numel() == 0
+
+
+class TestLoadCheckpointFileRemapsLegacyKeys:
+    """load_checkpoint_file is the single door every consumer reads a
+    checkpoint through (train.py, dump_probe_predictions.py,
+    probe_motion_decodability.py, diag_reconstruction.py,
+    export_vit_internals.py), so the pre-ViT-refactor rename belongs here
+    rather than repeated at each call site.
+
+    Two payload shapes are in circulation and both must be covered: a dict with
+    a "model_state_dict" entry, and a bare state dict -- train.py:86 and
+    dump_probe_predictions.py:62 both fall back to the payload itself via
+    .get("model_state_dict", ckpt).
+    """
+
+    def test_remaps_keys_nested_under_model_state_dict(self, tmp_path):
+        payload = {
+            "epoch": 3,
+            "model_state_dict": {
+                "encoder.blocks.0.attn.in_proj_weight": torch.tensor([1.0]),
+                "encoder.blocks.0.mlp.0.weight": torch.tensor([2.0]),
+            },
+        }
+        path = tmp_path / "legacy.pt"
+        torch.save(payload, path)
+
+        loaded = load_checkpoint_file(path)
+
+        assert set(loaded["model_state_dict"]) == {
+            "encoder.blocks.0.attn.qkv.weight",
+            "encoder.blocks.0.mlp.net.0.weight",
+        }
+        assert loaded["epoch"] == 3
+
+    def test_remaps_a_bare_state_dict_payload(self, tmp_path):
+        payload = {"encoder.blocks.0.attn.out_proj.bias": torch.tensor([5.0])}
+        path = tmp_path / "bare.pt"
+        torch.save(payload, path)
+
+        loaded = load_checkpoint_file(path)
+
+        assert list(loaded) == ["encoder.blocks.0.attn.proj.bias"]
+        assert torch.equal(loaded["encoder.blocks.0.attn.proj.bias"], torch.tensor([5.0]))
+
+    def test_leaves_sibling_payload_entries_alone(self, tmp_path):
+        """Only the model weights are renamed; optimizer state and metadata
+        must survive byte-for-byte, since the outer-step code reads them."""
+        payload = {
+            "model_state_dict": {"encoder.blocks.0.attn.in_proj_bias": torch.tensor([1.0])},
+            "optimizer_state_dict": {"state": {0: {"exp_avg": torch.tensor([4.0])}}},
+            "round": 120,
+        }
+        path = tmp_path / "full.pt"
+        torch.save(payload, path)
+
+        loaded = load_checkpoint_file(path)
+
+        assert loaded["round"] == 120
+        assert torch.equal(
+            loaded["optimizer_state_dict"]["state"][0]["exp_avg"], torch.tensor([4.0])
+        )

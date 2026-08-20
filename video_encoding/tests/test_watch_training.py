@@ -18,6 +18,11 @@ def test_main_fast_path_refreshes_squeue_and_exits_without_full_check(
     monkeypatch.setattr(
         watch_mod, "LOCK_PATH", tmp_path / "runs" / "state" / "watch_training.lock"
     )
+    # Every test designates its own host: main() refuses to tick unless
+    # runs/state/watcher_host names this machine.
+    (tmp_path / "watcher_host").write_text("testhost\n")
+    monkeypatch.setattr(watch_mod, "HOST_PATH", tmp_path / "watcher_host")
+    monkeypatch.setattr(watch_mod, "HOSTNAME", "testhost")
 
     # Pre-seed state so next_full_check_at is far in the future -- fast path.
     (tmp_path / "runs" / "state").mkdir(parents=True)
@@ -62,6 +67,11 @@ def test_main_runs_full_check_and_logs_when_due(tmp_path, monkeypatch):
     monkeypatch.setattr(
         watch_mod, "LOCK_PATH", tmp_path / "runs" / "state" / "watch_training.lock"
     )
+    # Every test designates its own host: main() refuses to tick unless
+    # runs/state/watcher_host names this machine.
+    (tmp_path / "watcher_host").write_text("testhost\n")
+    monkeypatch.setattr(watch_mod, "HOST_PATH", tmp_path / "watcher_host")
+    monkeypatch.setattr(watch_mod, "HOSTNAME", "testhost")
 
     with (
         patch("video_encoding.scripts.watch_training.refresh_squeue_snapshot"),
@@ -92,6 +102,11 @@ def test_main_survives_mesh_advancement_exception(tmp_path, monkeypatch):
     monkeypatch.setattr(watch_mod, "RESULTS_DIR", tmp_path / "runs" / "results")
     monkeypatch.setattr(watch_mod, "LOG_PATH", state_dir / "watcher.log")
     monkeypatch.setattr(watch_mod, "LOCK_PATH", state_dir / "watch_training.lock")
+    # Every test designates its own host: main() refuses to tick unless
+    # runs/state/watcher_host names this machine.
+    (tmp_path / "watcher_host").write_text("testhost\n")
+    monkeypatch.setattr(watch_mod, "HOST_PATH", tmp_path / "watcher_host")
+    monkeypatch.setattr(watch_mod, "HOSTNAME", "testhost")
 
     state_dir.mkdir(parents=True)
     (state_dir / "mesh_run_configs.json").write_text(
@@ -149,6 +164,11 @@ def test_main_exempts_mesh_runs_no_longer_in_config_from_remediation(
     monkeypatch.setattr(watch_mod, "RESULTS_DIR", tmp_path / "runs" / "results")
     monkeypatch.setattr(watch_mod, "LOG_PATH", state_dir / "watcher.log")
     monkeypatch.setattr(watch_mod, "LOCK_PATH", state_dir / "watch_training.lock")
+    # Every test designates its own host: main() refuses to tick unless
+    # runs/state/watcher_host names this machine.
+    (tmp_path / "watcher_host").write_text("testhost\n")
+    monkeypatch.setattr(watch_mod, "HOST_PATH", tmp_path / "watcher_host")
+    monkeypatch.setattr(watch_mod, "HOSTNAME", "testhost")
 
     state_dir.mkdir(parents=True)
     # LIVE is configured; FINISHED is not -- it survives only in state.runs,
@@ -223,6 +243,11 @@ def test_main_sweeps_orphaned_pending_checkpoints_each_tick(tmp_path, monkeypatc
     monkeypatch.setattr(watch_mod, "RESULTS_DIR", tmp_path / "runs" / "results")
     monkeypatch.setattr(watch_mod, "LOG_PATH", state_dir / "watcher.log")
     monkeypatch.setattr(watch_mod, "LOCK_PATH", state_dir / "watch_training.lock")
+    # Every test designates its own host: main() refuses to tick unless
+    # runs/state/watcher_host names this machine.
+    (tmp_path / "watcher_host").write_text("testhost\n")
+    monkeypatch.setattr(watch_mod, "HOST_PATH", tmp_path / "watcher_host")
+    monkeypatch.setattr(watch_mod, "HOSTNAME", "testhost")
     mesh_shared = tmp_path / "mesh_shared"
     monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
 
@@ -283,6 +308,11 @@ def test_main_detects_and_remediates_nan_nodes_each_tick(tmp_path, monkeypatch):
     monkeypatch.setattr(watch_mod, "RESULTS_DIR", tmp_path / "runs" / "results")
     monkeypatch.setattr(watch_mod, "LOG_PATH", state_dir / "watcher.log")
     monkeypatch.setattr(watch_mod, "LOCK_PATH", state_dir / "watch_training.lock")
+    # Every test designates its own host: main() refuses to tick unless
+    # runs/state/watcher_host names this machine.
+    (tmp_path / "watcher_host").write_text("testhost\n")
+    monkeypatch.setattr(watch_mod, "HOST_PATH", tmp_path / "watcher_host")
+    monkeypatch.setattr(watch_mod, "HOSTNAME", "testhost")
     monkeypatch.setenv("MESH_SHARED", str(tmp_path / "mesh_shared"))
     monkeypatch.setenv("NAN_REMEDIATION_DRY_RUN", "false")
 
@@ -354,6 +384,11 @@ def test_main_skips_when_lock_held(tmp_path, monkeypatch):
     )
     lock_path = tmp_path / "runs" / "state" / "watch_training.lock"
     monkeypatch.setattr(watch_mod, "LOCK_PATH", lock_path)
+    # Every test designates its own host: main() refuses to tick unless
+    # runs/state/watcher_host names this machine.
+    (tmp_path / "watcher_host").write_text("testhost\n")
+    monkeypatch.setattr(watch_mod, "HOST_PATH", tmp_path / "watcher_host")
+    monkeypatch.setattr(watch_mod, "HOSTNAME", "testhost")
 
     lock_path.parent.mkdir(parents=True)
     import fcntl

@@ -57,6 +57,19 @@ QUORUM=13  # of 16 pool nodes: both the reseed threshold and the abort-round quo
 
 [[ -f "${QUEUE_FILE}" ]] || { echo "ERROR: no queue file ${QUEUE_FILE}" >&2; exit 1; }
 
+# sweep_queue.sh and watch_training.py both read-modify-write
+# mesh_run_configs.json, and fcntl.flock provides no cross-host mutual
+# exclusion on this NFSv3 home (verified 2026-08-20) -- so they must run on the
+# same machine. runs/state/watcher_host names it.
+HOST_FILE="${STATE_DIR}/watcher_host"
+[[ -f "${HOST_FILE}" ]] || { echo "ERROR: no ${HOST_FILE}; run install_watcher.sh <host> to designate one" >&2; exit 1; }
+DESIGNATED="$(tr -d '[:space:]' < "${HOST_FILE}")"; DESIGNATED="${DESIGNATED%%.*}"
+THIS_HOST="$(hostname)"; THIS_HOST="${THIS_HOST%%.*}"
+if [[ -z "${DESIGNATED}" || "${THIS_HOST}" != "${DESIGNATED}" ]]; then
+  echo "ERROR: ${THIS_HOST} is not the designated mesh control-plane host (${DESIGNATED:-none}) -- exiting" >&2
+  exit 1
+fi
+
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
   echo "ERROR: another sweep_queue holds ${LOCK_FILE} -- exiting" >&2

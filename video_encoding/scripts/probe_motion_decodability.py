@@ -104,7 +104,15 @@ def _load(ckpt_path, cfg, device):
             ckpt_io.load_checkpoint_file(ckpt_path)["model_state_dict"]
         )
         result = model.load_state_dict(state, strict=False)
-        if result.missing_keys or result.unexpected_keys:
+        # Checkpoints predating the ViT refactor lack encoder.registers.tokens.
+        # At num_registers: 0 that parameter is empty and RegisterTokens passes
+        # it through untouched, so its absence leaves the forward pass
+        # identical; anything else missing means the weights really don't fit.
+        params = dict(model.named_parameters())
+        missing = [
+            k for k in result.missing_keys if params[k].numel() > 0
+        ]
+        if missing or result.unexpected_keys:
             raise ValueError(f"{ckpt_path}: key mismatch")
     return model.eval().to(device)
 

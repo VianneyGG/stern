@@ -3,7 +3,10 @@
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
+from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
+from video_encoding.scripts import probe_motion_decodability as pmd
 from video_encoding.scripts.probe_motion_decodability import (
     frame_diff_targets,
     ridge_r2,
@@ -179,3 +182,51 @@ class TestFrameDiffTargetsEdges:
         # tubelet 1 covers frames 2,3: diffs (2->3)=1 and the duplicated (2->3)=1
         assert float(targets[1].mean()) == pytest.approx(1.0)
         assert float(targets[0].mean()) == pytest.approx(0.0)
+
+
+class TestLoadAcceptsLegacyCheckpoints:
+    """_load must read pool-cars-best-120r, which predates the ViT refactor.
+
+    load_checkpoint_file renames its attention and MLP keys, but the refactor
+    also *added* encoder.registers.tokens, which no old checkpoint carries. At
+    the default num_registers: 0 that parameter is an empty (1, 0, D) tensor
+    that RegisterTokens.prepend/strip pass through untouched, so its absence
+    changes no computation and must not abort the probe. Any other mismatch
+    still must.
+    """
+
+    def _legacy_state(self, model):
+        inverse = {
+            ".attn.qkv.": ".attn.in_proj_",
+            ".attn.proj.": ".attn.out_proj.",
+            ".mlp.net.": ".mlp.",
+        }
+        legacy = {}
+        for key, value in model.state_dict().items():
+            if key == "encoder.registers.tokens":
+                continue
+            for new, old in inverse.items():
+                key = key.replace(new, old)
+            legacy[key] = value
+        return legacy
+
+    def test_a_legacy_checkpoint_loads(self, tmp_path):
+        cfg = OmegaConf.load("video_encoding/conf/model/videomae_base.yaml")
+        model = VideoMAEForPreTraining(cfg)
+        path = tmp_path / "legacy.pt"
+        torch.save({"model_state_dict": self._legacy_state(model)}, path)
+
+        loaded = pmd._load(path, cfg, "cpu")
+
+        assert loaded.encoder.registers.tokens.numel() == 0
+
+    def test_a_genuinely_wrong_checkpoint_still_raises(self, tmp_path):
+        cfg = OmegaConf.load("video_encoding/conf/model/videomae_base.yaml")
+        model = VideoMAEForPreTraining(cfg)
+        state = self._legacy_state(model)
+        state.pop("encoder.blocks.0.attn.in_proj_weight")
+        path = tmp_path / "broken.pt"
+        torch.save({"model_state_dict": state}, path)
+
+        with pytest.raises(ValueError, match="key mismatch"):
+            pmd._load(path, cfg, "cpu")

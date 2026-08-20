@@ -42,10 +42,7 @@ from video_encoding.data.mesh_shard_dataset import MeshShardIterableDataset
 from video_encoding.mesh.assignment import read_my_shards
 from video_encoding.mesh.shard_map import load_shard_map
 from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
-from video_encoding.models.videomaev2.masking import (
-    MotionGuidedTubeMasking,
-    RandomTubeMasking,
-)
+from video_encoding.models.videomaev2.masking import build_masker
 from video_encoding.mesh.topology import NODE_SUBNETS
 from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.compile_utils import maybe_compile
@@ -102,6 +99,7 @@ def _append_round_metrics(
     val_loss: float,
     samp_s: float,
     n_shards: int,
+    lr: float,
 ) -> None:
     """Append one JSONL record to mesh_shared/metrics/<run_id>/<node>.jsonl.
 
@@ -119,6 +117,7 @@ def _append_round_metrics(
         "val_loss": val_loss,
         "samp_s": samp_s,
         "n_shards": n_shards,
+        "lr": lr,
         "ts": time.time(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
     }
@@ -250,21 +249,22 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     amp = str(cfg.train.get("amp", "off")).lower()
     accum_steps = int(cfg.train.get("accum_steps", 1))
     grad_clip = float(cfg.train.get("grad_clip", 0.0))
+    # local_batch=_MESH_BATCH_SIZE: the mesh path's real per-optimizer-step
+    # sample count is _MESH_BATCH_SIZE * accum_steps, NOT cfg.train.batch_size
+    # (16 in ssl.yaml, never overridden here) -- _scaled_lr's linear-scaling
+    # rule must scale off the batch actually seen per step, or the LR is
+    # silently mistuned for every mesh run regardless of accum_steps. Kept in
+    # its own variable (not inlined into the AdamW call) so it can also be
+    # reported alongside per-round metrics -- it never changes mid-run (no
+    # scheduler on this path), so it's a fixed reference value, not a curve.
+    lr = _scaled_lr(cfg, world_size=1, local_batch=_MESH_BATCH_SIZE)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        # local_batch=_MESH_BATCH_SIZE: the mesh path's real per-optimizer-step
-        # sample count is _MESH_BATCH_SIZE * accum_steps, NOT cfg.train.batch_size
-        # (16 in ssl.yaml, never overridden here) -- _scaled_lr's linear-scaling
-        # rule must scale off the batch actually seen per step, or the LR is
-        # silently mistuned for every mesh run regardless of accum_steps.
-        lr=_scaled_lr(cfg, world_size=1, local_batch=_MESH_BATCH_SIZE),
+        lr=lr,
         betas=(0.9, 0.95),
         weight_decay=float(cfg.train.get("weight_decay", 0.0)),
     )
-    if bool(cfg.model.get("motion_mask", False)):
-        masker = MotionGuidedTubeMasking(mask_ratio=float(cfg.model.mask_ratio))
-    else:
-        masker = RandomTubeMasking(mask_ratio=float(cfg.model.mask_ratio))
+    masker = build_masker(cfg.model)
 
     master_path = mesh_shared / "checkpoints" / run_id / "master.pt"
 
@@ -473,6 +473,7 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             val_loss,
             train_stats["samples_per_s_per_gpu"],
             len(train_shard_names),
+            lr,
         )
 
     return {

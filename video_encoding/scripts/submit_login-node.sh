@@ -75,24 +75,18 @@ else
   echo "WARNING: could not parse job id from sbatch output; jobs_registry not updated" >&2
 fi
 
-# Ensure the training watcher's cron entry is installed (video_encoding/watcher/*,
-# commit ec1a3be). It's cron-driven and stateless between ticks by design
-# (watcher/state.py: "no long-lived process -- it's cron-driven"), so
-# installing/verifying the crontab line is the correct launch mechanism --
-# not a PID file or screen/tmux session. grep-guarded so re-running
-# submit_login-node.sh never installs a duplicate line.
-if ! crontab -l 2>/dev/null | grep -q "watch_training"; then
-  # cron's own PATH (/usr/bin:/bin on this cluster) doesn't include
-  # ~/.local/bin, where uv lives -- an unqualified "uv" here fails silently
-  # every tick with no watcher.log entry at all. \$HOME/.local/bin/uv is
-  # robust since cron always sets HOME for the crontab owner. cron_stderr.log
-  # captures anything that fails before our own logging can run. --no-sync is
-  # required, not optional: the venv is 9.4 GB on NFS, and without it every
-  # 60s tick re-syncs while the previous tick's sync may still be running,
-  # racing uv's own package install/uninstall and intermittently crashing
-  # watch_training.py with ModuleNotFoundError before it ever imports
-  # video_encoding (observed in production 2026-08-05).
-  (crontab -l 2>/dev/null; echo "* * * * * cd ${REMOTE_DIR} && \$HOME/.local/bin/uv run --no-sync python -m video_encoding.scripts.watch_training >> ${REMOTE_DIR}/runs/state/cron_stderr.log 2>&1") | crontab -
-  echo "Installed training watcher crontab entry."
+# Converge this host onto the watcher designation in runs/state/watcher_host.
+# This used to install and enable the timer unconditionally, which quietly made
+# every host that ran a submit a second watcher -- and flock does not exclude
+# them from each other across this NFSv3 home (verified 2026-08-20). The
+# installer now enables the timer only on the designated host and disables it
+# everywhere else. Idempotent either way.
+#
+# The crontab removal predates that: migrated off cron 2026-08-12 after the
+# spool was found wiped 5 separate times with no confirmed root cause.
+if crontab -l 2>/dev/null | grep -q "watch_training"; then
+  (crontab -l 2>/dev/null | grep -v "watch_training") | crontab - || crontab -r
+  echo "Removed legacy training watcher crontab entry."
 fi
+\$HOME/stern/video_encoding/scripts/install_watcher.sh
 REMOTE

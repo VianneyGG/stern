@@ -122,12 +122,24 @@ class Sweep:
         (self.state / f"mesh_pool_ready_{TIER}.txt").write_text("\n".join(NODES) + "\n")
         (self.state / f"mesh_pool_active_{TIER}.txt").write_text(",".join(NODES) + "\n")
         self.set_watcher({})
+        # Every test runs as the designated host; the guard is exercised
+        # explicitly by test_sweep_refuses_to_run_off_the_designated_host.
+        self.set_designation("sweephost")
+        self.set_hostname("sweephost")
 
     def _stub(self, name: str, body: str) -> Path:
         path = self.bin / name
         path.write_text(body)
         path.chmod(0o755)
         return path
+
+    def set_designation(self, host: str) -> None:
+        """runs/state/watcher_host names the one host allowed to write mesh
+        control-plane state; sweep_queue.sh refuses to run anywhere else."""
+        (self.state / "watcher_host").write_text(f"{host}\n")
+
+    def set_hostname(self, host: str) -> None:
+        self._stub("hostname", f'#!/bin/sh\necho "{host}"\n')
 
     def set_cluster(self, idle: list[str], mine: list[str]) -> None:
         self.sinfo_out.write_text("".join(f"{n} idle\n" for n in idle))
@@ -290,12 +302,17 @@ def test_second_instance_exits_nonzero_and_changes_nothing(sweep):
     sweep.set_watcher({"run_a": {"status": "RUNNING", "round": 1}})
     with sweep.running():
         wait_until(lambda: _registered(sweep, "run_a"))
-        log_before, calls_before = sweep.log(), sweep.call_log()
+        calls_before = sweep.call_log()
         second = sweep.run(timeout=20)
         assert second.returncode != 0
         assert "another sweep_queue" in second.stderr
-        assert sweep.log() == log_before
+        # The first instance keeps polling at SWEEP_POLL_S=1 throughout, so its
+        # own heartbeat lines may land while the second one starts up --
+        # comparing the whole log byte-for-byte makes this test a race. What
+        # must hold is that the second instance advanced nothing: no new run
+        # was registered and no queue item was consumed.
         assert sweep.call_log() == calls_before
+        assert "run_a DONE" not in sweep.log()
 
 
 def test_stop_file_exits_cleanly_and_leaves_the_run_untouched(sweep):
@@ -599,3 +616,28 @@ def test_deadline_reached_exits_before_starting_the_next_item(sweep):
     assert not sweep.configs_path.exists()
     assert "register" not in sweep.call_log()
     assert "launch" not in sweep.call_log()
+
+
+def test_sweep_refuses_to_run_off_the_designated_host(sweep):
+    """sweep_queue.sh and the watcher both read-modify-write
+    mesh_run_configs.json, and flock does not exclude them from each other
+    across the shared NFSv3 home -- so they have to be on the same machine."""
+    sweep.set_configs([])
+    sweep.set_hostname("login-node.polytechnique.fr")
+    sweep.set_queue(["sw3-fish-a 10 0.7 0.9"])
+    before = sweep.configs_path.read_text()
+
+    result = sweep.run()
+
+    assert result.returncode != 0
+    assert "designated" in (result.stderr + result.stdout)
+    assert sweep.configs_path.read_text() == before
+
+
+def test_sweep_refuses_when_no_host_is_designated(sweep):
+    (sweep.state / "watcher_host").unlink()
+    sweep.set_queue(["sw3-fish-a 10 0.7 0.9"])
+
+    result = sweep.run()
+
+    assert result.returncode != 0

@@ -25,7 +25,12 @@ from torch.utils.data import DataLoader
 import video_encoding.training.diloco.mesh_round as mesh_round
 from video_encoding.data.mesh_shard_dataset import MeshShardIterableDataset
 from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
-from video_encoding.models.videomaev2.masking import RandomTubeMasking
+from video_encoding.models.videomaev2.masking import (
+    MixedTubeFrameMasking,
+    MotionGuidedTubeMasking,
+    RandomFrameMasking,
+    RandomTubeMasking,
+)
 from video_encoding.scripts.build_wds_shards import (
     BalancedShardWriter,
     encode_frames_jpeg,
@@ -1268,7 +1273,7 @@ def test_append_round_metrics_swallows_unwritable_metrics_dir(tmp_path):
     (mesh_shared / "metrics").write_text("not a directory")
 
     mesh_round._append_round_metrics(
-        mesh_shared, "run1", "node001", 1, 0.5, 0.4, 12.0, 3
+        mesh_shared, "run1", "node001", 1, 0.5, 0.4, 12.0, 3, 0.0015
     )  # must not raise
 
     assert (mesh_shared / "metrics").is_file()  # untouched, still a plain file
@@ -1279,7 +1284,7 @@ def test_append_round_metrics_includes_slurm_job_id_from_environ(tmp_path, monke
     mesh_shared = tmp_path / "mesh_shared"
 
     mesh_round._append_round_metrics(
-        mesh_shared, "run1", "node001", 1, 0.5, 0.4, 12.0, 3
+        mesh_shared, "run1", "node001", 1, 0.5, 0.4, 12.0, 3, 0.0015
     )
 
     lines = (
@@ -1287,6 +1292,7 @@ def test_append_round_metrics_includes_slurm_job_id_from_environ(tmp_path, monke
     )
     record = json.loads(lines[0])
     assert record["slurm_job_id"] == "987654"
+    assert record["lr"] == 0.0015
 
 
 def _run_with_step_capture(tmp_path, monkeypatch, *, mesh_cfg, rates):
@@ -1477,3 +1483,83 @@ def test_run_mesh_pretrain_stage_reproducible_across_ambient_rng_state(
     loss_a = _cold_start_recon_loss("a", ambient_seed=111)
     loss_b = _cold_start_recon_loss("b", ambient_seed=222)
     assert loss_a == loss_b
+
+
+def _mesh_env(tmp_path, monkeypatch, run_id="maskrun"):
+    """Minimal MESH_* setup for one cold-start round, mirroring the
+    cold-start test above."""
+    hostname = socket.gethostname().split(".", 1)[0]
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / f"shard_assignments_{run_id}.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+    monkeypatch.setenv("MESH_RUN_ID", run_id)
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(tmp_path / "ckpt"))
+
+
+def _mask_cfg(**model_kwargs):
+    return DictConfig(
+        {
+            "model": DictConfig({**_tiny_cfg(), **model_kwargs}),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 1,
+                "steps_per_round": 1,
+                "merge": False,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "model_kwargs,expected",
+    [
+        ({}, RandomTubeMasking),
+        ({"mask_type": "tube"}, RandomTubeMasking),
+        ({"mask_type": "frame"}, RandomFrameMasking),
+        ({"mask_type": "mixed"}, MixedTubeFrameMasking),
+        ({"motion_mask": True}, MotionGuidedTubeMasking),
+    ],
+)
+def test_mesh_round_honours_mask_type(tmp_path, monkeypatch, model_kwargs, expected):
+    """The mesh worker must select its masker from cfg.model.mask_type, the
+    same way pretrain.py does.
+
+    This is the only training path with data staged on the cluster, so the
+    mask_type x target_mode factorial runs through here. It previously
+    hardcoded RandomTubeMasking and honoured only motion_mask, which would
+    have silently collapsed the two `mixed` arms onto their `tube`
+    counterparts -- four jobs, two distinct conditions, no error.
+    """
+    _mesh_env(tmp_path, monkeypatch)
+    seen = []
+    real = mesh_round.build_masker
+
+    def spy(model_cfg):
+        masker = real(model_cfg)
+        seen.append(masker)
+        return masker
+
+    monkeypatch.setattr(mesh_round, "build_masker", spy)
+
+    run_mesh_pretrain_stage(_mask_cfg(**model_kwargs), device=torch.device("cpu"))
+
+    assert len(seen) == 1
+    assert isinstance(seen[0], expected)
+    assert seen[0].mask_ratio == 0.5

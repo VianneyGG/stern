@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -42,6 +43,10 @@ STATE_DIR = REPO_ROOT / "runs" / "state"
 RESULTS_DIR = REPO_ROOT / "runs" / "results"
 LOG_PATH = STATE_DIR / "watcher.log"
 LOCK_PATH = STATE_DIR / "watch_training.lock"
+HOST_PATH = STATE_DIR / "watcher_host"
+# Short name: systemd/SLURM report login-node, socket.gethostname() reports
+# login-node.polytechnique.fr. The designation file records the short form.
+HOSTNAME = socket.gethostname().split(".")[0]
 # Applies only to pending/ checkpoints whose run_id is not currently
 # configured -- an active run's own checkpoints are never touched
 # regardless of age. Generous relative to sync_timeout_s (1800s default) so
@@ -49,7 +54,33 @@ LOCK_PATH = STATE_DIR / "watch_training.lock"
 _ORPHANED_PENDING_MAX_AGE_S = 3600.0
 
 
+def is_designated_watcher(host_file: Path, hostname: str) -> bool:
+    """True when `hostname` is the host `host_file` designates as the watcher.
+
+    Both sides are reduced to their short name so a hand-edited file holding an
+    FQDN still matches. Raises OSError when the file is absent or unreadable --
+    the caller must fail closed rather than assume it is the designated host.
+    """
+    designated = host_file.read_text().strip().split(".")[0].lower()
+    return bool(designated) and designated == hostname.split(".")[0].lower()
+
+
 def main() -> int:
+    # Ahead of every side effect below -- STATE_DIR.mkdir and the open(LOCK_PATH,
+    # "w") that truncates a file shared over NFS both happen before flock is even
+    # attempted, so a guard placed any later would still let a decommissioned
+    # host clobber shared state once a minute.
+    try:
+        designated = is_designated_watcher(HOST_PATH, HOSTNAME)
+    except OSError as exc:
+        print(f"{HOST_PATH} unreadable, refusing to tick: {exc}", file=sys.stderr)
+        return 1
+    if not designated:
+        # stderr, not watcher.log: journald keeps it, and a minute-cadence line
+        # in the shared log would drown the records used to audit a migration.
+        print(f"{HOSTNAME} is not the designated watcher host", file=sys.stderr)
+        return 0
+
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -76,9 +107,9 @@ def main() -> int:
     # Mesh round advancement is unconditional -- not gated by the health-check
     # backoff timer below, since worker jobs push checkpoints and wait on sync
     # flags on their own schedule, independent of that cadence.
+    mesh_shared = Path(os.environ.get("MESH_SHARED", Path.home() / "stern_mesh"))
     run_configs = load_run_configs(STATE_DIR / "mesh_run_configs.json")
     if run_configs:
-        mesh_shared = Path(os.environ.get("MESH_SHARED", Path.home() / "stern_mesh"))
         try:
             mesh_actions = advance_all_runs(
                 run_configs,
@@ -157,6 +188,8 @@ def main() -> int:
         now=now,
         state=state,
         mesh_run_ids=frozenset(c.run_id for c in run_configs) | frozenset(state.runs),
+        mesh_shared=mesh_shared,
+        active_run_ids=frozenset(c.run_id for c in run_configs),
     )
     save_state(state_path, state)
     _log(
@@ -169,7 +202,7 @@ def _log(line: str) -> None:
     ts = datetime.now(timezone.utc).isoformat()
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a") as fh:
-        fh.write(f"{ts} {line}\n")
+        fh.write(f"{ts} [{HOSTNAME}] {line}\n")
 
 
 if __name__ == "__main__":

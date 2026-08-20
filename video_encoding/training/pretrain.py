@@ -27,10 +27,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 from video_encoding.data.loaders import build_ssl_loader
 from video_encoding.data.ssl_windows import SSLWindowDataset
 from video_encoding.models.videomaev2.masking import (
-    MixedTubeFrameMasking,
     MotionGuidedTubeMasking,
-    RandomFrameMasking,
     RandomTubeMasking,
+    build_masker,
 )
 from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
 from video_encoding.training import checkpoint as ckpt_io
@@ -50,17 +49,7 @@ def _build_masker(cfg: DictConfig):
     `motion_mask` predates `mask_type` and stays authoritative, so no existing
     config changes meaning when `mask_type` is absent.
     """
-    ratio = float(cfg.model.mask_ratio)
-    if bool(cfg.model.get("motion_mask", False)):
-        return MotionGuidedTubeMasking(mask_ratio=ratio)
-    mask_type = str(cfg.model.get("mask_type", "tube"))
-    if mask_type == "tube":
-        return RandomTubeMasking(mask_ratio=ratio)
-    if mask_type == "frame":
-        return RandomFrameMasking(mask_ratio=ratio)
-    if mask_type == "mixed":
-        return MixedTubeFrameMasking(mask_ratio=ratio)
-    raise ValueError(f"unknown mask_type {mask_type!r}: expected tube|frame|mixed")
+    return build_masker(cfg.model)
 
 
 def run_pretrain_stage(

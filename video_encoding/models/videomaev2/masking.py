@@ -227,3 +227,27 @@ class MotionGuidedTubeMasking:
         keep_indices, _ = torch.sort(keep_indices)
         mask_indices, _ = torch.sort(mask_indices)
         return keep_indices, mask_indices
+
+
+def build_masker(model_cfg):
+    """Select the masking strategy from a model config.
+
+    Lives here rather than in pretrain.py because both training entrypoints
+    need it and pretrain.py <-> mesh_round.py is already a real import cycle
+    (broken only by a function-local import); importing the selector from
+    either one into the other would tighten it.
+
+    `motion_mask` predates `mask_type` and stays authoritative, so no existing
+    config changes meaning when `mask_type` is absent.
+    """
+    ratio = float(model_cfg.mask_ratio)
+    if bool(model_cfg.get("motion_mask", False)):
+        return MotionGuidedTubeMasking(mask_ratio=ratio)
+    mask_type = str(model_cfg.get("mask_type", "tube"))
+    if mask_type == "tube":
+        return RandomTubeMasking(mask_ratio=ratio)
+    if mask_type == "frame":
+        return RandomFrameMasking(mask_ratio=ratio)
+    if mask_type == "mixed":
+        return MixedTubeFrameMasking(mask_ratio=ratio)
+    raise ValueError(f"unknown mask_type {mask_type!r}: expected tube|frame|mixed")
