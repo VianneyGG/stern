@@ -256,6 +256,7 @@ def _write_tb_scalars(
     round_num: int,
     n_workers: int,
     timeout_forced: bool,
+    alphas: dict[str, float],
 ) -> None:
     """Write this merge's contributor scalars, then replay any backlogged
     per-round scalars from the JSONL. Never raises -- diagnostics must
@@ -276,10 +277,12 @@ def _write_tb_scalars(
         writer = make_writer(tb_dir, rank=0)
         if writer is None:
             return
-        writer.add_scalar("mesh_merge/n_contributors", n_workers, round_num)
+        writer.add_scalar("merge/n_contributors", n_workers, round_num)
         writer.add_scalar(
-            "mesh_merge/timeout_forced", 1.0 if timeout_forced else 0.0, round_num
+            "merge/timeout_forced", 1.0 if timeout_forced else 0.0, round_num
         )
+        for node, alpha in sorted(alphas.items()):
+            writer.add_scalar(f"merge/alpha/{node}", alpha, round_num)
         new_last_round = write_mesh_round_scalars(
             writer, mesh_shared, run_id, last_round
         )
@@ -292,6 +295,33 @@ def _write_tb_scalars(
             f"run_outer_step: WARNING failed to write TB scalars to {tb_dir}: {exc}",
             file=sys.stderr,
         )
+
+
+def filter_nonfinite(
+    checkpoints: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Split off checkpoints carrying a nan/inf tensor.
+
+    A node that trains zero samples -- because it was assigned a shard it does
+    not hold -- produces nan weights while still reporting a perfectly healthy
+    val_loss, since val shards are replicated to every node and always resolve
+    locally. `_inverse_loss_weights` only ever checked val_loss, so on
+    2026-08-20 those weights averaged straight into master.pt and poisoned
+    every node in the pool. Averaging is not robust to this: one nan makes the
+    whole merged tensor nan regardless of its alpha.
+
+    Returns `(kept, dropped_names)`; the caller decides whether an empty
+    `kept` is fatal.
+    """
+    kept: dict[str, dict[str, Any]] = {}
+    dropped: list[str] = []
+    for name, ckpt in checkpoints.items():
+        sd = ckpt.get("delta_state_dict") or ckpt.get("model_state_dict") or {}
+        if all(torch.isfinite(t).all() for t in sd.values() if torch.is_tensor(t)):
+            kept[name] = ckpt
+        else:
+            dropped.append(name)
+    return kept, dropped
 
 
 def merge_round(
@@ -335,6 +365,21 @@ def merge_round(
     current_master_version = master_payload.get("master_version")
 
     checkpoints = _load_worker_checkpoints(pending_dir, run_id, round_num=round_num)
+    checkpoints, nonfinite = filter_nonfinite(checkpoints)
+    if nonfinite:
+        print(
+            f"run_outer_step: WARNING dropped {len(nonfinite)} checkpoint(s) with "
+            f"non-finite weights (run_id={run_id!r}): {sorted(nonfinite)}",
+            file=sys.stderr,
+        )
+    if not checkpoints:
+        raise ValueError(
+            f"merge_round: every worker checkpoint for run_id={run_id!r} has "
+            f"non-finite weights ({sorted(nonfinite)}) -- refusing to merge. A "
+            "worker training zero samples reports train_loss=nan while its "
+            "val_loss stays healthy, so re-run validate_seeding.py before "
+            "restarting this run."
+        )
     checkpoints, stale = filter_stale_deltas(checkpoints, current_master_version)
     if stale:
         print(
@@ -504,6 +549,7 @@ def main(argv: list[str] | None = None) -> int:
             round_num=args.round_num,
             n_workers=result["n_workers"],
             timeout_forced=args.timeout_forced,
+            alphas=result["alphas"],
         )
 
     print(

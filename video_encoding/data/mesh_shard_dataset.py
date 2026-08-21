@@ -31,7 +31,6 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from video_encoding.data.wds_frames import load_shard_index, read_shard_frames_at
 from video_encoding.data.windows import window_starts
-from video_encoding.mesh.fetch import fetch_shard
 from video_encoding.mesh.shard_map import Holder
 from video_encoding.models.videomaev2.encoder import preprocess_window
 
@@ -46,10 +45,12 @@ def resolve_shard(
     """Locate `shard` on local disk, preferring the permanent seeded copy.
 
     Fall-through order: seeded (`mesh_root/shard`) -> already-cached
-    (`mesh_root/cache/shard`) -> fetch via P2P into `mesh_root/cache/`.
-    Only the seeded copy is reported as `was_fetched=False`: both the
-    already-cached and the freshly-fetched cases live under `cache/` and
-    must be evicted after use.
+    (`mesh_root/cache/shard`) -> FileNotFoundError. Only the seeded copy is
+    reported as `was_fetched=False`; a leftover `cache/` entry still counts
+    as fetched and is evicted after use.
+
+    Raises FileNotFoundError if the shard is absent. There is deliberately
+    no P2P fetch: see the comment in the body.
     """
     mesh_root = Path(mesh_root)
 
@@ -62,8 +63,16 @@ def resolve_shard(
     if cached_path.exists():
         return cached_path, True
 
-    fetched_path = fetch_shard(shard, shard_map, subnet, cache_dir)
-    return fetched_path, True
+    # No P2P fallback. Assignment is static -- a node is only ever given
+    # shards it verifiably holds -- so reaching here means the assignment
+    # disagrees with the disk, and fetching would paper over that exactly
+    # as it did before 2026-08-20, when nothing was serving and every miss
+    # became a silently skipped shard.
+    raise FileNotFoundError(
+        f"resolve_shard: {shard!r} is not present under {mesh_root} and no "
+        "fetch fallback exists. The shard assignment disagrees with this "
+        "node's disk -- re-run validate_seeding.py."
+    )
 
 
 def evict_if_fetched(path: Path, mesh_root: Path) -> None:

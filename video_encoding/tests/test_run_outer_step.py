@@ -959,8 +959,52 @@ def test_tb_dir_writes_merge_contributor_scalars_and_replays_jsonl(
     assert rc == 0
     assert replay_calls == [(pending_dir.parent.parent, "run1", 0)]
     tags = {c[0]: c for c in recording_writer.calls}
-    assert tags["mesh_merge/n_contributors"] == ("mesh_merge/n_contributors", 2, 2)
-    assert tags["mesh_merge/timeout_forced"] == ("mesh_merge/timeout_forced", 0.0, 2)
+    assert tags["merge/n_contributors"] == ("merge/n_contributors", 2, 2)
+    assert tags["merge/timeout_forced"] == ("merge/timeout_forced", 0.0, 2)
+
+
+def test_tb_dir_writes_per_node_alpha_scalars(tmp_path, monkeypatch):
+    pending_dir = tmp_path / "mesh_shared" / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+    tb_dir = tmp_path / "tb"
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_2_a.pt", 0.0, n_samples=100)
+    _write_worker(pending_dir / "run1_2_b.pt", 2.0, n_samples=300)
+
+    monkeypatch.setattr(
+        "video_encoding.scripts.run_outer_step.write_mesh_round_scalars",
+        lambda writer, mesh_shared, run_id, last_round: 0,
+    )
+    recording_writer = _RecordingWriter()
+    monkeypatch.setattr(
+        "video_encoding.scripts.run_outer_step.make_writer",
+        lambda log_dir, rank=0: recording_writer,
+    )
+
+    rc = main(
+        _cli_argv(
+            pending_dir,
+            master_path,
+            momentum_path,
+            "run1",
+            extra=[
+                "--round",
+                "2",
+                "--allow-missing-momentum",
+                "--tb-dir",
+                str(tb_dir),
+            ],
+        )
+    )
+
+    assert rc == 0
+    tags = {c[0]: c[1] for c in recording_writer.calls}
+    # data weighting: a's alpha=100/400=0.25, b's alpha=300/400=0.75
+    assert tags["merge/alpha/a"] == 0.25
+    assert tags["merge/alpha/b"] == 0.75
 
 
 def test_tb_dir_persists_last_round_sidecar_after_replay(tmp_path, monkeypatch):
@@ -1091,3 +1135,61 @@ def test_tb_dir_omitted_creates_no_tb_directory(tmp_path):
 
     assert rc == 0
     assert not tb_dir.exists()
+
+
+# --- NaN checkpoints must never reach the master ---------------------------
+
+
+def test_merge_drops_a_worker_whose_weights_are_nan(tmp_path):
+    """The 2026-08-20 fault's silent half.
+
+    A node assigned shards it did not hold trained zero samples, so its
+    train_loss was nan -- while its val_loss stayed a healthy real number
+    (val shards are replicated to every node and always resolved locally).
+    The only finiteness check in the merge looked at val_loss, so the nan
+    weights averaged straight into master.pt and poisoned every node.
+    """
+    pending = tmp_path / "pending"
+    pending.mkdir()
+    _write_master(tmp_path / "master.pt", 0.0)
+    _write_worker(pending / "RUN_1_good.pt", 2.0, n_samples=100, val_loss=1.0)
+    _write_worker(pending / "RUN_1_nan.pt", float("nan"), n_samples=100, val_loss=1.0)
+
+    result = merge_round(
+        pending,
+        tmp_path / "master.pt",
+        tmp_path / "momentum.pt",
+        run_id="RUN",
+        lr=1.0,
+        momentum=0.0,
+        round_num=1,
+        allow_missing_momentum=True,
+    )
+
+    assert result["n_workers"] == 1
+    assert "RUN_1_nan" not in result["alphas"]
+    master = torch.load(tmp_path / "master.pt", weights_only=False)
+    for tensor in master["model_state_dict"].values():
+        assert torch.isfinite(tensor).all()
+
+
+def test_merge_refuses_a_round_where_every_worker_is_nan(tmp_path):
+    """Dropping the last healthy worker would silently merge nothing and
+    advance the round, which reads as progress. Fail the round instead."""
+    pending = tmp_path / "pending"
+    pending.mkdir()
+    _write_master(tmp_path / "master.pt", 0.0)
+    _write_worker(pending / "RUN_1_a.pt", float("nan"), n_samples=100)
+    _write_worker(pending / "RUN_1_b.pt", float("inf"), n_samples=100)
+
+    with pytest.raises(ValueError, match="non-finite"):
+        merge_round(
+            pending,
+            tmp_path / "master.pt",
+            tmp_path / "momentum.pt",
+            run_id="RUN",
+            lr=1.0,
+            momentum=0.0,
+            round_num=1,
+            allow_missing_momentum=True,
+        )

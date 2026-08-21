@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from video_encoding.mesh.shard_map import Holder, save_shard_map
 from video_encoding.watcher.epoch_advance import exclude_node
 from video_encoding.watcher.mesh_tick import (
     MeshRunConfig,
@@ -97,12 +96,33 @@ def test_meshrunconfig_extra_overrides_round_trips_through_load_run_configs(tmp_
 
 
 def _seed_shard_map(mesh_shared) -> None:
-    """9 shards, all seeded on node001 -- phase-1 locality then spreads the
-    remaining 6 across node002/node003 in assign_locality_first's phase 2."""
-    shard_map = {
-        f"shard-{i:06d}.tar": [Holder(host="node001", subnet="/254")] for i in range(9)
-    }
-    save_shard_map(mesh_shared / "metadata" / "shard_map.json", shard_map)
+    """9 shards spread 3-per-node across the roster.
+
+    Assignment is now static -- a node is only ever given shards it verifiably
+    holds -- so the fixture records real per-node holdings rather than piling
+    everything on node001 and relying on a remainder-fill phase to spread it.
+    shard_map.json is still written for the paths that have not migrated off
+    it yet (fetch, reassign_failed).
+    """
+    shards = [f"shard-{i:06d}.tar" for i in range(9)]
+    holdings = {node: shards[i::3] for i, node in enumerate(_NODES)}
+    _seed_placement(mesh_shared, holdings, shards)
+
+
+def _seed_placement(mesh_shared, holdings, shards=None) -> None:
+    """Write verified_holdings.json (+ manifest) -- the only shard-location truth.
+
+    Both `_do_assigning` and the `reassign_failed` handoff read this now;
+    shard_map.json is no longer consulted by any watcher path.
+    """
+    if shards is None:
+        shards = sorted({s for ss in holdings.values() for s in ss})
+    metadata = mesh_shared / "metadata"
+    metadata.mkdir(parents=True, exist_ok=True)
+    (metadata / "verified_holdings.json").write_text(json.dumps({"fish": holdings}))
+    (metadata / "shard_manifest.json").write_text(
+        json.dumps({"train": {name: 100 for name in shards}, "val": {}})
+    )
 
 
 def test_assigning_writes_assignments_file_and_submits_jobs(tmp_path):
@@ -962,6 +982,31 @@ def test_syncing_reaches_done_at_final_round(tmp_path):
     assert state.run("RUN1").status == "DONE"
 
 
+def test_syncing_flushes_final_tb_rounds_on_done(tmp_path):
+    """No merge cycle follows DONE, so the round(s) write_mesh_round_scalars's
+    straggler holdback left pending on the live run must be flushed here --
+    otherwise a finished run's TB curve is permanently short its last round(s)."""
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config(rounds=3)
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 2  # entering the final round's sync
+
+    with patch("video_encoding.watcher.mesh_tick.flush_final_tb_rounds") as mock_flush:
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    expected_tb_dir = Path(os.environ["MESH_LOCAL_ROOT"]) / "RUN1" / "tb"
+    mock_flush.assert_called_once_with(expected_tb_dir, mesh_shared, "RUN1")
+    assert state.run("RUN1").status == "DONE"
+
+
 def test_syncing_transfers_results_to_node089_on_done(tmp_path):
     mesh_shared = tmp_path / "mesh_shared"
     run_config = _run_config(rounds=3)
@@ -1375,12 +1420,17 @@ def test_replenish_pool_appends_idle_node_and_reassigns_shards(tmp_path):
     run.round = 4
     exclude_node(state, "node003", "crash-loop: missed 2 consecutive rounds of RUN1")
 
-    shard_map = {
-        "s1": [Holder(host="node001", subnet="/254")],
-        "s2": [Holder(host="node002", subnet="/254")],
-        "s3": [Holder(host="node003", subnet="/254")],
-    }
-    save_shard_map(mesh_shared / "metadata" / "shard_map.json", shard_map)
+    # node004 (the idle replacement) also holds s3 -- a replacement can only
+    # inherit shards it physically has, so it is the least-loaded real holder.
+    _seed_placement(
+        mesh_shared,
+        {
+            "node001": ["s1", "s3"],
+            "node002": ["s2", "s3"],
+            "node003": ["s3"],
+            "node004": ["s3"],
+        },
+    )
     assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
     assignments_path.write_text(
         json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]})
@@ -1467,11 +1517,7 @@ def test_replenish_pool_does_not_submit_a_replacement_with_no_shards_to_inherit(
     run.target_pool_size = 3
     exclude_node(state, "node003", "crash-loop")
 
-    shard_map = {
-        "s1": [Holder(host="node001", subnet="/254")],
-        "s2": [Holder(host="node002", subnet="/254")],
-    }
-    save_shard_map(mesh_shared / "metadata" / "shard_map.json", shard_map)
+    _seed_placement(mesh_shared, {"node001": ["s1"], "node002": ["s2"]})
     assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
     # node003 has NO entry at all -- e.g. it was itself a prior replacement
     # that fell into this same gap, or assign_locality_first never gave it
@@ -1536,11 +1582,7 @@ def test_replenish_pool_does_not_submit_a_replacement_for_an_empty_shard_list(
     run.target_pool_size = 3
     exclude_node(state, "node003", "crash-loop")
 
-    shard_map = {
-        "s1": [Holder(host="node001", subnet="/254")],
-        "s2": [Holder(host="node002", subnet="/254")],
-    }
-    save_shard_map(mesh_shared / "metadata" / "shard_map.json", shard_map)
+    _seed_placement(mesh_shared, {"node001": ["s1"], "node002": ["s2"]})
     assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
     assignments_path.write_text(
         json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": []})
@@ -1657,12 +1699,11 @@ def test_replenish_pool_reassigns_shards_when_no_idle_nodes_available(tmp_path):
     run.target_pool_size = 3
     exclude_node(state, "node003", "crash-loop")
 
-    shard_map = {
-        "s1": [Holder(host="node001", subnet="/254")],
-        "s2": [Holder(host="node002", subnet="/254")],
-        "s3": [Holder(host="node003", subnet="/254")],
-    }
-    save_shard_map(mesh_shared / "metadata" / "shard_map.json", shard_map)
+    # node001 holds a replica of s3, so the handoff has a real destination.
+    _seed_placement(
+        mesh_shared,
+        {"node001": ["s1", "s3"], "node002": ["s2"], "node003": ["s3"]},
+    )
     assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
     assignments_path.write_text(
         json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]})
@@ -1722,12 +1763,11 @@ def test_replenish_pool_reassigns_shards_when_deficit_zero(tmp_path):
     run.target_pool_size = 3  # 4 - 1 excluded = 3, meets target -> deficit 0
     exclude_node(state, "node003", "crash-loop")
 
-    shard_map = {
-        "s1": [Holder(host="node001", subnet="/254")],
-        "s2": [Holder(host="node002", subnet="/254")],
-        "s3": [Holder(host="node003", subnet="/254")],
-    }
-    save_shard_map(mesh_shared / "metadata" / "shard_map.json", shard_map)
+    # node001 holds a replica of s3, so the handoff has a real destination.
+    _seed_placement(
+        mesh_shared,
+        {"node001": ["s1", "s3"], "node002": ["s2"], "node003": ["s3"]},
+    )
     assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
     assignments_path.write_text(
         json.dumps(
@@ -1816,12 +1856,8 @@ def test_do_awaiting_checkpoints_triggers_replenish_on_new_exclusion(tmp_path):
         path.write_text("x")
         os.utime(path, (old_mtime, old_mtime))
 
-    save_shard_map(
-        mesh_shared / "metadata" / "shard_map.json",
-        {
-            "s1": [Holder(host="node001", subnet="/254")],
-            "s2": [Holder(host="node003", subnet="/254")],
-        },
+    _seed_placement(
+        mesh_shared, {"node001": ["s1", "s2"], "node002": [], "node003": ["s2"]}
     )
     # node003 must have a real shard to hand off -- an empty list would
     # correctly block replenishment (0.4's fix), which is not what this
@@ -2187,3 +2223,101 @@ def test_sweep_orphaned_pending_never_touches_an_active_runs_files(tmp_path):
 
     assert swept == 0
     assert active.exists()
+
+
+def _seed_holdings(mesh_shared, holdings, shards=None) -> None:
+    shards = shards or sorted({s for v in holdings.values() for s in v})
+    metadata = mesh_shared / "metadata"
+    metadata.mkdir(parents=True, exist_ok=True)
+    (metadata / "verified_holdings.json").write_text(json.dumps({"fish": holdings}))
+    (metadata / "shard_manifest.json").write_text(
+        json.dumps({"train": {name: 100 for name in shards}, "val": {}})
+    )
+
+
+def test_assigning_never_gives_a_node_a_shard_it_does_not_hold(tmp_path):
+    """The 2026-08-20 regression test at the coordinator level: node055 was
+    assigned 19 shards it held none of, fetched nothing, and trained zero
+    samples while reporting a warning."""
+    mesh_shared = tmp_path / "mesh_shared"
+    holdings = {
+        "node001": ["shard-000000.tar", "shard-000001.tar"],
+        "node002": ["shard-000002.tar"],
+        "node003": ["shard-000003.tar"],
+    }
+    _seed_holdings(mesh_shared, holdings)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 101\n")
+    with patch("video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake):
+        advance_one_run(
+            _run_config(),
+            state=WatcherState(),
+            repo_root=repo_root,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path / "mesh_root",
+            now=1000.0,
+        )
+
+    assignments = json.loads(
+        (mesh_shared / "metadata" / "shard_assignments_RUN1.json").read_text()
+    )
+    for node, shards in assignments.items():
+        assert set(shards) <= set(holdings[node])
+
+
+def test_assigning_skips_a_node_that_holds_no_shards(tmp_path):
+    """node017, node069 and five birds nodes hold nothing. Submitting a worker
+    there burns a GPU at 0 samp/s and stalls the round waiting for a push
+    that never comes."""
+    mesh_shared = tmp_path / "mesh_shared"
+    _seed_holdings(
+        mesh_shared,
+        {
+            "node001": ["shard-000000.tar", "shard-000001.tar"],
+            "node002": ["shard-000002.tar"],
+            "node003": [],
+        },
+    )
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 101\n")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        action = advance_one_run(
+            _run_config(),
+            state=WatcherState(),
+            repo_root=repo_root,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path / "mesh_root",
+            now=1000.0,
+        )
+
+    assert mock_run.call_count == 2, "a shardless node must not get a worker job"
+    assignments = json.loads(
+        (mesh_shared / "metadata" / "shard_assignments_RUN1.json").read_text()
+    )
+    assert "node003" not in assignments
+    assert "node003" in action and "holding no shards" in action
+
+
+def test_assigning_refuses_to_launch_onto_an_unvalidated_pool(tmp_path):
+    """No verified_holdings.json means nobody has checked what is on disk.
+    Inferring assignment from a placement plan is what went stale."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "metadata").mkdir(parents=True)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="validate_seeding"):
+        advance_one_run(
+            _run_config(),
+            state=WatcherState(),
+            repo_root=repo_root,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path / "mesh_root",
+            now=1000.0,
+        )

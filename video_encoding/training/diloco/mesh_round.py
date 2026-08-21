@@ -100,6 +100,9 @@ def _append_round_metrics(
     samp_s: float,
     n_shards: int,
     lr: float,
+    *,
+    n_samples: int,
+    n_steps: int,
 ) -> None:
     """Append one JSONL record to mesh_shared/metrics/<run_id>/<node>.jsonl.
 
@@ -118,6 +121,11 @@ def _append_round_metrics(
         "samp_s": samp_s,
         "n_shards": n_shards,
         "lr": lr,
+        # Exact counts, not samp_s x round_budget_s: the inferred axis is
+        # wrong for a fetch-starved node, which is what a scaling sweep
+        # measures.
+        "n_samples": n_samples,
+        "n_steps": n_steps,
         "ts": time.time(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
     }
@@ -151,6 +159,33 @@ def _resolve_subnet(hostname: str, cfg: DictConfig) -> str:
     about (e.g. a manual test run off the real roster).
     """
     return NODE_SUBNETS.get(hostname, str(cfg.mesh.get("subnet", "/254")))
+
+
+def _require_local_shards(
+    shard_names: list[str], mesh_root: Path, *, run_id: str, node: str
+) -> None:
+    """Exit non-zero if this node was assigned a shard it does not hold.
+
+    Assignment is static (mesh/assignment.py::assign_static), so this can
+    only fire when the assignment file disagrees with the disk -- the exact
+    condition that ran undetected for two weeks before 2026-08-20, because
+    the only symptom was a skipped-shard WARNING and a zero-sample round
+    that the worker treated as "not a failure".
+
+    A worker that cannot train on what it was given must die loudly at
+    startup, not spend the round burning a GPU at 0 samp/s.
+    """
+    absent = [name for name in shard_names if not (mesh_root / name).exists()]
+    if not absent:
+        return
+    raise SystemExit(
+        f"mesh_round: node {node!r} (run {run_id!r}) was assigned "
+        f"{len(absent)} of {len(shard_names)} shard(s) it does not hold: "
+        + ", ".join(absent[:10])
+        + (" ..." if len(absent) > 10 else "")
+        + f" -- {mesh_root} is out of sync with the shard assignment. "
+        "Re-run validate_seeding.py; do not restart this worker."
+    )
 
 
 def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
@@ -204,6 +239,7 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
 
     shard_map = load_shard_map(shard_map_path)
     train_shard_names = read_my_shards(assignments_path, node)
+    _require_local_shards(train_shard_names, mesh_root, run_id=run_id, node=node)
     train_dataset = MeshShardIterableDataset(
         train_shard_names,
         mesh_root=mesh_root,
@@ -474,6 +510,8 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             train_stats["samples_per_s_per_gpu"],
             len(train_shard_names),
             lr,
+            n_samples=train_stats["samples"],
+            n_steps=train_stats["steps"],
         )
 
     return {

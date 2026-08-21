@@ -28,19 +28,17 @@ from pathlib import Path
 
 import torch
 
-from video_encoding.mesh.assignment import assign_locality_first, reassign_failed
+from video_encoding.mesh.assignment import (
+    assign_static,
+    reassign_failed,
+)
 from video_encoding.mesh.pending_files import (
     pending_files_for_round,
 )
 from video_encoding.mesh.quorum import ready_for_merge
-from video_encoding.mesh.scoring import (
-    NodeInfo,
-    compute_effective_weights,
-    compute_shard_counts,
-)
-from video_encoding.mesh.shard_map import Holder, load_shard_map
-from video_encoding.mesh.topology import NODE_GROUPS, NODE_SUBNETS
+from video_encoding.mesh.topology import NODE_GROUPS
 from video_encoding.training import checkpoint as ckpt_io
+from video_encoding.training.tb_logger import flush_final_tb_rounds
 from video_encoding.watcher.cluster import query_idle_nodes
 from video_encoding.watcher.epoch_advance import (
     candidate_replacements,
@@ -91,7 +89,7 @@ class MeshRunConfig:
     n_shards: int
     outer_lr: float
     outer_momentum: float
-    weighting: str  # "data" | "inverse_loss"
+    weighting: str  # "data" | "inverse_loss" | "token"
     rounds: int
     merge: bool = True  # False for the ab-single_node reference arm
     # "fp32" or "fp16" (default) for the master.pt every worker reads back
@@ -218,17 +216,6 @@ def advance_one_run(
 # --- ASSIGNING -------------------------------------------------------------
 
 
-def _invert_placement(shard_map: dict[str, list[Holder]]) -> dict[str, list[str]]:
-    """`shard -> [Holder, ...]` (shard_map.py's schema) to `host -> [shard, ...]`
-    (assign_locality_first's `placement` schema), in shard_map iteration order.
-    """
-    placement: dict[str, list[str]] = {}
-    for shard, holders in shard_map.items():
-        for holder in holders:
-            placement.setdefault(holder.host, []).append(shard)
-    return placement
-
-
 def _parse_submitted_job_id(stdout: str) -> str | None:
     """Mirrors remediate_dead_job's "Submitted batch job N" parsing."""
     for line in stdout.splitlines():
@@ -294,6 +281,67 @@ def _submit_worker_job(
     return job_id
 
 
+def _verified_holdings(mesh_shared: Path) -> dict[str, list[str]]:
+    """`{node: [shard, ...]}` of what each node *physically holds*.
+
+    Read from verified_holdings.json, which validate_seeding.py writes from
+    a live `ls` of every node. This is the mesh's only source of truth about
+    shard location. The old shard_map.json was a placement *plan* -- what
+    seeding intended -- and was never reconciled with what seeding achieved;
+    by 2026-08-21 it was 1062/1113 false, which is what let a node be handed
+    89 shards it did not have.
+
+    Raises FileNotFoundError if the pool has never been validated.
+    """
+    holdings_path = mesh_shared / "metadata" / "verified_holdings.json"
+    if not holdings_path.exists():
+        raise FileNotFoundError(
+            f"{holdings_path} missing -- run validate_seeding.py before launching. "
+            "Shard location is never inferred from a placement plan."
+        )
+    # Keyed by pool; a run's roster may span only part of one, so flatten.
+    by_node: dict[str, list[str]] = {}
+    for pool_holdings in json.loads(holdings_path.read_text()).values():
+        for node, shards in pool_holdings.items():
+            by_node[node] = list(shards)
+    return by_node
+
+
+def _static_assignments(
+    nodes: list[str], mesh_shared: Path
+) -> tuple[dict[str, list[str]], str]:
+    """Partition the shards `nodes` actually hold, from verified_holdings.json.
+
+    The expected set is the union of this roster's own verified holdings
+    intersected with the golden manifest -- not the full 260. A roster that
+    is a subset of its tier trains what that subset collectively has, and the
+    resulting coverage is reported so a degraded round is visible rather than
+    silent. Asking for shards nobody in the roster holds is what produced the
+    2026-08-20 incident, so it is not expressible here.
+
+    Raises FileNotFoundError if the pool has never been validated -- an
+    unvalidated pool must not launch.
+    """
+    manifest_path = mesh_shared / "metadata" / "shard_manifest.json"
+    by_node = _verified_holdings(mesh_shared)
+    roster = {node: by_node.get(node, []) for node in nodes}
+
+    golden: set[str] | None = None
+    if manifest_path.exists():
+        golden = set(json.loads(manifest_path.read_text()).get("train", {}))
+
+    expected: set[str] = set()
+    for shards in roster.values():
+        expected |= set(shards)
+    if golden is not None:
+        expected &= golden
+
+    assignments = assign_static(roster, expected)
+    total = len(golden) if golden else len(expected)
+    note = f"coverage {len(expected)}/{total}" if total else "coverage 0/0"
+    return assignments, note
+
+
 def _do_assigning(
     run_config: MeshRunConfig,
     run: RunState,
@@ -312,22 +360,19 @@ def _do_assigning(
 
     deleted = _clean_stale_run_artifacts(run_config.run_id, mesh_shared)
 
-    shard_map = load_shard_map(mesh_shared / "metadata" / "shard_map.json")
-    placement = _invert_placement(shard_map)
-    all_shards = list(shard_map)
+    assignments, coverage_note = _static_assignments(eligible, mesh_shared)
 
-    nodes_info = [
-        NodeInfo(
-            hostname=host,
-            group=NODE_GROUPS[host],
-            subnet=NODE_SUBNETS[host],
-            free_gb=0.0,  # not consumed by effective_weight -- mesh/scoring.py
+    # A node holding nothing would train zero samples and stall the round --
+    # exactly the 2026-08-20 failure. Drop it from this round instead.
+    starved = [node for node in eligible if not assignments.get(node)]
+    if starved:
+        eligible = [node for node in eligible if assignments.get(node)]
+        assignments = {node: assignments[node] for node in eligible}
+    if not eligible:
+        return (
+            f"{run_config.run_id}: ASSIGNING skipped -- no eligible node holds "
+            "any shard (pool is unseeded)"
         )
-        for host in eligible
-    ]
-    weights = compute_effective_weights(nodes_info)
-    shard_counts = compute_shard_counts(weights, run_config.n_shards)
-    assignments = assign_locality_first(shard_counts, placement, all_shards)
 
     assignments_path = (
         mesh_shared / "metadata" / f"shard_assignments_{run_config.run_id}.json"
@@ -342,6 +387,11 @@ def _do_assigning(
     run.status = "RUNNING"
     run.round_started_at = now
     action = f"{run_config.run_id}: ASSIGNING -> RUNNING ({len(eligible)} nodes)"
+    action += f"; {coverage_note}"
+    if starved:
+        action += f"; skipped {len(starved)} node(s) holding no shards: " + ", ".join(
+            starved
+        )
     if deleted:
         action += f"; cleaned {len(deleted)} stale artifact(s) from a prior attempt"
     return action
@@ -566,7 +616,6 @@ def _replenish_pool(
     picked: list[str] = []
     replenish_note: str | None = None
 
-    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
     assignments_path = (
         mesh_shared / "metadata" / f"shard_assignments_{run_config.run_id}.json"
     )
@@ -619,14 +668,23 @@ def _replenish_pool(
 
     reassign_note = None
     if assignments is not None and excluded_node in assignments:
-        placement = _invert_placement(load_shard_map(shard_map_path))
+        placement = _verified_holdings(mesh_shared)
         for node in picked:
             assignments.setdefault(node, [])
-        assignments = reassign_failed(excluded_node, assignments, placement)
+        assignments, dropped = reassign_failed(
+            excluded_node, assignments, placement
+        )
         _write_json_atomic(assignments_path, assignments)
         reassign_note = (
             f"{run_config.run_id}: reassigned {excluded_node}'s shards to survivors"
         )
+        if dropped:
+            # Coverage genuinely shrank: no survivor holds these. Say so --
+            # the alternative is handing them to a node that cannot open them.
+            reassign_note += (
+                f"; dropped {len(dropped)} shard(s) no survivor holds "
+                f"({', '.join(dropped[:5])}{' ...' if len(dropped) > 5 else ''})"
+            )
 
     notes = [n for n in (replenish_note, reassign_note) if n]
     return "; ".join(notes) if notes else None
@@ -930,6 +988,14 @@ def _do_syncing(
 
     if run.round >= run_config.rounds:
         run.status = "DONE"
+        # No merge cycle is coming next to flush the round(s) that
+        # write_mesh_round_scalars's straggler holdback always leaves
+        # pending on a live run -- final=True catches those up now.
+        flush_final_tb_rounds(
+            _mesh_local_root() / run_config.run_id / "tb",
+            mesh_shared,
+            run_config.run_id,
+        )
         _stage_local_merge_state_for_archive(run_config, mesh_shared)
         transfer_note = _transfer_results_to_node089(run_config, mesh_shared)
         swept = _sweep_pending_checkpoints(run_config.run_id, mesh_shared)

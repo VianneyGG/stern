@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import pytest
+
+from video_encoding.mesh.assignment import assign_static
+
+
+def test_every_expected_shard_is_assigned_exactly_once():
+    holdings = {
+        "node001": ["shard-a", "shard-b"],
+        "node002": ["shard-b", "shard-c"],
+    }
+    result = assign_static(holdings, {"shard-a", "shard-b", "shard-c"})
+
+    assigned = [s for shards in result.values() for s in shards]
+    assert sorted(assigned) == ["shard-a", "shard-b", "shard-c"]
+    assert len(assigned) == len(set(assigned)), "a shard was assigned twice"
+
+
+def test_a_node_is_only_ever_assigned_shards_it_physically_holds():
+    """The whole point: attribution can no longer disagree with reality."""
+    holdings = {
+        "node001": ["shard-a", "shard-b"],
+        "node002": ["shard-c"],
+    }
+    result = assign_static(holdings, {"shard-a", "shard-b", "shard-c"})
+
+    for node, shards in result.items():
+        assert set(shards) <= set(holdings[node]), f"{node} assigned a shard it lacks"
+
+
+def test_a_replicated_shard_goes_to_exactly_one_of_its_holders():
+    holdings = {"node001": ["shard-a"], "node002": ["shard-a"], "node004": ["shard-a"]}
+    result = assign_static(holdings, {"shard-a"})
+
+    owners = [n for n, shards in result.items() if "shard-a" in shards]
+    assert len(owners) == 1
+    assert owners[0] in holdings
+
+
+def test_load_is_balanced_across_holders_rather_than_dumped_on_the_first():
+    """Rounds are time-budgeted, so a node handed 3x its share of the data
+    simply trains less of it -- the imbalance shows up as silently skipped
+    data, not as a longer round."""
+    shards = [f"shard-{i:03d}" for i in range(30)]
+    holdings = {"node001": list(shards), "node002": list(shards), "node004": list(shards)}
+    result = assign_static(holdings, set(shards))
+
+    counts = sorted(len(v) for v in result.values())
+    assert counts == [10, 10, 10]
+
+
+def test_a_node_holding_nothing_gets_an_empty_assignment_not_a_missing_key():
+    """node017, node030, node069 and friends hold zero shards. They must
+    appear in the assignment as empty rather than vanish -- the watcher
+    reads this file to decide who to submit."""
+    holdings = {"node001": ["shard-a"], "node017": []}
+    result = assign_static(holdings, {"shard-a"})
+
+    assert result["node017"] == []
+    assert result["node001"] == ["shard-a"]
+
+
+def test_an_expected_shard_no_node_holds_raises_naming_it():
+    """This is the 2026-08-20 incident as a unit test: node055 was assigned 19
+    shards it did not hold. That must now be impossible to express."""
+    holdings = {"node001": ["shard-a"]}
+    with pytest.raises(ValueError) as exc:
+        assign_static(holdings, {"shard-a", "shard-b"})
+    assert "shard-b" in str(exc.value)
+
+
+def test_shards_held_but_not_expected_are_left_unassigned():
+    """A leftover from an older seeding is not training data."""
+    holdings = {"node001": ["shard-a", "shard-stale"]}
+    result = assign_static(holdings, {"shard-a"})
+    assert result["node001"] == ["shard-a"]
+
+
+def test_assignment_is_deterministic_across_calls():
+    holdings = {
+        "node001": ["shard-a", "shard-b", "shard-c"],
+        "node002": ["shard-a", "shard-b", "shard-c"],
+    }
+    expected = {"shard-a", "shard-b", "shard-c"}
+    assert assign_static(holdings, expected) == assign_static(holdings, expected)
+
+
+def test_output_is_json_round_trippable():
+    """It is written to shard_assignments_<run_id>.json and read back by
+    the worker."""
+    import json
+
+    result = assign_static({"node001": ["shard-a"]}, {"shard-a"})
+    assert json.loads(json.dumps(result)) == result

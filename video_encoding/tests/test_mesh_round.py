@@ -1094,6 +1094,10 @@ def test_run_mesh_pretrain_stage_writes_one_round_metrics_line(tmp_path, monkeyp
     assert record["node"] == hostname
     assert record["round"] == 1  # 1-based, matching the printed "round 1/1" line
     assert record["n_shards"] == 1  # matches len(assignments[hostname])
+    # The exact compute axis comes from train_stats, not from the printed
+    # throughput -- one window, one step, for this single-window fixture.
+    assert record["n_samples"] == 1
+    assert record["n_steps"] == 1
     assert math.isfinite(record["train_loss"])
     # val_loss is nan here -- this fixture seeds no val shards (val_root
     # never exists), same as every other run_mesh_pretrain_stage test in
@@ -1273,7 +1277,17 @@ def test_append_round_metrics_swallows_unwritable_metrics_dir(tmp_path):
     (mesh_shared / "metrics").write_text("not a directory")
 
     mesh_round._append_round_metrics(
-        mesh_shared, "run1", "node001", 1, 0.5, 0.4, 12.0, 3, 0.0015
+        mesh_shared,
+        "run1",
+        "node001",
+        1,
+        0.5,
+        0.4,
+        12.0,
+        3,
+        0.0015,
+        n_samples=64,
+        n_steps=2,
     )  # must not raise
 
     assert (mesh_shared / "metrics").is_file()  # untouched, still a plain file
@@ -1284,7 +1298,17 @@ def test_append_round_metrics_includes_slurm_job_id_from_environ(tmp_path, monke
     mesh_shared = tmp_path / "mesh_shared"
 
     mesh_round._append_round_metrics(
-        mesh_shared, "run1", "node001", 1, 0.5, 0.4, 12.0, 3, 0.0015
+        mesh_shared,
+        "run1",
+        "node001",
+        1,
+        0.5,
+        0.4,
+        12.0,
+        3,
+        0.0015,
+        n_samples=64,
+        n_steps=2,
     )
 
     lines = (
@@ -1563,3 +1587,52 @@ def test_mesh_round_honours_mask_type(tmp_path, monkeypatch, model_kwargs, expec
     assert len(seen) == 1
     assert isinstance(seen[0], expected)
     assert seen[0].mask_ratio == 0.5
+
+
+def test_append_round_metrics_records_exact_sample_and_step_counts(tmp_path):
+    """The scaling analysis needs a measured compute axis: `samp_s *
+    round_budget_s` is an inference that is wrong for exactly the
+    fetch-starved low-node-count cells the sweep characterises."""
+    mesh_shared = tmp_path / "mesh_shared"
+
+    mesh_round._append_round_metrics(
+        mesh_shared,
+        "run1",
+        "node001",
+        7,
+        0.5,
+        0.4,
+        12.0,
+        3,
+        0.0015,
+        n_samples=4096,
+        n_steps=150,
+    )
+
+    lines = (
+        (mesh_shared / "metrics" / "run1" / "node001.jsonl").read_text().splitlines()
+    )
+    record = json.loads(lines[0])
+    assert record["n_samples"] == 4096
+    assert record["n_steps"] == 150
+    # Every pre-existing key must survive with its passed value, so the
+    # addition cannot silently drop a field the sweep analysis reads.
+    assert record["run_id"] == "run1"
+    assert record["node"] == "node001"
+    assert record["round"] == 7
+    assert record["train_loss"] == 0.5
+    assert record["val_loss"] == 0.4
+    assert record["samp_s"] == 12.0
+    assert record["n_shards"] == 3
+    assert record["lr"] == 0.0015
+    assert math.isfinite(record["ts"])
+    assert "slurm_job_id" in record
+
+
+def test_append_round_metrics_rejects_a_missing_count(tmp_path):
+    """No default: a missing count must be a call-site error rather than a
+    zero that silently under-reports the compute axis."""
+    with pytest.raises(TypeError):
+        mesh_round._append_round_metrics(
+            tmp_path / "mesh_shared", "run1", "node001", 1, 0.5, 0.4, 12.0, 3, 0.0015
+        )

@@ -10,10 +10,12 @@ gap: each node trains shards it already stores first, and only reaches into
 the network-fetch path (Task 7) to fill out the remainder.
 
 `reassign_failed` handles a node dying mid-round. Its in-flight shards need
-a new trainer; routing them to a survivor that already holds a replica (the
-second copy R=2 placement bought in Task 3) costs zero network. Only when
-no survivor holds a replica does a shard fall back to the least-loaded
-survivor, which will fetch it over HTTP.
+a new trainer; routing them to a survivor that already holds a replica costs
+zero network. A shard no survivor holds is dropped, not parked on an
+arbitrary survivor -- there is no HTTP fetch path left to rescue it.
+
+`assign_static` supersedes `assign_locality_first` for launching a round;
+the latter survives only for its own tests.
 """
 
 from __future__ import annotations
@@ -93,16 +95,26 @@ def reassign_failed(
     failed_node: str,
     assignments: dict[str, list[str]],
     placement: dict[str, list[str]],
-) -> dict[str, list[str]]:
-    """Redistribute a dead node's shards among the survivors.
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Redistribute a dead node's shards among survivors that hold them.
 
-    Each orphaned shard prefers a surviving replica holder (per
-    `placement`) so the reassignment costs zero network -- this is what
-    storing R=2 copies (Task 3) bought. Among multiple qualifying replica
-    holders, or when none holds a replica, the least-loaded survivor wins
-    (ties broken by hostname for determinism); load is tracked as shards
-    are handed out so a single replica holder doesn't get every one of the
-    dead node's shards dumped on it.
+    Each orphaned shard goes to a surviving *replica holder* (per
+    `placement`), so the reassignment costs zero network -- this is what
+    storing multiple copies bought. Among several qualifying holders the
+    least-loaded wins (ties broken by hostname for determinism); load is
+    tracked as shards are handed out so one holder doesn't get every shard
+    dumped on it.
+
+    A shard **no survivor holds is dropped** and returned in the second
+    element, not parked on the least-loaded survivor. That fallback is the
+    2026-08-20 fault in its second location: the named node cannot open a
+    shard it does not have, and with the P2P fetch removed
+    (`mesh_shard_dataset.resolve_shard`) it now raises rather than silently
+    skipping. Losing coverage of the shard is the honest outcome; the
+    caller logs the drop so a degraded round is visible.
+
+    `placement` must be real, verified holdings -- `verified_holdings.json`
+    as written by `validate_seeding.py`, never a placement *plan*.
     """
     if failed_node not in assignments:
         raise ValueError(
@@ -116,15 +128,18 @@ def reassign_failed(
         )
 
     load = {h: len(shards) for h, shards in result.items()}
+    dropped: list[str] = []
 
     for shard in assignments[failed_node]:
-        replica_holders = [h for h in result if shard in placement.get(h, [])]
-        candidates = replica_holders if replica_holders else list(result)
-        target = min(candidates, key=lambda h: (load[h], h))
+        holders = [h for h in result if shard in placement.get(h, [])]
+        if not holders:
+            dropped.append(shard)
+            continue
+        target = min(holders, key=lambda h: (load[h], h))
         result[target].append(shard)
         load[target] += 1
 
-    return result
+    return result, dropped
 
 
 def read_my_shards(assignments_path: Path, hostname: str) -> list[str]:
@@ -155,3 +170,48 @@ def read_my_shards(assignments_path: Path, hostname: str) -> list[str]:
             "produce a meaningless checkpoint"
         )
     return shards
+
+
+def assign_static(
+    holdings: dict[str, list[str]], expected: set[str]
+) -> dict[str, list[str]]:
+    """Partition `expected` across the nodes that physically hold each shard.
+
+    This replaces the locality-first/remainder-fill scheme, whose phase 2
+    handed a node shards nobody local held and left the worker to fetch them
+    over HTTP. When the shard map went stale on 2026-08-20 that path became
+    the only path, nothing was serving, and every affected worker trained on
+    zero samples while reporting it as a warning.
+
+    Here a node can only ever be assigned a shard it already has, so
+    attribution cannot disagree with reality. The result is disjoint: each
+    shard goes to exactly one of its holders, chosen least-loaded-first so
+    that replicated pools spread evenly rather than piling onto whichever
+    node sorts first. Ties break on node name, so the output is
+    deterministic.
+
+    Note this does NOT require the pool to be deduplicated to 1x. Holdings
+    may overlap freely; disjointness is a property of the partition, not of
+    the disk.
+
+    Raises ValueError if any expected shard has no holder -- an unsatisfiable
+    assignment must fail here, loudly, rather than at 3am inside a worker.
+    """
+    assignment: dict[str, list[str]] = {node: [] for node in sorted(holdings)}
+    holders = {
+        shard: sorted(node for node, held in holdings.items() if shard in set(held))
+        for shard in expected
+    }
+
+    orphans = sorted(shard for shard, nodes in holders.items() if not nodes)
+    if orphans:
+        raise ValueError(
+            f"assign_static: {len(orphans)} expected shard(s) held by no node: "
+            f"{', '.join(orphans[:10])}" + (" ..." if len(orphans) > 10 else "")
+        )
+
+    for shard in sorted(expected):
+        owner = min(holders[shard], key=lambda n: (len(assignment[n]), n))
+        assignment[owner].append(shard)
+
+    return assignment

@@ -10,10 +10,8 @@
 #   [outer_lr]         DiLoCo outer-optimizer LR; default 0.7 (literature)
 #   [outer_momentum]   DiLoCo outer-optimizer momentum; default 0.9 (literature)
 #
-# Does NOT rebuild the generic shard_map.json workers read by default
-# (run_mesh_worker.sh's MESH_SHARD_MAP fallback) -- run
-# recover_shard_map.py once, across every tier's active node list
-# combined, after all pools you're launching this round have registered.
+# Environment overrides: NEED (idle nodes to wait for), DATASET_HOLDER,
+# EXPECTED_SHARDS, QUORUM_K, WEIGHTING, SKIP_SEED_VALIDATION.
 set -euo pipefail
 
 TIER="${1:?usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds] [outer_lr] [outer_momentum]}"
@@ -44,7 +42,10 @@ else
   echo "launch_mesh_pool: squeue --me non-empty -- assuming watcher already active, skipping cron install"
 fi
 
-NEED=22  # 16 active + 6 backup
+# 16 active + 6 backup. Overridable because not every tier is that big --
+# countries has only 19 nodes total, so the default can never be satisfied
+# and the poll loop spins forever.
+NEED="${NEED:-22}"
 
 echo "launch_mesh_pool: polling ${TIER} for ${NEED} idle nodes (60s interval)..."
 IFS=',' read -r -a TIER_NODES <<< "${NODELIST}"
@@ -63,7 +64,7 @@ while true; do
 done
 
 ACTIVE=("${READY[@]:0:16}")
-BACKUP=("${READY[@]:16:6}")
+BACKUP=("${READY[@]:16}")
 ACTIVE_CSV=$(IFS=,; echo "${ACTIVE[*]}")
 READY_CSV=$(IFS=,; echo "${READY[*]}")
 echo "launch_mesh_pool: ${TIER} active=[${ACTIVE_CSV}]"
@@ -76,10 +77,25 @@ echo "launch_mesh_pool: ${TIER} backup (seeded, not active)=[$(IFS=,; echo "${BA
 printf '%s\n' "${READY[@]}" > "runs/state/mesh_pool_ready_${TIER}.txt"
 
 SOURCE_NODE="${ACTIVE[0]}"
-echo "launch_mesh_pool: reseeding ${SOURCE_NODE} from node089..."
-ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "${SOURCE_NODE}" \
-  "mkdir -p /Data/$USER/voxceleb2_shards && \
-   rsync -az node089:/Data/$USER/voxceleb2_shards/ /Data/$USER/voxceleb2_shards/"
+# Node holding the full 260-shard dataset that seed_mesh distributes from.
+# This was node089 until the 2026-08-17 reboot wiped node-local /Data there;
+# node001 is the node whose copy survived. Overridable because the holder is
+# a fact about the cluster today, not a property of any tier.
+DATASET_HOLDER="${DATASET_HOLDER:-node001}"
+# Ask the node what it actually has rather than trusting a hostname: several
+# tiers' first nodes already carry the full set, and reseeding one needlessly
+# drags 223 GB across a 1GbE link for nothing.
+EXPECTED_SHARDS="${EXPECTED_SHARDS:-260}"
+HAVE=$(ssh -o ConnectTimeout=15 "${SOURCE_NODE}" \
+  "ls /Data/$USER/voxceleb2_shards/*.tar 2>/dev/null | wc -l" || echo 0)
+if [[ "${SOURCE_NODE}" == "${DATASET_HOLDER}" || "${HAVE}" -ge "${EXPECTED_SHARDS}" ]]; then
+  echo "launch_mesh_pool: ${SOURCE_NODE} already holds ${HAVE} shard(s) -- no reseed needed"
+else
+  echo "launch_mesh_pool: reseeding ${SOURCE_NODE} from ${DATASET_HOLDER}..."
+  ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "${SOURCE_NODE}" \
+    "mkdir -p /Data/$USER/voxceleb2_shards && \
+     rsync -az ${DATASET_HOLDER}:/Data/$USER/voxceleb2_shards/ /Data/$USER/voxceleb2_shards/"
+fi
 
 echo "launch_mesh_pool: seeding mesh across ${TIER} pool (22 = 16 active + 6 backup)..."
 uv run python -m video_encoding.scripts.seed_mesh \
@@ -91,9 +107,34 @@ uv run python -m video_encoding.scripts.seed_mesh \
   --dataset-gb 223 \
   --replication 2
 
-echo "launch_mesh_pool: registering run config ${RUN_ID} (outer_lr=${OUTER_LR} outer_momentum=${OUTER_MOMENTUM})..."
+# Verify what actually landed on every node before anything trains against
+# it. seed_mesh reports success per rsync, not per shard, and on 2026-08-20 a
+# pool whose placement metadata disagreed with its disks trained zero samples
+# for eleven hours without a single error. validate_seeding writes
+# verified_holdings.json, which _do_assigning then requires.
+if [[ -n "${SKIP_SEED_VALIDATION:-}" ]]; then
+  echo "launch_mesh_pool: WARNING -- SKIP_SEED_VALIDATION set, registering ${RUN_ID} without verifying seeded shards" >&2
+else
+  echo "launch_mesh_pool: validating seeded shards across ${TIER} pool..."
+  # set -e aborts here on a non-zero exit, before the run is registered.
+  uv run python -m video_encoding.scripts.validate_seeding \
+    --pool "${TIER}" \
+    --metadata-dir "${HOME}/stern_mesh/metadata"
+fi
+
+# Merge once three quarters of the pool has checked in rather than waiting
+# all-or-ROUND_TIMEOUT_S: one dead node otherwise costs every round a
+# 30-minute stall. Pair it with token weighting, which corrects a partial
+# merge's sample-count bias instead of plain renormalization.
+N_ACTIVE=$(awk -F, '{print NF}' <<< "${ACTIVE_CSV}")
+QUORUM_K="${QUORUM_K:-$(( N_ACTIVE * 3 / 4 ))}"
+[[ "${QUORUM_K}" -lt 1 ]] && QUORUM_K=1
+WEIGHTING="${WEIGHTING:-token}"
+
+echo "launch_mesh_pool: registering run config ${RUN_ID} (outer_lr=${OUTER_LR} outer_momentum=${OUTER_MOMENTUM} quorum_k=${QUORUM_K}/${N_ACTIVE} weighting=${WEIGHTING})..."
 "$(dirname "${BASH_SOURCE[0]}")/register_mesh_run.sh" \
-  "${RUN_ID}" "${ACTIVE_CSV}" "${ROUNDS}" "${OUTER_LR}" "${OUTER_MOMENTUM}"
+  "${RUN_ID}" "${ACTIVE_CSV}" "${ROUNDS}" "${OUTER_LR}" "${OUTER_MOMENTUM}" \
+  "${QUORUM_K}" "${WEIGHTING}"
 
 echo "${ACTIVE_CSV}" > "runs/state/mesh_pool_active_${TIER}.txt"
 echo "launch_mesh_pool: ${TIER} pool launched -- watcher cron will pick up ${RUN_ID} within a minute"
