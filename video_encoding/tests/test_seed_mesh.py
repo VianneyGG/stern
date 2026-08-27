@@ -330,3 +330,73 @@ def test_main_replicates_val_manifest_alongside_val_shards_to_every_replica(
     shards_arg = args[2]
     assert "manifest.json" in shards_arg
     assert kwargs["remote_source_dir"] == "/Data/$USER/shards/val"
+
+
+def _dry_run_argv(nodes: list[str], source: str) -> list[str]:
+    return [
+        "seed_mesh.py",
+        "--nodes",
+        ",".join(nodes),
+        "--source-node",
+        source,
+        "--shards-dir",
+        "/Data/$USER/shards",
+        "--shard-map",
+        "/tmp/shard_map.json",
+        "--dataset-gb",
+        "800",
+        "--replication",
+        "1",
+        "--dry-run",
+    ]
+
+
+def test_main_accepts_a_source_node_outside_nodes(monkeypatch, capsys):
+    """The corpus is built on a file server (node114) that is deliberately absent
+    from tiers.tsv. It must be usable as --source-node without joining the
+    pool, or probe_nodes drops it and the run aborts -- and putting it in
+    --nodes would make the pool size stop dividing n_shards evenly."""
+    pool = [f"n{i}" for i in range(20)]
+    monkeypatch.setattr(
+        "video_encoding.scripts.seed_mesh.probe_nodes",
+        lambda hostnames: [NodeInfo(h, "fish", "/254", 500.0) for h in hostnames],
+    )
+    monkeypatch.setattr(
+        "video_encoding.scripts.seed_mesh._list_remote_shards",
+        lambda host, d: [f"shard-{i:06d}.tar" for i in range(800)],
+    )
+    monkeypatch.setattr(
+        "video_encoding.scripts.seed_mesh._remote_file_exists", lambda host, p: True
+    )
+    monkeypatch.setattr("sys.argv", _dry_run_argv(pool, "node114"))
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    counts = dict(
+        (line.split(":")[0].strip(), int(line.split(":")[1].split()[0]))
+        for line in out.splitlines()
+        if line.startswith("  ")
+    )
+    assert "node114" not in counts, "serve-only source must not be a placement target"
+    assert set(counts) == set(pool)
+    # 800 shards / 20 equal-weight nodes at replication 1 divides exactly.
+    assert set(counts.values()) == {40}
+
+
+def test_main_still_rejects_a_listed_source_node_that_failed_to_probe(
+    monkeypatch, capsys
+):
+    """Relaxing the membership rule must not silently swallow the real error
+    it used to catch: a source named in --nodes that did not come back."""
+    pool = [f"n{i}" for i in range(4)]
+    monkeypatch.setattr(
+        "video_encoding.scripts.seed_mesh.probe_nodes",
+        lambda hostnames: [
+            NodeInfo(h, "fish", "/254", 500.0) for h in hostnames if h != "n0"
+        ],
+    )
+    monkeypatch.setattr("sys.argv", _dry_run_argv(pool, "n0"))
+
+    assert main() == 1
+    assert "did not probe successfully" in capsys.readouterr().err

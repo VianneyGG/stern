@@ -43,14 +43,14 @@ class TestVideoMAEForPreTraining:
 
         grid = (8, 14, 14)  # T', H', W'
         masker = RandomTubeMasking(mask_ratio=0.9)
-        keep_indices, mask_indices = masker(pixel_values, grid, torch.device("cpu"))
+        keep_indices, mask_indices = masker(pixel_values, grid, torch.device("cpu"), batch_size=B)
 
         with torch.no_grad():
             pred, target = model(pixel_values, keep_indices, mask_indices)
 
         # Prediction shape: (B, num_masked, 3 * patch_size^2)
         patch_size = 16
-        expected_pred_shape = (B, len(mask_indices), 3 * patch_size * patch_size)
+        expected_pred_shape = (B, mask_indices.shape[1], 3 * patch_size * patch_size)
         assert pred.shape == expected_pred_shape, (
             f"pred shape mismatch: got {pred.shape}, expected {expected_pred_shape}"
         )
@@ -87,7 +87,7 @@ class TestVideoMAEForPreTraining:
 
         grid = (8, 14, 14)  # T', H', W'
         masker = RandomTubeMasking(mask_ratio=0.9)
-        keep_indices, mask_indices = masker(pixel_values, grid, torch.device("cpu"))
+        keep_indices, mask_indices = masker(pixel_values, grid, torch.device("cpu"), batch_size=B)
 
         losses = []
         for step in range(10):
@@ -181,8 +181,8 @@ class TestVideoMAEForPreTraining:
         pixel_values = torch.randn(B, C, T, H, W)
         grid = (8, 14, 14)
         masker = RandomTubeMasking(mask_ratio=0.9)
-        keep_indices, mask_indices = masker(pixel_values, grid, torch.device("cpu"))
-        n_mask = len(mask_indices)
+        keep_indices, mask_indices = masker(pixel_values, grid, torch.device("cpu"), batch_size=B)
+        n_mask = mask_indices.shape[1]
         expected_n_recon = max(1, round(n_mask * 0.5))
 
         with torch.no_grad():
@@ -203,9 +203,83 @@ class TestVideoMAEForPreTraining:
         pixel_values = torch.randn(B, C, T, H, W)
         grid = (8, 14, 14)
         masker = RandomTubeMasking(mask_ratio=0.9)
-        keep_indices, mask_indices = masker(pixel_values, grid, torch.device("cpu"))
+        keep_indices, mask_indices = masker(pixel_values, grid, torch.device("cpu"), batch_size=B)
 
         with torch.no_grad():
             pred, target = model(pixel_values, keep_indices, mask_indices)
 
-        assert pred.shape[1] == len(mask_indices)
+        assert pred.shape[1] == mask_indices.shape[1]
+
+
+class TestPerSampleGatherIsNotCrossWired:
+    """The batched gather/scatter must keep each row on its OWN indices.
+
+    Every other test here asserts shapes only, and shapes are identical under
+    a batch-index-swap bug (e.g. gathering with row 0's indices for the whole
+    batch). These tests compare against a per-row reference computed one
+    sample at a time, which such a bug cannot satisfy.
+    """
+
+    GRID = (4, 4, 4)
+
+    @pytest.fixture
+    def model_cfg(self):
+        """Tiny geometry -- these tests run several forwards each."""
+        return DictConfig(
+            {
+                "num_frames": 8,
+                "image_size": 64,
+                "in_channels": 3,
+                "tubelet_size": 2,
+                "patch_size": 16,
+                "embed_dim": 32,
+                "depth": 1,
+                "num_heads": 4,
+                "mlp_ratio": 2.0,
+                "dropout": 0.0,
+                "decoder_depth": 1,
+                "decoder_embed_dim": 32,
+                "decoder_num_heads": 4,
+                "mask_ratio": 0.5,
+            }
+        )
+
+    def test_target_rows_match_single_sample_forward(self, model_cfg):
+        model = VideoMAEForPreTraining(model_cfg).eval()
+        torch.manual_seed(0)
+        B = 3
+        pixel_values = torch.randn(B, 3, 8, 64, 64)
+        grid = self.GRID
+        keep, mask = RandomTubeMasking(mask_ratio=0.5)(
+            pixel_values, grid, torch.device("cpu"), batch_size=B
+        )
+        assert not torch.equal(mask[0], mask[1]), "fixture needs distinct rows"
+
+        with torch.no_grad():
+            _, target = model(pixel_values, keep, mask)
+            for b in range(B):
+                _, target_b = model(
+                    pixel_values[b : b + 1], keep[b : b + 1], mask[b : b + 1]
+                )
+                torch.testing.assert_close(target[b], target_b[0])
+
+    def test_swapping_two_rows_indices_swaps_their_targets(self, model_cfg):
+        """A row's output must depend on that row's own mask_indices."""
+        model = VideoMAEForPreTraining(model_cfg).eval()
+        torch.manual_seed(1)
+        pixel_values = torch.randn(2, 3, 8, 64, 64)
+        grid = self.GRID
+        keep, mask = RandomTubeMasking(mask_ratio=0.5)(
+            pixel_values, grid, torch.device("cpu"), batch_size=2
+        )
+
+        with torch.no_grad():
+            _, target = model(pixel_values, keep, mask)
+            _, swapped = model(
+                pixel_values, keep.flip(0), mask.flip(0)
+            )
+
+        assert not torch.allclose(target[0], swapped[0]), (
+            "row 0's target did not change when its mask indices changed -- "
+            "the gather is not per-row"
+        )

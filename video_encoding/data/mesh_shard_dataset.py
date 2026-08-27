@@ -29,7 +29,11 @@ from typing import Iterator
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from video_encoding.data.wds_frames import load_shard_index, read_shard_frames_at
+from video_encoding.data.augment import apply_group_augment, sample_group_augment
+from video_encoding.data.wds_frames import (
+    load_shard_index,
+    read_shard_frames_indexed,
+)
 from video_encoding.data.windows import window_starts
 from video_encoding.mesh.shard_map import Holder
 from video_encoding.models.videomaev2.encoder import preprocess_window
@@ -116,6 +120,8 @@ class MeshShardIterableDataset(IterableDataset):
         num_frames: int,
         image_size: int,
         overlap: float,
+        frame_stride: int = 1,
+        augment: bool = False,
         seed: int = 0,
     ):
         self._shard_names = list(shard_names)
@@ -125,6 +131,8 @@ class MeshShardIterableDataset(IterableDataset):
         self._num_frames = num_frames
         self._image_size = image_size
         self._overlap = overlap
+        self._frame_stride = frame_stride
+        self._augment = augment
         self._seed = seed
         self._round = 0
 
@@ -177,6 +185,13 @@ class MeshShardIterableDataset(IterableDataset):
         # tuple -- a delimited string keeps the three components distinct
         # (no collision between e.g. (1, 23) and (12, 3)).
         rng = random.Random(f"{self._seed}:{self._round}:{worker_id}")
+        # A SEPARATE stream for augmentation draws. Sharing `rng` would let
+        # every augment draw advance the same state the per-shard
+        # `rng.shuffle(windows)` consumes, so merely toggling `augment` would
+        # silently reorder the training windows of every shard after the
+        # first -- an augmentation flag must not change which data is seen in
+        # which order.
+        aug_rng = random.Random(f"aug:{self._seed}:{self._round}:{worker_id}")
         shard_names = list(shard_names)
         rng.shuffle(shard_names)
 
@@ -218,15 +233,35 @@ class MeshShardIterableDataset(IterableDataset):
                     for clip_key, entry in shard_index.items()
                     if entry["shard"] == shard_name
                     for start in window_starts(
-                        entry["num_frames"], self._num_frames, self._overlap
+                        entry["num_frames"],
+                        self._num_frames,
+                        self._overlap,
+                        frame_stride=self._frame_stride,
                     )
                 ]
                 rng.shuffle(windows)
                 for clip_key, start in windows:
-                    idx = list(range(start, start + self._num_frames))
-                    frames = read_shard_frames_at(
+                    idx = list(
+                        range(
+                            start,
+                            start + self._num_frames * self._frame_stride,
+                            self._frame_stride,
+                        )
+                    )
+                    # _indexed, not _at: the shuffle above makes this random
+                    # access within the shard, and read_shard_frames_at
+                    # re-opens the tar and walks all ~4k member headers on
+                    # every window. Measured on a real 0.89 GB shard:
+                    # 47.8 ms/window vs 3.3 ms via the cached member offsets,
+                    # of which the actual JPEG decode is only 2.7 ms. The tar
+                    # scan, not the decode, is what held every node's GPU at
+                    # ~15% utilization.
+                    frames = read_shard_frames_indexed(
                         path, clip_key, idx, size=self._image_size
                     )
+                    if self._augment:
+                        params = sample_group_augment(self._image_size, aug_rng)
+                        frames = apply_group_augment(frames, params, self._image_size)
                     pixel_values = preprocess_window(
                         frames, self._num_frames, self._image_size
                     )

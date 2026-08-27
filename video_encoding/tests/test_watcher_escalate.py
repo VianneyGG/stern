@@ -149,8 +149,10 @@ def test_run_escalation_builds_scoped_allowed_tools(tmp_path):
             now_str="20260715-100000",
         )
 
+    from video_encoding.watcher.escalate import _claude_bin
+
     cmd = captured["cmd"]
-    assert cmd[0] == "claude"
+    assert cmd[0] == _claude_bin()
     assert "-p" in cmd
     idx = cmd.index("--allowed-tools")
     tools = cmd[idx + 1]

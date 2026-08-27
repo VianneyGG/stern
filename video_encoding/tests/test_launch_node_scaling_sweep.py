@@ -26,9 +26,7 @@ def env(tmp_path):
     """Returns (make_roster, run, calls_path, state_dir)."""
     log = tmp_path / "register_calls.txt"
     fake = tmp_path / "fake_register.sh"
-    fake.write_text(
-        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> ' + f'"{log}"\n'
-    )
+    fake.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> ' + f'"{log}"\n')
     fake.chmod(0o755)
 
     state_dir = tmp_path / "state"
@@ -79,7 +77,9 @@ def test_wave_a_registers_four_cells_with_disjoint_nodes(env):
     assert sorted(calls) == ["nsl-n01a", "nsl-n02", "nsl-n04", "nsl-n08"]
 
     node_sets = {rid: argv[1].split(",") for rid, argv in calls.items()}
-    assert [len(node_sets[r]) for r in ("nsl-n01a", "nsl-n02", "nsl-n04", "nsl-n08")] == [
+    assert [
+        len(node_sets[r]) for r in ("nsl-n01a", "nsl-n02", "nsl-n04", "nsl-n08")
+    ] == [
         1,
         2,
         4,

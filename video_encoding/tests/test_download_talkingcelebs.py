@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-from video_encoding.scripts.download_talkingcelebs import ClipSpec, limit_specs, parse_sources
+from video_encoding.scripts.download_talkingcelebs import (
+    ClipSpec,
+    limit_specs,
+    parse_sources,
+)
 
 
 def _spec(identity_id: str, clip_num: int) -> ClipSpec:
@@ -68,7 +72,12 @@ def test_parse_sources_formats_identity_id_with_zero_padding(tmp_path: Path):
                         "id": 42,
                         "name": "Test",
                         "videos": [
-                            {"id": "XYZ", "clips": [{"id": 1, "start": "00:00:00", "end": "00:00:30"}]},
+                            {
+                                "id": "XYZ",
+                                "clips": [
+                                    {"id": 1, "start": "00:00:00", "end": "00:00:30"}
+                                ],
+                            },
                         ],
                     }
                 ],
@@ -116,7 +125,12 @@ def test_parse_sources_handles_multiple_identities(tmp_path: Path):
                         "id": i,
                         "name": f"Person{i}",
                         "videos": [
-                            {"id": f"VID{i}", "clips": [{"id": 1, "start": "00:00:00", "end": "00:00:30"}]},
+                            {
+                                "id": f"VID{i}",
+                                "clips": [
+                                    {"id": 1, "start": "00:00:00", "end": "00:00:30"}
+                                ],
+                            },
                         ],
                     }
                     for i in range(5)
@@ -159,8 +173,11 @@ def test_limit_specs_caps_clips_per_identity():
 
 def test_limit_specs_applies_both_caps_together():
     specs = [
-        _spec("id0", 1), _spec("id0", 2), _spec("id0", 3),
-        _spec("id1", 1), _spec("id1", 2),
+        _spec("id0", 1),
+        _spec("id0", 2),
+        _spec("id0", 3),
+        _spec("id1", 1),
+        _spec("id1", 2),
         _spec("id2", 1),
     ]
 

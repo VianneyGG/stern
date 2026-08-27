@@ -12,7 +12,12 @@
 #
 # Cluster facts (T1.1/T1.2/T1.7): single partition SallesInfo, no GPU GRES
 # (whole-node allocation -- request nodes not gres), 16 cores/node, ~63 GB
-# RAM, 3-day max walltime, no preemption.
+# RAM, no preemption. Max walltime is 2h: the cluster was rebuilt on
+# 2026-08-22 (SLURM 26.05.2, job counter reset, MaxNodes=5) and the new
+# slurm.conf sets SallesInfo MaxTime=2:00:00, down from 3 days. SLURM does
+# not reject an over-limit --time; it parks the job as PENDING
+# (PartitionTimeLimit) forever, so exceeding this is silent -- 64 jobs sat
+# unschedulable while the watcher logged them as RUNNING.
 #
 # Usage: sbatch mesh_train.sbatch <experiment-name> <run-id> [overrides...]
 #SBATCH --job-name=stern-mesh-worker
@@ -27,7 +32,10 @@
 # NOT enforce GPU isolation between SLURM jobs, so without it another
 # student's job can land on the same node and OOM the shared GPU (the same
 # failure mode train.sbatch guards against, observed in the wild).
-#SBATCH --time=3-00:00:00
+# A worker no longer spans a whole run: at ~1000s/round a 40-round run is
+# ~11h, so it is chunked into successive jobs (mesh.chunk_rounds) that each
+# exit cleanly under this cap and resume via +mesh.start_round + master.pt.
+#SBATCH --time=02:00:00
 #SBATCH --output=video_encoding/slurm/logs/%x-%j.out
 
 set -euo pipefail

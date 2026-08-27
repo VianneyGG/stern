@@ -14,6 +14,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,8 @@ def write_mesh_round_scalars(
     mesh_shared: Path,
     run_id: str,
     last_round: int,
+    *,
+    final: bool = False,
 ) -> int:
     """Replay not-yet-flushed mesh rounds from every node's JSONL onto `writer`.
 
@@ -125,17 +128,20 @@ def write_mesh_round_scalars(
     record uses a 1-based `round`; scalars are written at 0-based step
     `round - 1` to match run_outer_step.py's own `--round`.
 
-    The *newest* round observed across all nodes is always held back one
-    call, never flushed immediately: a worker only appends its JSONL
-    record for round R after the merge for round R has already run (it's
-    blocked in a post-push barrier the merge itself releases), so a fast
-    node's round-R record can land before a straggler's. Holding the
-    newest round back gives every node one more merge cycle (~one round)
-    to catch up before that round's scalars (including the pool mean) are
-    finalized. Once flushed a round is never revisited, so a node that
-    never reports for a round simply isn't counted in that round's pool
-    mean -- this is monitoring, not the source of truth (the JSONL
-    itself, on NFS, is unaffected and still has every record).
+    The *newest* round observed across all nodes is held back one call,
+    never flushed immediately, unless `final=True`: a worker only appends
+    its JSONL record for round R after the merge for round R has already
+    run (it's blocked in a post-push barrier the merge itself releases),
+    so a fast node's round-R record can land before a straggler's. Holding
+    the newest round back gives every node one more merge cycle (~one
+    round) to catch up before that round's scalars (including the pool
+    mean) are finalized. Once flushed a round is never revisited, so a
+    node that never reports for a round simply isn't counted in that
+    round's pool mean -- this is monitoring, not the source of truth (the
+    JSONL itself, on NFS, is unaffected and still has every record).
+    `final=True` is for a run that just reached DONE: there is no future
+    merge cycle left to wait for, so every remaining round (including the
+    one that would otherwise still be held back) is flushed as-is.
 
     Returns the highest round number flushed this call, or `last_round`
     unchanged if nothing new was flushed. The caller persists this as the
@@ -162,8 +168,11 @@ def write_mesh_round_scalars(
     if not per_round:
         return last_round
 
-    newest_round = max(per_round)
-    rounds_to_flush = sorted(r for r in per_round if r < newest_round)
+    if final:
+        rounds_to_flush = sorted(per_round)
+    else:
+        newest_round = max(per_round)
+        rounds_to_flush = sorted(r for r in per_round if r < newest_round)
 
     new_last_round = last_round
     for round_ in rounds_to_flush:
@@ -173,39 +182,79 @@ def write_mesh_round_scalars(
         samp_s_total = 0.0
         pool_job_id: float | None = None
         for node, record in sorted(per_round[round_].items()):
+            writer.add_scalar(f"loss/train/{node}", record["train_loss"], step)
+            writer.add_scalar(f"loss/val/{node}", record["val_loss"], step)
             writer.add_scalar(
-                f"mesh_round/{node}/train_loss", record["train_loss"], step
+                f"throughput/samples_per_sec/{node}", record["samp_s"], step
             )
-            writer.add_scalar(f"mesh_round/{node}/val_loss", record["val_loss"], step)
-            writer.add_scalar(f"mesh_round/{node}/samp_s", record["samp_s"], step)
+            n_shards = record.get("n_shards")
+            if n_shards is not None:
+                writer.add_scalar(f"data/n_shards/{node}", n_shards, step)
+            lr = record.get("lr")
+            if lr is not None:
+                writer.add_scalar(f"config/lr/{node}", lr, step)
             train_losses.append(record["train_loss"])
             val_losses.append(record["val_loss"])
             samp_s_total += record["samp_s"]
             job_id = record.get("slurm_job_id")
             if job_id is not None and str(job_id).isdigit():
-                writer.add_scalar(
-                    f"mesh_round/{node}/slurm_job_id", float(job_id), step
-                )
+                writer.add_scalar(f"slurm_job_id/{node}", float(job_id), step)
                 if pool_job_id is None:
                     pool_job_id = float(job_id)
         if pool_job_id is not None:
-            writer.add_scalar("mesh_round/pool/slurm_job_id", pool_job_id, step)
+            writer.add_scalar("slurm_job_id/pool", pool_job_id, step)
         if train_losses:
             writer.add_scalar(
-                "mesh_round/pool/train_loss_mean",
+                "loss/train/pool_mean",
                 sum(train_losses) / len(train_losses),
                 step,
             )
         if val_losses:
             writer.add_scalar(
-                "mesh_round/pool/val_loss_mean",
+                "loss/val/pool_mean",
                 sum(val_losses) / len(val_losses),
                 step,
             )
-        writer.add_scalar("mesh_round/pool/samp_s_sum", samp_s_total, step)
+        writer.add_scalar("throughput/samples_per_sec/pool_sum", samp_s_total, step)
         new_last_round = round_
 
     return new_last_round
+
+
+def flush_final_tb_rounds(tb_dir: Path, mesh_shared: Path, run_id: str) -> None:
+    """Best-effort: flush every round still held back once a run reaches DONE.
+
+    write_mesh_round_scalars's straggler holdback (see its docstring) always
+    leaves a run's last round or two unflushed while it's still live -- there
+    is no next merge cycle coming once the run is DONE, so this is the one
+    call site that passes final=True. Mirrors run_outer_step.py's
+    _write_tb_scalars bookkeeping (same tb_last_round.txt convention) but
+    carries no merge-specific scalars, since no merge runs at DONE.
+
+    Never raises -- called from the watcher's DONE transition
+    (video_encoding/watcher/mesh_tick.py), where a TB write failure must
+    never block a run from finishing.
+    """
+    last_round_path = tb_dir.parent / "tb_last_round.txt"
+    try:
+        last_round = (
+            int(last_round_path.read_text().strip()) if last_round_path.exists() else 0
+        )
+        writer = make_writer(tb_dir, rank=0)
+        if writer is None:
+            return
+        new_last_round = write_mesh_round_scalars(
+            writer, mesh_shared, run_id, last_round, final=True
+        )
+        writer.flush()
+        writer.close()
+        if new_last_round != last_round:
+            last_round_path.write_text(str(new_last_round))
+    except Exception as exc:  # noqa: BLE001 -- must never fail the DONE transition
+        print(
+            f"flush_final_tb_rounds: WARNING failed to write TB scalars to {tb_dir}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def _git_sha() -> str | None:

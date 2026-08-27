@@ -104,12 +104,17 @@ def predict_z(
     to masked positions, so a whole reconstruction can be rendered or scored."""
     enc = model.encoder
     x = enc.patch_embed(pixel_values) + enc.pos_embed
-    visible = model.encoder_to_decoder(enc.forward_tokens(x, keep_indices))
+    B = pixel_values.shape[0]
+    # forward_tokens gathers per-sample; temporal_split's split is the same for
+    # every element, so broadcast the shared 1-D indices across the batch.
+    visible = model.encoder_to_decoder(
+        enc.forward_tokens(x, keep_indices.expand(B, -1))
+    )
 
-    dec = visible.new_zeros(pixel_values.shape[0], x.shape[1], model.decoder_embed_dim)
+    dec = visible.new_zeros(B, x.shape[1], model.decoder_embed_dim)
     dec[:, keep_indices, :] = visible
     dec[:, mask_indices, :] = model.mask_token.expand(
-        pixel_values.shape[0], mask_indices.shape[0], -1
+        B, mask_indices.shape[0], -1
     ).to(dec.dtype)
     dec = dec + model.decoder_pos_embed
     for block in model.decoder_blocks:
@@ -225,9 +230,7 @@ def temporal_correlation(
     as 0.0 rather than a 0/0 nan.
     """
     prd_dev, tgt_dev = _temporal_deviations(pred_z, target_z, grid, mask_indices)
-    denom = float(
-        (prd_dev**2).mean().sqrt() * (tgt_dev**2).mean().sqrt()
-    )
+    denom = float((prd_dev**2).mean().sqrt() * (tgt_dev**2).mean().sqrt())
     if denom < 1e-12:
         return 0.0
     return float((prd_dev * tgt_dev).mean()) / denom

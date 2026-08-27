@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,6 +13,8 @@ from video_encoding.watcher.epoch_advance import exclude_node
 from video_encoding.watcher.mesh_tick import (
     MeshRunConfig,
     _clean_stale_run_artifacts,
+    _do_awaiting_checkpoints,
+    _recover_pool,
     _replenish_pool,
     _submit_worker_job,
     advance_all_runs,
@@ -483,9 +486,14 @@ def test_awaiting_checkpoints_quorum_configured_still_waits_below_quorum(tmp_pat
 def test_awaiting_checkpoints_quorum_configured_falls_back_to_exclusion_after_grace(
     tmp_path,
 ):
-    """Quorum never reached and grace_s has fully elapsed: falls back to the
-    exact same exclusion/replenish path the plain timeout uses -- grace_s
-    plays ROUND_TIMEOUT_S's old role once quorum is configured."""
+    """Quorum never reached and grace_s has fully elapsed: runs the exact same
+    exclusion/replenish bookkeeping the plain timeout uses -- grace_s plays
+    ROUND_TIMEOUT_S's old role once quorum is configured -- and THEN halts.
+
+    Only one node of the two quorum_k demands ever checked in, so merging
+    here would average below the configured floor. Bookkeeping still runs
+    first (missed_rounds is recorded, a replacement is submitted) so the log
+    and state show a human what happened; the run just does not advance."""
     mesh_shared = tmp_path / "mesh_shared"
     pending_dir = mesh_shared / "checkpoints" / "pending"
     pending_dir.mkdir(parents=True)
@@ -508,11 +516,10 @@ def test_awaiting_checkpoints_quorum_configured_falls_back_to_exclusion_after_gr
         now=old_mtime + 901.0,  # past grace_s (900s)
     )
 
-    assert state.run("RUN1").status == "MERGING"
-    assert state.run("RUN1").timeout_forced is True
+    assert state.run("RUN1").status == "DEGRADED"
     for node in ("node002", "node003"):
         assert state.run("RUN1").missed_rounds.get(node) == 1
-    assert action is not None
+    assert action is not None and "below quorum_k=2" in action
 
 
 def test_merging_calls_run_outer_step_with_correct_args(tmp_path):
@@ -1466,8 +1473,17 @@ def test_replenish_pool_appends_idle_node_and_reassigns_shards(tmp_path):
     # of two colliding patches, whichever is entered last silently winning
     # for both call sites) is what actually isolates the sinfo vs sbatch
     # responses.
+    # ssh is the node-health probe (_replenish_pool -> query_node_health):
+    # free GPU MiB then seeded shard count. A candidate must look genuinely
+    # healthy here or the health gate correctly refuses to submit it.
+    healthy_probe = MagicMock(returncode=0, stdout="24423\n26\n")
+
     def _fake_run(cmd, *args, **kwargs):
-        return idle_sinfo if cmd[0] == "sinfo" else sbatch_result
+        if cmd[0] == "sinfo":
+            return idle_sinfo
+        if cmd[0] == "ssh":
+            return healthy_probe
+        return sbatch_result
 
     with patch(
         "video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
@@ -1544,9 +1560,16 @@ def test_replenish_pool_does_not_submit_a_replacement_with_no_shards_to_inherit(
     )
 
     idle_sinfo = MagicMock(returncode=0, stdout="node004 idle\n")
+    # node004 must clear the node-health gate, otherwise this test would pass
+    # for the wrong reason -- an unhealthy candidate is dropped before the
+    # no-shards-to-inherit guard under test is ever reached.
+    healthy_probe = MagicMock(returncode=0, stdout="24423\n26\n")
+
+    def _fake_run(cmd, *args, **kwargs):
+        return healthy_probe if cmd[0] == "ssh" else idle_sinfo
 
     with patch(
-        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=idle_sinfo
+        "video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
     ) as mock_run:
         result = _replenish_pool(
             run_config,
@@ -1559,7 +1582,7 @@ def test_replenish_pool_does_not_submit_a_replacement_with_no_shards_to_inherit(
         )
 
     # sinfo (idle query) is allowed; sbatch (job submission) must never fire.
-    assert all(call.args[0][0] == "sinfo" for call in mock_run.call_args_list)
+    assert not any(call.args[0][0] == "sbatch" for call in mock_run.call_args_list)
     grown = json.loads(run_configs_path.read_text())
     assert "node004" not in grown[0]["nodes"]
     assert not (tmp_path / "runs" / "state" / "jobs_registry.json").exists()
@@ -1608,9 +1631,16 @@ def test_replenish_pool_does_not_submit_a_replacement_for_an_empty_shard_list(
     )
 
     idle_sinfo = MagicMock(returncode=0, stdout="node004 idle\n")
+    # node004 must clear the node-health gate, otherwise this test would pass
+    # for the wrong reason -- an unhealthy candidate is dropped before the
+    # no-shards-to-inherit guard under test is ever reached.
+    healthy_probe = MagicMock(returncode=0, stdout="24423\n26\n")
+
+    def _fake_run(cmd, *args, **kwargs):
+        return healthy_probe if cmd[0] == "ssh" else idle_sinfo
 
     with patch(
-        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=idle_sinfo
+        "video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
     ) as mock_run:
         _replenish_pool(
             run_config,
@@ -1622,7 +1652,7 @@ def test_replenish_pool_does_not_submit_a_replacement_for_an_empty_shard_list(
             "node003",
         )
 
-    assert all(call.args[0][0] == "sinfo" for call in mock_run.call_args_list)
+    assert not any(call.args[0][0] == "sbatch" for call in mock_run.call_args_list)
     grown = json.loads(run_configs_path.read_text())
     assert "node004" not in grown[0]["nodes"]
 
@@ -1660,8 +1690,17 @@ def test_replenish_pool_partial_fill_when_not_enough_idle(tmp_path):
     # See the sibling test above for why this must be a single patch with a
     # dispatching side_effect rather than two colliding patches on the
     # shared `subprocess` module.
+    # ssh is the node-health probe (_replenish_pool -> query_node_health):
+    # free GPU MiB then seeded shard count. A candidate must look genuinely
+    # healthy here or the health gate correctly refuses to submit it.
+    healthy_probe = MagicMock(returncode=0, stdout="24423\n26\n")
+
     def _fake_run(cmd, *args, **kwargs):
-        return idle_sinfo if cmd[0] == "sinfo" else sbatch_result
+        if cmd[0] == "sinfo":
+            return idle_sinfo
+        if cmd[0] == "ssh":
+            return healthy_probe
+        return sbatch_result
 
     with patch(
         "video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
@@ -1898,8 +1937,17 @@ def test_do_awaiting_checkpoints_triggers_replenish_on_new_exclusion(tmp_path):
     # See test_replenish_pool_appends_idle_node_and_reassigns_shards for why
     # this must be a single patch with a dispatching side_effect rather than
     # two colliding patches on the shared `subprocess` module.
+    # ssh is the node-health probe (_replenish_pool -> query_node_health):
+    # free GPU MiB then seeded shard count. A candidate must look genuinely
+    # healthy here or the health gate correctly refuses to submit it.
+    healthy_probe = MagicMock(returncode=0, stdout="24423\n26\n")
+
     def _fake_run(cmd, *args, **kwargs):
-        return idle_sinfo if cmd[0] == "sinfo" else sbatch_result
+        if cmd[0] == "sinfo":
+            return idle_sinfo
+        if cmd[0] == "ssh":
+            return healthy_probe
+        return sbatch_result
 
     with patch(
         "video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
@@ -1973,8 +2021,17 @@ def test_do_awaiting_checkpoints_does_not_double_pick_same_node_for_simultaneous
     idle_sinfo = MagicMock(returncode=0, stdout="node007 idle\n")  # only 1 idle
     sbatch_result = MagicMock(returncode=0, stdout="Submitted batch job 999\n")
 
+    # ssh is the node-health probe (_replenish_pool -> query_node_health):
+    # free GPU MiB then seeded shard count. A candidate must look genuinely
+    # healthy here or the health gate correctly refuses to submit it.
+    healthy_probe = MagicMock(returncode=0, stdout="24423\n26\n")
+
     def _fake_run(cmd, *args, **kwargs):
-        return idle_sinfo if cmd[0] == "sinfo" else sbatch_result
+        if cmd[0] == "sinfo":
+            return idle_sinfo
+        if cmd[0] == "ssh":
+            return healthy_probe
+        return sbatch_result
 
     now = old_mtime + 4000.0  # past ROUND_TIMEOUT_S
     with patch(
@@ -2321,3 +2378,963 @@ def test_assigning_refuses_to_launch_onto_an_unvalidated_pool(tmp_path):
             mesh_root=tmp_path / "mesh_root",
             now=1000.0,
         )
+
+
+def test_advance_all_runs_terminates_when_a_run_cannot_progress(tmp_path):
+    """A handler that reports an action without advancing must not spin.
+
+    advance_all_runs drives one run_id until a handler returns None or the
+    run reaches DONE. _do_assigning with every node excluded returns an
+    action string ("no eligible nodes") and deliberately leaves the status
+    at ASSIGNING, so neither exit condition is ever met: on 2026-08-21 this
+    span forever, appending one string per iteration, and grew the watcher
+    to 61 GB. That exhausted node089' memory and left the host unreachable
+    over ssh for ~40 minutes.
+    """
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+
+    config = _run_config(run_id="RUN1")
+    state = WatcherState()
+    # Every node in the roster is excluded -> eligible_nodes() returns [].
+    for node in config.nodes:
+        state.excluded_nodes[node] = "crash-loop: missed 2 consecutive rounds of OLD"
+    state.run("RUN1").status = "ASSIGNING"
+
+    actions = advance_all_runs(
+        [config],
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=1000.0,
+    )
+
+    # Reported exactly once, then the loop gives up instead of spinning.
+    assert len(actions) == 1, f"expected one action, got {len(actions)}"
+    assert "no eligible nodes" in actions[0]
+    assert state.run("RUN1").status == "ASSIGNING"  # still needs a human
+
+
+def _probe_stdout(gpu_free_mib: int, shards: int) -> str:
+    return f"{gpu_free_mib}\n{shards}\n"
+
+
+def _replenish_fixture(tmp_path):
+    """Shared setup for the node-health replenishment tests: RUN1 is one node
+    short and node004 is the only same-tier candidate, holding s3."""
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config()
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.target_pool_size = 3
+    run.round = 4
+    exclude_node(state, "node003", "crash-loop: missed 2 consecutive rounds of RUN1")
+    _seed_placement(
+        mesh_shared,
+        {
+            "node001": ["s1", "s3"],
+            "node002": ["s2", "s3"],
+            "node003": ["s3"],
+            "node004": ["s3"],
+        },
+    )
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
+    assignments_path.write_text(
+        json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]})
+    )
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": list(_NODES),
+                    "n_shards": 3,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+    return run_config, run, state, mesh_shared, run_configs_path
+
+
+def _run_replenish(tmp_path, fixture, probe_stdout):
+    run_config, run, state, mesh_shared, run_configs_path = fixture
+    responses = {
+        "sinfo": MagicMock(returncode=0, stdout="node004 idle\n"),
+        "ssh": MagicMock(returncode=0, stdout=probe_stdout),
+        "sbatch": MagicMock(returncode=0, stdout="Submitted batch job 999\n"),
+    }
+
+    def _fake_run(cmd, *args, **kwargs):
+        return responses.get(cmd[0], responses["sbatch"])
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
+    ) as mock_run:
+        result = _replenish_pool(
+            run_config, run, state, mesh_shared, tmp_path, run_configs_path, "node003"
+        )
+    submitted = [c for c in mock_run.call_args_list if c[0][0][0] == "sbatch"]
+    return result, submitted
+
+
+def test_replenish_pool_skips_slurm_idle_node_whose_gpu_is_held(tmp_path):
+    """The 2026-08-21 birds regression: sinfo said idle, nvidia-smi said a
+    foreign process held 21.7 of 24.5 GiB, and the submitted worker died on
+    torch.OutOfMemoryError before round 1."""
+    fixture = _replenish_fixture(tmp_path)
+    result, submitted = _run_replenish(tmp_path, fixture, _probe_stdout(2914, 26))
+
+    assert submitted == []
+    assert (
+        "node004"
+        not in json.loads((tmp_path / "mesh_run_configs.json").read_text())[0]["nodes"]
+    )
+    assert result is not None and "node004" not in result
+
+
+def test_replenish_pool_skips_unseeded_node(tmp_path):
+    """The other half of the same regression: a free GPU on a node that was
+    never seeded, which died on FileNotFoundError for manifest.json."""
+    fixture = _replenish_fixture(tmp_path)
+    _, submitted = _run_replenish(tmp_path, fixture, _probe_stdout(24426, 0))
+    assert submitted == []
+
+
+def test_replenish_pool_skips_unreachable_node(tmp_path):
+    fixture = _replenish_fixture(tmp_path)
+    _, submitted = _run_replenish(tmp_path, fixture, "")
+    assert submitted == []
+
+
+def test_replenish_pool_submits_a_genuinely_healthy_node(tmp_path):
+    fixture = _replenish_fixture(tmp_path)
+    result, submitted = _run_replenish(tmp_path, fixture, _probe_stdout(24423, 26))
+
+    assert len(submitted) == 1
+    assert "node004" in result
+    assert (
+        "node004"
+        in json.loads((tmp_path / "mesh_run_configs.json").read_text())[0]["nodes"]
+    )
+
+
+def test_replenish_pool_still_reassigns_shards_when_health_gate_rejects(tmp_path):
+    """Rejecting a candidate must not regress the coverage guarantee: the
+    excluded node's shards still move to a survivor that holds them."""
+    fixture = _replenish_fixture(tmp_path)
+    _, _ = _run_replenish(tmp_path, fixture, _probe_stdout(2914, 26))
+
+    assignments = json.loads(
+        (
+            tmp_path / "mesh_shared" / "metadata" / "shard_assignments_RUN1.json"
+        ).read_text()
+    )
+    assert "node003" not in assignments
+    assert "s3" in assignments["node001"] + assignments["node002"]
+
+
+def _orphan_fixture(tmp_path):
+    """RUN1 loses node003, whose shard s3 NO survivor and no replacement
+    holds -- the 1x-replication case that dropped 46 of birds' 260 shards."""
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config()
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.target_pool_size = 3
+    run.round = 4
+    exclude_node(state, "node003", "crash-loop: missed 2 consecutive rounds of RUN1")
+    _seed_placement(
+        mesh_shared,
+        {
+            "node001": ["s1"],
+            "node002": ["s2"],
+            "node003": ["s3"],  # node021 holder of s3
+            "node004": [],  # healthy replacement, holds nothing
+        },
+    )
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
+    assignments_path.write_text(
+        json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]})
+    )
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": list(_NODES),
+                    "n_shards": 3,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+    return run_config, run, state, mesh_shared, assignments_path, run_configs_path
+
+
+def test_replenish_pool_copies_orphaned_shards_to_the_replacement(tmp_path):
+    (
+        run_config,
+        run,
+        state,
+        mesh_shared,
+        assignments_path,
+        run_configs_path,
+    ) = _orphan_fixture(tmp_path)
+
+    responses = {
+        "sinfo": MagicMock(returncode=0, stdout="node004 idle\n"),
+        "ssh": MagicMock(returncode=0, stdout="24423\n26\n"),
+        "sbatch": MagicMock(returncode=0, stdout="Submitted batch job 999\n"),
+    }
+
+    def _fake_run(cmd, *args, **kwargs):
+        return responses.get(cmd[0], responses["sbatch"])
+
+    with (
+        patch("video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run),
+        patch(
+            "video_encoding.watcher.mesh_tick.copy_shards", return_value=["s3"]
+        ) as mock_copy,
+    ):
+        result = _replenish_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            "node003",
+        )
+
+    mock_copy.assert_called_once_with("node003", "node004", ["s3"])
+    assignments = json.loads(assignments_path.read_text())
+    assert assignments["node004"] == ["s3"]
+    assert "node003" not in assignments
+    assert "recovered 1 shard(s)" in result
+    assert "dropped" not in result
+
+
+def test_replenish_pool_reports_a_drop_when_the_copy_fails(tmp_path):
+    """A failed rsync must not leave node004 named for a shard it lacks --
+    read_my_shards would crash the worker and exclude it two rounds later."""
+    (
+        run_config,
+        run,
+        state,
+        mesh_shared,
+        assignments_path,
+        run_configs_path,
+    ) = _orphan_fixture(tmp_path)
+
+    responses = {
+        "sinfo": MagicMock(returncode=0, stdout="node004 idle\n"),
+        "ssh": MagicMock(returncode=0, stdout="24423\n26\n"),
+        "sbatch": MagicMock(returncode=0, stdout="Submitted batch job 999\n"),
+    }
+
+    def _fake_run(cmd, *args, **kwargs):
+        return responses.get(cmd[0], responses["sbatch"])
+
+    with (
+        patch("video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run),
+        patch("video_encoding.watcher.mesh_tick.copy_shards", return_value=[]),
+    ):
+        result = _replenish_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            "node003",
+        )
+
+    assignments = json.loads(assignments_path.read_text())
+    assert assignments.get("node004") == []
+    assert "dropped 1 shard(s)" in result
+
+
+def test_replenish_pool_readmits_a_recovered_roster_node_and_submits_it(tmp_path):
+    """node003 is excluded and no fresh tier node is idle, but node003's own
+    GPU has freed up. It still holds its shards, so recovering it is strictly
+    better than leaving the pool short."""
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config()
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.target_pool_size = 3
+    run.round = 4
+    run.missed_rounds["node003"] = 2
+    exclude_node(state, "node003", "crash-loop: missed 2 consecutive rounds of RUN1")
+    _seed_placement(
+        mesh_shared,
+        {"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]},
+    )
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
+    assignments_path.write_text(
+        json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]})
+    )
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": list(_NODES),
+                    "n_shards": 3,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+
+    # Only node003 is idle -- no fresh replacement exists on the tier.
+    responses = {
+        "sinfo": MagicMock(returncode=0, stdout="node003 idle\n"),
+        "ssh": MagicMock(returncode=0, stdout="24423\n26\n"),
+        "sbatch": MagicMock(returncode=0, stdout="Submitted batch job 999\n"),
+    }
+
+    def _fake_run(cmd, *args, **kwargs):
+        return responses.get(cmd[0], responses["sbatch"])
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
+    ) as mock_run:
+        _replenish_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            "node003",
+        )
+
+    assert "node003" not in state.excluded_nodes
+    assert state.run("RUN1").readmitted["node003"] == 1
+    submitted = [c for c in mock_run.call_args_list if c[0][0][0] == "sbatch"]
+    assert len(submitted) == 1
+
+
+def test_replenish_pool_leaves_an_unhealthy_excluded_node_excluded(tmp_path):
+    """The counterpart: node003 is idle to SLURM but its GPU is still held,
+    so it must stay out rather than be re-admitted into `eligible` with no
+    job running -- which would stall every subsequent round."""
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config()
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.target_pool_size = 3
+    run.round = 4
+    run.missed_rounds["node003"] = 2
+    exclude_node(state, "node003", "crash-loop: missed 2 consecutive rounds of RUN1")
+    _seed_placement(mesh_shared, {"node001": ["s1"], "node002": ["s2"]})
+    (mesh_shared / "metadata" / "shard_assignments_RUN1.json").write_text(
+        json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]})
+    )
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": list(_NODES),
+                    "n_shards": 3,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+
+    responses = {
+        "sinfo": MagicMock(returncode=0, stdout="node003 idle\n"),
+        # GPU held by a foreign process: 2443 MiB free of 24.5 GiB.
+        "ssh": MagicMock(returncode=0, stdout="2443\n26\n"),
+        "sbatch": MagicMock(returncode=0, stdout="Submitted batch job 999\n"),
+    }
+
+    def _fake_run(cmd, *args, **kwargs):
+        return responses.get(cmd[0], responses["sbatch"])
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
+    ) as mock_run:
+        _replenish_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            "node003",
+        )
+
+    assert "node003" in state.excluded_nodes
+    assert state.run("RUN1").readmitted == {}
+    assert not any(c[0][0][0] == "sbatch" for c in mock_run.call_args_list)
+
+
+# --- periodic pool recovery ---------------------------------------------
+
+
+def _recovery_fixture(tmp_path, *, holdings=None, assignments=None):
+    """RUN1 has settled into a degraded steady state: node003 was excluded
+    long ago, nothing new is failing, so _replenish_pool is never called
+    again. node003 is healthy and still holds s3, which nobody trains."""
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config()
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.target_pool_size = 3
+    run.round = 7
+    run.missed_rounds["node003"] = 2
+    exclude_node(state, "node003", "crash-loop: missed 2 consecutive rounds of RUN1")
+    _seed_placement(
+        mesh_shared,
+        holdings
+        if holdings is not None
+        else {"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]},
+    )
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
+    assignments_path.write_text(
+        json.dumps(
+            assignments
+            if assignments is not None
+            else {"node001": ["s1"], "node002": ["s2"]}
+        )
+    )
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": list(_NODES),
+                    "n_shards": 3,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+    return run_config, run, state, mesh_shared, assignments_path, run_configs_path
+
+
+def _recovery_responses(probe_stdout="24423\n26\n"):
+    responses = {
+        "sinfo": MagicMock(returncode=0, stdout="node003 idle\n"),
+        "ssh": MagicMock(returncode=0, stdout=probe_stdout),
+        "sbatch": MagicMock(returncode=0, stdout="Submitted batch job 777\n"),
+    }
+
+    def _fake_run(cmd, *args, **kwargs):
+        return responses.get(cmd[0], responses["sbatch"])
+
+    return _fake_run
+
+
+def test_recover_pool_readmits_and_resubmits_a_healthy_excluded_node(tmp_path):
+    """The gap that let birds finish 4 rounds at 10 workers with 12 idle
+    machines beside it: nothing new was failing, so no recovery ever ran."""
+    (
+        run_config,
+        run,
+        state,
+        mesh_shared,
+        assignments_path,
+        run_configs_path,
+    ) = _recovery_fixture(tmp_path)
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run",
+        side_effect=_recovery_responses(),
+    ) as mock_run:
+        note = _recover_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            now=10_000.0,
+        )
+
+    assert "node003" not in state.excluded_nodes
+    assert json.loads(assignments_path.read_text())["node003"] == ["s3"]
+    submitted = [c for c in mock_run.call_args_list if c[0][0][0] == "sbatch"]
+    assert len(submitted) == 1
+    assert "+mesh.start_round=8" in submitted[0][0][0]  # run.round(7) + 1
+    assert note is not None and "node003" in note
+
+
+def test_recover_pool_leaves_an_unhealthy_node_excluded(tmp_path):
+    fixture = _recovery_fixture(tmp_path)
+    run_config, run, state, mesh_shared, assignments_path, run_configs_path = fixture
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run",
+        # GPU still held by a foreign process
+        side_effect=_recovery_responses("2443\n26\n"),
+    ) as mock_run:
+        note = _recover_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            now=10_000.0,
+        )
+
+    assert "node003" in state.excluded_nodes
+    assert note is None
+    assert not any(c[0][0][0] == "sbatch" for c in mock_run.call_args_list)
+
+
+def test_recover_pool_does_not_resubmit_a_node_with_no_shards_to_train(tmp_path):
+    """node003 is healthy but every shard it holds is already being trained
+    by a survivor. Submitting it would crash on read_my_shards' empty-list
+    guard and re-exclude it."""
+    fixture = _recovery_fixture(
+        tmp_path,
+        holdings={"node001": ["s1", "s3"], "node002": ["s2"], "node003": ["s3"]},
+        assignments={"node001": ["s1", "s3"], "node002": ["s2"]},
+    )
+    run_config, run, state, mesh_shared, assignments_path, run_configs_path = fixture
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run",
+        side_effect=_recovery_responses(),
+    ) as mock_run:
+        note = _recover_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            now=10_000.0,
+        )
+
+    assert note is None
+    assert "node003" in state.excluded_nodes
+    assert not any(c[0][0][0] == "sbatch" for c in mock_run.call_args_list)
+
+
+def test_recover_pool_is_throttled_between_probes(tmp_path):
+    fixture = _recovery_fixture(tmp_path)
+    run_config, run, state, mesh_shared, assignments_path, run_configs_path = fixture
+    run.last_recovery_at = 9_900.0
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run",
+        side_effect=_recovery_responses(),
+    ) as mock_run:
+        note = _recover_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            now=10_000.0,
+        )
+
+    assert note is None
+    assert mock_run.call_count == 0  # not even an sinfo probe
+    assert "node003" in state.excluded_nodes
+
+
+def test_recover_pool_noop_when_the_pool_is_already_full(tmp_path):
+    fixture = _recovery_fixture(tmp_path)
+    run_config, run, state, mesh_shared, assignments_path, run_configs_path = fixture
+    run.target_pool_size = 2  # node001 + node002 already meet it
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run",
+        side_effect=_recovery_responses(),
+    ) as mock_run:
+        note = _recover_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            now=10_000.0,
+        )
+
+    assert note is None
+    assert mock_run.call_count == 0
+
+
+# --- quorum floor --------------------------------------------------------
+
+
+def _quorum_fixture(tmp_path, *, quorum_k, checked_in, excluded=()):
+    """RUN1 with a configured quorum floor; `checked_in` nodes have pushed a
+    checkpoint for round 0 and `excluded` are permanently out."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    for node in checked_in:
+        _write_pending_checkpoint(pending_dir / f"RUN1_0_{node}.pt")
+    run_config = _run_config(quorum_k=quorum_k)
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.status = "AWAITING_CHECKPOINTS"
+    run.round = 0
+    run.round_started_at = 0.0
+    for node in excluded:
+        exclude_node(state, node, "crash-loop: missed 2 consecutive rounds of RUN1")
+    return run_config, run, state, mesh_shared
+
+
+def test_awaiting_checkpoints_halts_when_the_roster_falls_below_quorum(tmp_path):
+    """The bypass that let factorial-tube-per_frame merge 10-wide against
+    quorum_k=12 for its last four rounds: `checked_in >= eligible` is
+    trivially true once exclusions shrink eligible below the floor, and it
+    fires before quorum is ever consulted."""
+    run_config, run, state, mesh_shared = _quorum_fixture(
+        tmp_path,
+        quorum_k=3,
+        checked_in=["node001", "node002"],
+        excluded=["node003"],
+    )
+
+    note = _do_awaiting_checkpoints(
+        run_config, run, state, mesh_shared, 1.0, tmp_path, None
+    )
+
+    assert run.status == "DEGRADED"
+    assert "quorum_k=3" in note
+    assert "2 checked in" in note
+
+
+def test_awaiting_checkpoints_merges_normally_when_quorum_is_met(tmp_path):
+    run_config, run, state, mesh_shared = _quorum_fixture(
+        tmp_path, quorum_k=3, checked_in=["node001", "node002", "node003"]
+    )
+
+    note = _do_awaiting_checkpoints(
+        run_config, run, state, mesh_shared, 1.0, tmp_path, None
+    )
+
+    assert run.status == "MERGING"
+    assert "DEGRADED" not in note
+
+
+def test_awaiting_checkpoints_without_quorum_k_keeps_the_old_behaviour(tmp_path):
+    """Every run configured before quorum_k existed has None for it and must
+    keep merging on the all-checked-in path."""
+    run_config, run, state, mesh_shared = _quorum_fixture(
+        tmp_path,
+        quorum_k=None,
+        checked_in=["node001", "node002"],
+        excluded=["node003"],
+    )
+
+    _do_awaiting_checkpoints(run_config, run, state, mesh_shared, 1.0, tmp_path, None)
+
+    assert run.status == "MERGING"
+
+
+def test_degraded_run_is_not_advanced_further(tmp_path):
+    run_config, run, state, mesh_shared = _quorum_fixture(
+        tmp_path, quorum_k=3, checked_in=["node001"]
+    )
+    run.status = "DEGRADED"
+
+    note = advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=1.0,
+    )
+
+    assert note is None
+    assert run.status == "DEGRADED"
+
+
+def test_awaiting_checkpoints_halts_on_the_timeout_path_below_quorum(tmp_path):
+    """The grace-expired fall-through merges "whatever arrived", which is the
+    other way a sub-quorum merge slips through."""
+    run_config, run, state, mesh_shared = _quorum_fixture(
+        tmp_path, quorum_k=3, checked_in=[]
+    )
+
+    note = _do_awaiting_checkpoints(
+        run_config, run, state, mesh_shared, 1000.0, tmp_path, None
+    )
+
+    assert run.status == "DEGRADED"
+    assert "below quorum_k=3" in note
+
+
+def test_awaiting_checkpoints_timeout_still_merges_when_quorum_holds(tmp_path):
+    """A straggler short of the full roster but at or above the floor is
+    exactly what quorum merge is for -- it must still merge."""
+    run_config, run, state, mesh_shared = _quorum_fixture(
+        tmp_path, quorum_k=2, checked_in=["node001", "node002"]
+    )
+
+    note = _do_awaiting_checkpoints(
+        run_config, run, state, mesh_shared, 1000.0, tmp_path, None
+    )
+
+    assert run.status == "MERGING"
+    assert "DEGRADED" not in note
+
+
+def test_assigning_reports_nodes_whose_sbatch_failed(tmp_path):
+    """A failed submission must not be reported as a running worker.
+
+    The return value of `_submit_worker_job` used to be discarded and the
+    transition counted `eligible`, so a pool logged "16 nodes" while 15 jobs
+    existed. With quorum_k == pool size the missing worker cannot be waited
+    out: every round burns the full grace_s and then merges timeout-forced.
+    """
+    mesh_shared = tmp_path / "mesh_shared"
+    _seed_shard_map(mesh_shared)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    outcomes = [
+        MagicMock(returncode=0, stdout="Submitted batch job 101\n"),
+        MagicMock(returncode=1, stdout="", stderr="sbatch: error: node down"),
+        MagicMock(returncode=0, stdout="Submitted batch job 103\n"),
+    ]
+    with patch("video_encoding.watcher.mesh_tick.subprocess.run", side_effect=outcomes):
+        action = advance_one_run(
+            _run_config(),
+            state=WatcherState(),
+            repo_root=repo_root,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path / "mesh_root",
+            now=1000.0,
+        )
+
+    assert "2/3 nodes submitted" in action
+    assert "sbatch FAILED for" in action
+    # Exactly the node whose submission failed -- the other two are running.
+    failed = action.split("sbatch FAILED for ")[1].split(";")[0]
+    assert failed == _NODES[1]
+
+    # ...and only the successful submissions reach the registry, so the
+    # relaunch detector never waits on a job that was never created.
+    registry = json.loads(
+        (repo_root / "runs" / "state" / "jobs_registry.json").read_text()
+    )
+    assert [r["slurm_job_id"] for r in registry] == ["101", "103"]
+    assert [r["nodelist"] for r in registry] == [_NODES[0], _NODES[2]]
+
+
+def _write_straggler_state(
+    tmp_path, *, job_id="709", node="node067", state_name="RUNNING"
+):
+    """A registry record plus a squeue snapshot describing one live worker."""
+    state_dir = tmp_path / "runs" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "jobs_registry.json").write_text(
+        json.dumps(
+            [
+                {
+                    "slurm_job_id": job_id,
+                    "experiment": "videomae_mesh_ssl",
+                    "run_tag": "RUN1",
+                    "submitted_at": "2026-08-23T09:00:00+00:00",
+                    "nodelist": node,
+                }
+            ]
+        )
+    )
+    (state_dir / "squeue.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {"job_id": int(job_id), "job_state": [state_name], "nodes": node}
+                ]
+            }
+        )
+    )
+
+
+def test_done_cancels_straggling_workers(tmp_path):
+    """A run reaches DONE on quorum, so a node behind the pool's cadence is
+    still training rounds nobody will merge. Observed 2026-08-23: node067 was
+    on round 39 of a run that had reported DONE at 40."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+    _write_straggler_state(tmp_path)
+
+    run_config = _run_config(rounds=10)
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 9  # one flag-write from DONE
+
+    with patch("video_encoding.watcher.mesh_tick.subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        mock_run.return_value.stderr = ""
+        action = advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    scancels = [
+        c.args[0]
+        for c in mock_run.call_args_list
+        if c.args and c.args[0][0] == "scancel"
+    ]
+    assert scancels == [["scancel", "709"]]
+    assert "cancelled 1 straggling worker(s): 709" in action
+
+
+def test_done_does_not_cancel_a_recycled_job_id_on_another_node(tmp_path):
+    """Job ids are not unique over time -- the 2026-08-22 rebuild reset the
+    counter -- so a stale record must never cancel a stranger's job."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+    _write_straggler_state(tmp_path, node="node067")
+    state_dir = tmp_path / "runs" / "state"
+    (state_dir / "squeue.json").write_text(
+        json.dumps(
+            {"jobs": [{"job_id": 709, "job_state": ["RUNNING"], "nodes": "not-ours"}]}
+        )
+    )
+
+    run_config = _run_config(rounds=10)
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 9
+
+    with patch("video_encoding.watcher.mesh_tick.subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        mock_run.return_value.stderr = ""
+        action = advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert not [
+        c for c in mock_run.call_args_list if c.args and c.args[0][0] == "scancel"
+    ]
+    assert "no stragglers to cancel" in action
+
+
+def test_done_still_completes_when_scancel_fails(tmp_path):
+    """A failed cancel must not stop a run reporting DONE or releasing state."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+    _write_straggler_state(tmp_path)
+
+    run_config = _run_config(rounds=10)
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 9
+
+    def _fake_run(cmd, *args, **kwargs):
+        if cmd[0] == "scancel":
+            raise OSError("scancel: command not found")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch("video_encoding.watcher.mesh_tick.subprocess.run", _fake_run):
+        action = advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert state.run("RUN1").status == "DONE"
+    assert "failed to run" in action
+
+
+@pytest.mark.parametrize(
+    "experiment",
+    [
+        p.stem
+        for p in sorted(
+            (Path(__file__).resolve().parents[1] / "conf" / "experiment").glob(
+                "videomae_mesh_*.yaml"
+            )
+        )
+    ],
+)
+def test_submit_worker_job_composes_with_chunk_rounds_for_every_mesh_experiment(
+    tmp_path, experiment
+):
+    """Same '+'-on-an-existing-key regression as
+    test_submit_worker_job_overrides_compose_against_real_experiment_config,
+    but for mesh.chunk_rounds, which that test never exercises: its
+    _run_config() leaves chunk_rounds None, so the override is omitted
+    entirely. chunk_rounds is not optional in practice -- the 2h partition
+    walltime cap makes an unchunked run unschedulable -- and the
+    paper-recipe experiment configs declare it, so '+' aborts every worker
+    at Hydra composition before it reaches a GPU. Parametrized over every
+    mesh experiment config so a config added later cannot silently
+    reintroduce it."""
+    from hydra import compose, initialize_config_dir
+
+    run_config = _run_config(experiment=experiment, chunk_rounds=4)
+    registry_path = tmp_path / "jobs_registry.json"
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 556\n")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        _submit_worker_job(
+            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+        )
+    submitted_cmd = mock_run.call_args[0][0]
+    hydra_overrides = [a for a in submitted_cmd if a.startswith("+")]
+    assert any("chunk_rounds" in o for o in hydra_overrides)
+
+    conf_dir = Path(__file__).resolve().parents[1] / "conf"
+    with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
+        cfg = compose(
+            config_name="config",
+            overrides=[f"experiment={experiment}", *hydra_overrides],
+        )
+    assert cfg.mesh.chunk_rounds == 4

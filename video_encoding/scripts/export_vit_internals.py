@@ -121,10 +121,21 @@ def load_encoder(run_id: str, mesh_shared: Path, model_cfg) -> VideoMAEEncoder:
     payload = ckpt_io.load_checkpoint_file(ckpt_path)
     state_dict = to_fp32_state_dict(payload["model_state_dict"])
     result = model.load_state_dict(state_dict, strict=False)
-    if result.missing_keys or result.unexpected_keys:
+    # Checkpoints predating RegisterTokens lack `encoder.registers.tokens`.
+    # At num_registers=0 that parameter holds zero elements and is never used,
+    # so tolerate exactly this key -- and only when it is genuinely empty.
+    missing = [
+        k
+        for k in result.missing_keys
+        if not (
+            k == "encoder.registers.tokens"
+            and model.encoder.registers.tokens.numel() == 0
+        )
+    ]
+    if missing or result.unexpected_keys:
         raise ValueError(
             f"{run_id}: checkpoint/model key mismatch -- "
-            f"missing={result.missing_keys[:5]} unexpected={result.unexpected_keys[:5]}"
+            f"missing={missing[:5]} unexpected={result.unexpected_keys[:5]}"
         )
     return model.encoder.eval()
 
@@ -143,20 +154,23 @@ def run_encoder_with_internals(
     with torch.no_grad():
         x = encoder.patch_embed(pixel_values)
         x = x + encoder.pos_embed
+        x = encoder.registers.prepend(x)
+        n_reg = encoder.registers.num_registers
         received_attn: list[np.ndarray] = []
         attn_out_norms: list[np.ndarray] = []
         hidden: list[np.ndarray] = []
         for block in encoder.blocks:
             h = block.norm1(x)
-            attn_out, attn_weights = block.attn(
-                h, h, h, need_weights=True, average_attn_weights=False
+            attn_out, attn_weights = block.attn(h, need_weights=True)
+            received_attn.append(
+                attn_weights[0].mean(dim=(0, 1))[n_reg:].numpy().copy()
             )
-            received_attn.append(attn_weights[0].mean(dim=(0, 1)).numpy().copy())
-            attn_out_norms.append(attn_out[0].norm(dim=-1).numpy().copy())
+            attn_out_norms.append(attn_out[0].norm(dim=-1)[n_reg:].numpy().copy())
             del attn_weights
-            x = x + block.drop_path(attn_out)
-            x = x + block.drop_path(block.mlp(block.norm2(x)))
-            hidden.append(x[0].numpy().copy())
+            x = x + block.drop_path(block.layer_scale1(attn_out))
+            x = x + block.drop_path(block.layer_scale2(block.mlp(block.norm2(x))))
+            hidden.append(x[0][n_reg:].numpy().copy())
+        x = encoder.registers.strip(x)
         final_tokens = encoder.norm(x)[0].numpy().copy()
     return {
         "received_attn": received_attn,  # list[depth] of (N,)

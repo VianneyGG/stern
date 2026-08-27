@@ -170,7 +170,12 @@ def test_main_writes_csv_and_pngs(tmp_path):
                 f"node{i}",
                 [
                     {"round": 1, "val_loss": 0.8, "ts": 0.0, "n_samples": 100},
-                    {"round": 2, "val_loss": 0.4 / n_nodes, "ts": 100.0, "n_samples": 100},
+                    {
+                        "round": 2,
+                        "val_loss": 0.4 / n_nodes,
+                        "ts": 100.0,
+                        "n_samples": 100,
+                    },
                 ],
             )
         _write_merge(merge_root / f"{run_id}_rounds.jsonl", {0: n_nodes, 1: n_nodes})
@@ -201,7 +206,10 @@ def test_main_writes_csv_and_pngs(tmp_path):
 
     rows = out_csv.read_text().splitlines()
     assert len(rows) == 1 + 2  # header + one row per cell found
-    for png in (out_png.with_name("curve_wallclock.png"), out_png.with_name("curve_samples.png")):
+    for png in (
+        out_png.with_name("curve_wallclock.png"),
+        out_png.with_name("curve_samples.png"),
+    ):
         assert png.stat().st_size > 0
 
 
@@ -212,7 +220,10 @@ def test_main_warns_when_the_target_is_above_a_cells_first_round(tmp_path):
     _write_worker(
         metrics_root / "nsl-n01a",
         "node0",
-        [{"round": 1, "val_loss": 0.2, "ts": 0.0}, {"round": 2, "val_loss": 0.1, "ts": 100.0}],
+        [
+            {"round": 1, "val_loss": 0.2, "ts": 0.0},
+            {"round": 2, "val_loss": 0.1, "ts": 100.0},
+        ],
     )
 
     rc = subprocess.run(

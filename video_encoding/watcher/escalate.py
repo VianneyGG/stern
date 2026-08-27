@@ -12,6 +12,7 @@ whatever was written on disk.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,18 @@ _NAN_ALLOWED_TOOLS = "Read,Grep,Glob,Bash(video_encoding/scripts/slurm_wrapper.s
 
 def _today_utc(now: float) -> str:
     return datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _claude_bin() -> str:
+    """Absolute path to claude, for subprocesses launched from the watcher.
+
+    Same PATH gap as mesh_tick.py::_uv_bin -- `uv run` from cron only
+    prepends the venv's bin dir to PATH, not ~/.local/bin, so a bare
+    "claude" resolves fine interactively but raises FileNotFoundError on
+    every cron tick, silently disabling every escalation path (quota,
+    stalled, repeat-dead, NaN).
+    """
+    return shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
 
 
 def should_escalate(
@@ -111,7 +124,7 @@ def run_escalation(
 
     prompt = build_prompt(flag, registry_entry=registry_entry)
     cmd = [
-        "claude",
+        _claude_bin(),
         "-p",
         "--max-turns",
         str(max_turns),
@@ -214,7 +227,7 @@ def remediate_nan_node(
     transcript_dir.mkdir(parents=True, exist_ok=True)
     prompt = build_nan_prompt(flag, run_id=run_id, node=node)
     cmd = [
-        "claude",
+        _claude_bin(),
         "-p",
         "--max-turns",
         str(DEFAULT_MAX_TURNS),

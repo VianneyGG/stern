@@ -19,7 +19,9 @@ def _window_cfg():
     return OmegaConf.create({"len_s": 2.0, "overlap": 0.5})
 
 
-def _write_synthetic_mp4(path: Path, num_frames: int = 10, width: int = 32, height: int = 32) -> None:
+def _write_synthetic_mp4(
+    path: Path, num_frames: int = 10, width: int = 32, height: int = 32
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     container = av.open(str(path), mode="w")
     stream = container.add_stream("mpeg4", rate=25)

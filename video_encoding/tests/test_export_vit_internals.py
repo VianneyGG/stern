@@ -195,17 +195,6 @@ def test_load_encoder_missing_checkpoint_raises_file_not_found(tmp_path):
 # --- instrumented forward: must match the real encoder exactly ----------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "run_encoder_with_internals calls block.attn(h, h, h, need_weights=True, "
-        "average_attn_weights=False), the old nn.MultiheadAttention calling "
-        "convention. ViTBlock's attn is now SelfAttention (single-tensor input, "
-        "no average_attn_weights kwarg) -- known, deferred to the follow-up "
-        "change that updates this diagnostics script's block-internals access "
-        "(see docs/superpowers/plans/2026-08-16-videomae-vit-block-rewrite.md)."
-    ),
-    strict=True,
-)
 def test_run_encoder_with_internals_matches_real_forward():
     cfg = _tiny_model_cfg()
     model = VideoMAEForPreTraining(cfg).eval()

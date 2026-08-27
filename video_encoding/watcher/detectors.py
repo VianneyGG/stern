@@ -148,6 +148,14 @@ def detect_nan(
     by training/mesh_round.py::_append_round_metrics) -- only the LAST line
     per node is live; a node that NaN'd once and then recovered on a later
     round must not keep getting flagged.
+
+    A relaunch of an existing run_id reuses the same metrics directory (unlike
+    the checkpoint dir, nothing renames or clears it), so until a worker
+    appends its first round the last line is still the *previous* attempt's
+    -- typically a NaN, since a failed attempt is what prompted the relaunch.
+    On 2026-08-21 that window excluded 8 healthy nodes and shrank one arm's
+    roster from 16 to exactly quorum. Records older than the current round's
+    start therefore cannot describe this round and are skipped.
     """
     flags: list[Flag] = []
     run_state = state.runs.get(run_id)
@@ -167,6 +175,10 @@ def detect_nan(
         record = _last_json_line(node_file)
         if record is None:
             continue
+        if run_state is not None and run_state.round_started_at:
+            ts = record.get("ts")
+            if isinstance(ts, (int, float)) and ts < run_state.round_started_at:
+                continue  # left over from a previous attempt at this run_id
         loss = record.get("train_loss")
         if not isinstance(loss, (int, float)) or not (
             math.isnan(loss) or math.isinf(loss)

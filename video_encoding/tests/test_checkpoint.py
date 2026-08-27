@@ -375,13 +375,17 @@ class TestLoadCheckpointFileRemapsLegacyKeys:
         loaded = load_checkpoint_file(path)
 
         assert list(loaded) == ["encoder.blocks.0.attn.proj.bias"]
-        assert torch.equal(loaded["encoder.blocks.0.attn.proj.bias"], torch.tensor([5.0]))
+        assert torch.equal(
+            loaded["encoder.blocks.0.attn.proj.bias"], torch.tensor([5.0])
+        )
 
     def test_leaves_sibling_payload_entries_alone(self, tmp_path):
         """Only the model weights are renamed; optimizer state and metadata
         must survive byte-for-byte, since the outer-step code reads them."""
         payload = {
-            "model_state_dict": {"encoder.blocks.0.attn.in_proj_bias": torch.tensor([1.0])},
+            "model_state_dict": {
+                "encoder.blocks.0.attn.in_proj_bias": torch.tensor([1.0])
+            },
             "optimizer_state_dict": {"state": {0: {"exp_avg": torch.tensor([4.0])}}},
             "round": 120,
         }

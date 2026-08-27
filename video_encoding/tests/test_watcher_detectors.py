@@ -230,3 +230,29 @@ def test_detect_nan_skips_run_already_marked_done(tmp_path):
     state = WatcherState()
     state.run("run1").status = "DONE"
     assert detect_nan("run1", tmp_path, state) == []
+
+
+def test_detect_nan_ignores_a_line_left_over_from_a_previous_attempt(tmp_path):
+    """A relaunch reuses the metrics dir, so before a worker appends its
+    first round the last line is still the failed attempt's NaN. Flagging it
+    excluded 8 healthy nodes on login-node 2026-08-21 (node039's file held
+    round 38 NaN from job 60 next to a healthy round 1 from job 162)."""
+    _write_metrics(
+        tmp_path / "metrics" / "run1" / "nodeA.jsonl",
+        [_round_record("nodeA", 38, float("nan"))],  # ts = 1038.0
+    )
+    state = WatcherState()
+    state.run("run1").round_started_at = 2000.0
+    assert detect_nan("run1", tmp_path, state) == []
+
+
+def test_detect_nan_still_flags_a_nan_written_during_the_current_round(tmp_path):
+    _write_metrics(
+        tmp_path / "metrics" / "run1" / "nodeA.jsonl",
+        [_round_record("nodeA", 1, float("nan"))],  # ts = 1001.0
+    )
+    state = WatcherState()
+    state.run("run1").round_started_at = 1000.0
+    flags = detect_nan("run1", tmp_path, state)
+    assert len(flags) == 1
+    assert flags[0].subject == "nan:run1:nodeA"

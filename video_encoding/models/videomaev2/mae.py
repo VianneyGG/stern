@@ -107,8 +107,8 @@ class VideoMAEForPreTraining(nn.Module):
 
         Args:
             pixel_values: (B, C, T, H, W) video frames
-            keep_indices: (num_kept,) token indices to keep (sampled at train time)
-            mask_indices: (num_masked,) token indices to mask
+            keep_indices: (B, num_kept) token indices to keep (sampled at train time)
+            mask_indices: (B, num_masked) token indices to mask
 
         Returns:
             pred: (B, num_masked, 3*patch_size^2) predicted pixel values
@@ -127,10 +127,13 @@ class VideoMAEForPreTraining(nn.Module):
             # V2 dual-masking: subsample which masked tokens contribute to loss/target.
             # The decoder still processes the full token sequence (masked+visible);
             # only the reconstruction target is subsampled, not the decoder's compute footprint.
-            n_mask = mask_indices.shape[0]
+            # Independent subsample per row, same n_recon count for every
+            # row (decoder_mask_ratio is a fixed fraction of n_mask).
+            n_mask = mask_indices.shape[1]
             n_recon = max(1, round(n_mask * (1.0 - self.decoder_mask_ratio)))
-            perm = torch.randperm(n_mask, device=pixel_values.device)[:n_recon]
-            mask_indices = mask_indices[perm]
+            noise = torch.rand(B, n_mask, device=pixel_values.device)
+            perm = torch.argsort(noise, dim=1)[:, :n_recon]
+            mask_indices = torch.gather(mask_indices, 1, perm)
 
         # Positional embedding is added once, up front, so both the encoder
         # (on visible tokens) and the decoder (on visible + mask tokens) know
@@ -142,27 +145,31 @@ class VideoMAEForPreTraining(nn.Module):
         visible = self.encoder.forward_tokens(x, keep_indices)  # (B, num_kept, D)
         visible = self.encoder_to_decoder(visible)  # (B, num_kept, decoder_embed_dim)
 
-        num_masked = mask_indices.shape[0]
+        num_masked = mask_indices.shape[1]
         mask_tokens = self.mask_token.expand(B, num_masked, -1)
 
-        # Scatter visible + mask tokens back to their original positions.
+        # Scatter visible + mask tokens back to their per-sample positions.
         decoder_tokens = visible.new_zeros(B, N, self.decoder_embed_dim)
+        keep_idx = keep_indices.unsqueeze(-1).expand(-1, -1, self.decoder_embed_dim)
+        mask_idx = mask_indices.unsqueeze(-1).expand(-1, -1, self.decoder_embed_dim)
         # Under autocast, `visible` is the AMP dtype (bf16/fp16) while the
         # mask_token parameter stays fp32; match both to the destination dtype
-        # so the index-assign doesn't raise a dtype-mismatch.
-        decoder_tokens[:, keep_indices, :] = visible.to(decoder_tokens.dtype)
-        decoder_tokens[:, mask_indices, :] = mask_tokens.to(decoder_tokens.dtype)
+        # so the scatter doesn't raise a dtype-mismatch.
+        decoder_tokens.scatter_(1, keep_idx, visible.to(decoder_tokens.dtype))
+        decoder_tokens.scatter_(1, mask_idx, mask_tokens.to(decoder_tokens.dtype))
         decoder_tokens = decoder_tokens + self.decoder_pos_embed
 
         for block in self.decoder_blocks:
             decoder_tokens = block(decoder_tokens)
         decoder_tokens = self.decoder_norm(decoder_tokens)
 
-        pred_full = self.predict_head(decoder_tokens)  # (B, N, 3*patch_size^2)
-        pred = pred_full[:, mask_indices, :]
+        pred_full = self.predict_head(decoder_tokens)  # (B, N, out_dim)
+        pred_idx = mask_indices.unsqueeze(-1).expand(-1, -1, pred_full.shape[-1])
+        pred = torch.gather(pred_full, 1, pred_idx)
 
-        target_full = self._patchify_targets(pixel_values)  # (B, N, 3*patch_size^2)
-        target = target_full[:, mask_indices, :]
+        target_full = self._patchify_targets(pixel_values)  # (B, N, out_dim)
+        target_idx = mask_indices.unsqueeze(-1).expand(-1, -1, target_full.shape[-1])
+        target = torch.gather(target_full, 1, target_idx)
 
         return pred, target
 

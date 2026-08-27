@@ -39,9 +39,7 @@ def test_all_four_cells_are_submitted(dry_run):
 
 def test_each_arm_gets_its_own_node(dry_run):
     nodes = [
-        line.split("-> ")[1].strip()
-        for line in dry_run.splitlines()
-        if "] -> " in line
+        line.split("-> ")[1].strip() for line in dry_run.splitlines() if "] -> " in line
     ]
     assert len(nodes) == 4
     assert len(set(nodes)) == 4, f"arms share a node: {nodes}"
@@ -78,8 +76,7 @@ def test_never_writes_to_the_live_checkout_or_nfs_home(dry_run):
     stray = [
         line
         for line in dry_run.splitlines()
-        if "stern/" in line.replace("stern_factorial/", "")
-        and "ln -sfn" not in line
+        if "stern/" in line.replace("stern_factorial/", "") and "ln -sfn" not in line
     ]
     assert stray == [], stray
 

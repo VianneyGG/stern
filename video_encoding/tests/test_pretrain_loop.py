@@ -135,3 +135,93 @@ def test_train_epoch_skips_nonfinite_loss_without_poisoning_average():
     assert math.isfinite(stats["loss"])  # average over the 2 finite steps only
     for p in model.parameters():
         assert p.grad is None or torch.isfinite(p.grad).all()
+
+
+def _run(
+    loader, *, abandon_check=None, abandon_check_every=50, max_steps=0, accum_steps=1
+):
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    model = VideoMAEForPreTraining(_tiny_cfg()).to(device)
+    return _train_epoch_ssl(
+        model,
+        loader,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        device,
+        RandomTubeMasking(mask_ratio=0.5),
+        accum_steps=accum_steps,
+        max_steps=max_steps,
+        timing_warmup_steps=0,
+        amp="off",
+        abandon_check=abandon_check,
+        abandon_check_every=abandon_check_every,
+    )
+
+
+def test_no_abandon_check_is_unchanged_behaviour():
+    stats = _run(_loader(n_samples=8, batch_size=2))
+    assert stats["abandoned"] is False
+    assert stats["steps"] == 4
+
+
+def test_abandon_check_never_true_runs_the_full_epoch():
+    calls = []
+
+    def _check():
+        calls.append(1)
+        return False
+
+    stats = _run(
+        _loader(n_samples=8, batch_size=2), abandon_check=_check, abandon_check_every=1
+    )
+    assert stats["abandoned"] is False
+    assert stats["steps"] == 4
+    assert len(calls) == 4  # polled once per step, never short-circuited
+
+
+def test_abandon_check_stops_the_epoch_early():
+    """The pool merged this round without us -- every further step is waste."""
+    state = {"n": 0}
+
+    def _check():
+        state["n"] += 1
+        return state["n"] >= 2
+
+    stats = _run(
+        _loader(n_samples=20, batch_size=2), abandon_check=_check, abandon_check_every=1
+    )
+    assert stats["abandoned"] is True
+    assert stats["steps"] == 2  # stopped well short of the 10 available
+    assert math.isfinite(stats["loss"])  # work done before the break still counts
+
+
+def test_abandon_is_not_polled_mid_accumulation():
+    """Breaking between a backward and its boundary step would drop
+    accum_steps-1 micro-batches' gradients on the floor."""
+    seen_at = []
+    state = {"steps": 0}
+
+    def _check():
+        seen_at.append(state["steps"])
+        return False
+
+    class _CountingLoader:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __iter__(self):
+            for batch in self._inner:
+                state["steps"] += 1
+                yield batch
+
+        def __len__(self):
+            return len(self._inner)
+
+    _run(
+        _CountingLoader(_loader(n_samples=16, batch_size=2)),
+        abandon_check=_check,
+        abandon_check_every=1,
+        accum_steps=4,
+    )
+    # Polled only on accumulation boundaries: steps 4, 8, ...
+    assert seen_at == [4, 8]

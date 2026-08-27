@@ -48,7 +48,7 @@ def subsample_stride(
             f"stride {stride} x {num_frames} frames needs {needed} frames, "
             f"clip has {available}"
         )
-    return pixel_values[:, :, : needed : stride]
+    return pixel_values[:, :, :needed:stride]
 
 
 def motion_budget(

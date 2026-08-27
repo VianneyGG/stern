@@ -43,7 +43,11 @@ def test_load_is_balanced_across_holders_rather_than_dumped_on_the_first():
     simply trains less of it -- the imbalance shows up as silently skipped
     data, not as a longer round."""
     shards = [f"shard-{i:03d}" for i in range(30)]
-    holdings = {"node001": list(shards), "node002": list(shards), "node004": list(shards)}
+    holdings = {
+        "node001": list(shards),
+        "node002": list(shards),
+        "node004": list(shards),
+    }
     result = assign_static(holdings, set(shards))
 
     counts = sorted(len(v) for v in result.values())
@@ -93,3 +97,39 @@ def test_output_is_json_round_trippable():
 
     result = assign_static({"node001": ["shard-a"]}, {"shard-a"})
     assert json.loads(json.dumps(result)) == result
+
+
+def test_every_holder_gets_at_least_one_shard_when_holdings_overlap():
+    """A node holding few, heavily-replicated shards must still train.
+
+    Reproduces the 2026-08-21 factorial collapse: `assign_static` broke
+    load ties on node name, so a node whose whole (small) holding was also
+    held by alphabetically-earlier nodes lost every tie and was assigned
+    zero shards. `mesh_round` then reported train_loss=nan / 0.0 samp/s and
+    skipped its push, dropping merge quorum to a single contributor.
+    """
+    # node068 holds only two shards, and four other nodes that sort earlier
+    # hold them too. Every one of those competitors is still at load 0 when
+    # s1/s2 are handed out, so node068 loses both ties and starves.
+    holdings = {
+        "node002": ["s1", "s2", "s3", "s4", "s5", "s6"],
+        "node004": ["s1", "s2", "s3", "s4", "s5", "s6"],
+        "node008": ["s1", "s2", "s3", "s4", "s5", "s6"],
+        "node027": ["s1", "s2", "s3", "s4", "s5", "s6"],
+        "node068": ["s1", "s2"],
+    }
+    expected = {"s1", "s2", "s3", "s4", "s5", "s6"}
+
+    assignment = assign_static(holdings, expected)
+
+    assert len(assignment["node068"]) >= 1, (
+        "node068 holds shards but was assigned none; it would train on zero "
+        f"samples and skip its push. assignment={assignment}"
+    )
+    # The core invariants must still hold.
+    flat = [s for shards in assignment.values() for s in shards]
+    assert sorted(flat) == sorted(expected), "shards must be partitioned exactly once"
+    for node, shards in assignment.items():
+        assert set(shards) <= set(holdings[node]), (
+            f"{node} assigned a shard it does not hold"
+        )

@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import socket
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -90,6 +92,12 @@ def _fp16_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Ten
     }
 
 
+# Three rounds in a row merged without us is no longer a transient: it means
+# this node's cadence is persistently slower than its pool's, and preemption
+# is silently keeping it in the roster while it contributes nothing.
+_ABANDON_ALERT_STREAK = 3
+
+
 def _append_round_metrics(
     mesh_shared: Path,
     run_id: str,
@@ -103,6 +111,8 @@ def _append_round_metrics(
     *,
     n_samples: int,
     n_steps: int,
+    abandoned: bool = False,
+    consecutive_abandons: int = 0,
 ) -> None:
     """Append one JSONL record to mesh_shared/metrics/<run_id>/<node>.jsonl.
 
@@ -126,6 +136,14 @@ def _append_round_metrics(
         # measures.
         "n_samples": n_samples,
         "n_steps": n_steps,
+        # A preempted node writes a record too, so that "this node stopped
+        # contributing" is visible in the same stream we already aggregate
+        # rather than showing up as a silent gap. Preemption trades a loud
+        # failure (the pool stalls behind a straggler) for a quiet one (the
+        # straggler holds a whole node and merges into nothing), and this is
+        # what keeps the quiet one countable.
+        "abandoned": abandoned,
+        "consecutive_abandons": consecutive_abandons,
         "ts": time.time(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
     }
@@ -188,6 +206,77 @@ def _require_local_shards(
     )
 
 
+def mesh_round_lr(
+    peak_lr: float,
+    round_num: int,
+    total_rounds: int,
+    *,
+    warmup_frac: float = 0.05,
+    min_lr: float = 1e-5,
+) -> float:
+    """Cosine decay with linear warmup, evaluated at round granularity.
+
+    One value per round, constant across that round's H inner steps -- mirrors
+    pretrain.py's `_build_scheduler` (per-epoch stepping) but is a pure
+    function of round_num rather than persisted optimizer/scheduler state, so
+    a worker relaunched mid-run (chunk_rounds) reconstructs the exact same LR
+    for round_num without needing to have lived through the earlier rounds.
+    """
+    warmup_rounds = max(1, round(warmup_frac * total_rounds))
+    if round_num < warmup_rounds:
+        return peak_lr * (round_num + 1) / warmup_rounds
+    progress = (round_num - warmup_rounds) / max(1, total_rounds - warmup_rounds)
+    progress = min(1.0, progress)
+    return min_lr + 0.5 * (peak_lr - min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def round_already_merged(mesh_shared: Path, run_id: str, round_num: int) -> bool:
+    """True once the coordinator has merged `round_num` -- with or without us.
+
+    The sync flag is written by _do_syncing the moment a merge completes, and
+    a merge completes as soon as `quorum_k` nodes have checked in. So a node
+    that sees its OWN round's flag while still training is a node the merge
+    went ahead without: every remaining inner step is computed against a
+    master that is already superseded, and its checkpoint would be rejected
+    by the merge's master_version guard even if it arrived.
+
+    Naming the flag by round is what makes this safe to poll mid-round: a
+    flag from an earlier round can never match the round being trained.
+    """
+    flag = (
+        Path(mesh_shared)
+        / "checkpoints"
+        / "flags"
+        / f"sync_complete_{run_id}_{round_num}.flag"
+    )
+    return flag.exists()
+
+
+def chunk_stop_round(rounds: int, start_round: int, chunk_rounds: int | None) -> int:
+    """Last round (exclusive) THIS worker job runs, vs `rounds` for the run.
+
+    `chunk_rounds is None` means one job spans the whole run -- the
+    pre-2026-08-22 behaviour, and the default, so every already-registered
+    run is unaffected. Chunking became necessary when the rebuilt cluster
+    capped SallesInfo at a 2h walltime: an ~11h 40-round run no longer fits
+    in one job, so the watcher relaunches successive chunks that resume via
+    +mesh.start_round and master.pt.
+
+    Exiting cleanly under the cap is the whole point. A walltime kill instead
+    takes all 16 workers down mid-round at the same instant, every one misses
+    the same round, and that is precisely what permanently excludes an entire
+    roster.
+
+    Clamped to `rounds` so the final chunk stops at the run's real end rather
+    than overshooting, and never below `start_round` (a non-positive
+    chunk_rounds yields an empty range and an immediate clean exit rather
+    than a backwards range that would silently skip the round).
+    """
+    if chunk_rounds is None:
+        return rounds
+    return max(start_round, min(rounds, start_round + int(chunk_rounds)))
+
+
 def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     """Entry point called from pretrain.py's main() when MESH_RUN_ID is set.
 
@@ -216,6 +305,19 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
 
     rounds = int(cfg.mesh.get("rounds", 10))
     start_round = int(cfg.mesh.get("start_round", 0))
+    # How many rounds THIS job runs before exiting cleanly, vs `rounds` which
+    # is the run's absolute length. None means one job spans the whole run --
+    # the pre-2026-08-22 behaviour, kept as the default so every already
+    # registered run is unaffected. It became necessary when the rebuilt
+    # cluster capped SallesInfo at a 2h walltime: an 11h 40-round run no
+    # longer fits in one job, so the watcher relaunches successive chunks that
+    # resume through +mesh.start_round and master.pt. Exiting under the cap is
+    # the point -- being walltime-killed instead kills all 16 workers mid-round
+    # simultaneously, and every one then misses the same round, which is what
+    # permanently excludes a whole roster.
+    stop_round = chunk_stop_round(
+        rounds, start_round, cfg.mesh.get("chunk_rounds", None)
+    )
     steps_per_round = int(cfg.mesh.get("steps_per_round", 200))
     merge = bool(cfg.mesh.get("merge", True))
     outer_lr = float(cfg.mesh.get("outer_lr", 0.7))
@@ -236,6 +338,8 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     num_frames = int(cfg.model.num_frames)
     image_size = int(cfg.model.image_size)
     overlap = float(cfg.preprocess.window.overlap)
+    frame_stride = int(cfg.preprocess.window.get("frame_stride", 1))
+    augment = bool(cfg.preprocess.get("augment", False))
 
     shard_map = load_shard_map(shard_map_path)
     train_shard_names = read_my_shards(assignments_path, node)
@@ -248,6 +352,8 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         num_frames=num_frames,
         image_size=image_size,
         overlap=overlap,
+        frame_stride=frame_stride,
+        augment=augment,
         seed=int(cfg.train.get("seed", 42)),
     )
 
@@ -266,6 +372,7 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         num_frames=num_frames,
         image_size=image_size,
         overlap=overlap,
+        frame_stride=frame_stride,
     )
 
     # Production never seeds torch before this function runs (the only
@@ -285,18 +392,21 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     amp = str(cfg.train.get("amp", "off")).lower()
     accum_steps = int(cfg.train.get("accum_steps", 1))
     grad_clip = float(cfg.train.get("grad_clip", 0.0))
-    # local_batch=_MESH_BATCH_SIZE: the mesh path's real per-optimizer-step
-    # sample count is _MESH_BATCH_SIZE * accum_steps, NOT cfg.train.batch_size
+    micro_batch_size = int(cfg.mesh.get("micro_batch_size", _MESH_BATCH_SIZE))
+    # local_batch=micro_batch_size: the mesh path's real per-optimizer-step
+    # sample count is micro_batch_size * accum_steps, NOT cfg.train.batch_size
     # (16 in ssl.yaml, never overridden here) -- _scaled_lr's linear-scaling
     # rule must scale off the batch actually seen per step, or the LR is
     # silently mistuned for every mesh run regardless of accum_steps. Kept in
     # its own variable (not inlined into the AdamW call) so it can also be
-    # reported alongside per-round metrics -- it never changes mid-run (no
-    # scheduler on this path), so it's a fixed reference value, not a curve.
-    lr = _scaled_lr(cfg, world_size=1, local_batch=_MESH_BATCH_SIZE)
+    # reported alongside per-round metrics. It is the schedule's *peak*: the
+    # per-round value is set from mesh_round_lr below, before each round runs.
+    peak_lr = _scaled_lr(cfg, world_size=1, local_batch=micro_batch_size)
+    lr_warmup_frac = float(cfg.mesh.get("lr_warmup_frac", 0.05))
+    lr_min = float(cfg.mesh.get("lr_min", 1e-5))
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=lr,
+        lr=peak_lr,
         betas=(0.9, 0.95),
         weight_decay=float(cfg.train.get("weight_decay", 0.0)),
     )
@@ -306,8 +416,15 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
 
     last_train_loss = float("nan")
     final_round = -1
+    consecutive_abandons = 0
 
-    for round_num in range(start_round, rounds):
+    for round_num in range(start_round, stop_round):
+        lr = mesh_round_lr(
+            peak_lr, round_num, rounds, warmup_frac=lr_warmup_frac, min_lr=lr_min
+        )
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+
         # Not "round_num > start_round": a worker relaunched mid-run (e.g.
         # after the watcher process died) starts its local round_num back at
         # start_round, but master.pt may already reflect many prior rounds
@@ -410,10 +527,73 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             accum_steps=accum_steps,
             grad_clip=grad_clip,
             round_num=round_num,
+            micro_batch_size=micro_batch_size,
+            # Only when merging: a solo run has no coordinator writing flags,
+            # and nothing to resync to if one appeared.
+            abandon_check=(
+                (lambda: round_already_merged(mesh_shared, run_id, round_num))
+                if merge
+                else None
+            ),
         )
+        if train_stats.get("abandoned"):
+            # The pool merged this round without us. Drop the partial round
+            # whole -- no val pass, no local save, no push. The next
+            # iteration's master load is the resync, and because we bail the
+            # moment the flag appears, that iteration's round_num is the one
+            # the pool is now on: the lag stops here instead of compounding
+            # by (our cadence - the pool's) every round. Observed 2026-08-23:
+            # node055 ran 442s/round slower than its pool for 23 rounds,
+            # contributing to six merges out of 32 and costing 3.08h of
+            # chunk-boundary stalls.
+            logger.warning(
+                "run_mesh_pretrain_stage: round %d merged without this node "
+                "after %d/%d steps (run_id=%s node=%s) -- abandoning the "
+                "round and resyncing to the new master",
+                round_num,
+                train_stats["steps"],
+                round_steps,
+                run_id,
+                node,
+            )
+            consecutive_abandons += 1
+            if consecutive_abandons >= _ABANDON_ALERT_STREAK:
+                logger.error(
+                    "run_mesh_pretrain_stage: node %s has been merged around "
+                    "for %d consecutive rounds (run_id=%s) -- it is holding a "
+                    "node and contributing to no merge; check for a foreign "
+                    "process on its CPUs",
+                    node,
+                    consecutive_abandons,
+                    run_id,
+                )
+            print(
+                f"mesh round {round_num + 1}/{rounds}  ABANDONED at step "
+                f"{train_stats['steps']}/{round_steps} (merged without us, "
+                f"{consecutive_abandons} in a row)",
+                flush=True,
+            )
+            _append_round_metrics(
+                mesh_shared,
+                run_id,
+                node,
+                round_num + 1,
+                train_stats["loss"],
+                float("nan"),
+                train_stats["samples_per_s_per_gpu"],
+                len(train_shard_names),
+                lr,
+                n_samples=train_stats["samples"],
+                n_steps=train_stats["steps"],
+                abandoned=True,
+                consecutive_abandons=consecutive_abandons,
+            )
+            final_round = round_num
+            continue
+
+        consecutive_abandons = 0
+
         last_train_loss = train_stats["loss"]
-        # _MESH_BATCH_SIZE is 1 and _train_epoch_ssl counts micro-steps, so
-        # samples/s is steps/s exactly -- no conversion needed here.
         observed_rate = float(train_stats["samples_per_s_per_gpu"])
         if observed_rate > 0:
             rate_ema = update_rate_ema(rate_ema, observed_rate)
@@ -533,6 +713,8 @@ def train_one_round(
     accum_steps: int,
     grad_clip: float,
     round_num: int,
+    micro_batch_size: int = _MESH_BATCH_SIZE,
+    abandon_check: Callable[[], bool] | None = None,
 ) -> dict:
     """Thin wrapper around _train_epoch_ssl for one mesh round.
 
@@ -542,7 +724,7 @@ def train_one_round(
     max_steps=steps_per_round and progress_desc=f"round {round_num}", and
     returns its stats dict unchanged.
     """
-    loader = DataLoader(dataset, batch_size=_MESH_BATCH_SIZE, num_workers=0)
+    loader = DataLoader(dataset, batch_size=micro_batch_size, num_workers=0)
     return _train_epoch_ssl(
         model,
         loader,
@@ -554,6 +736,7 @@ def train_one_round(
         max_steps=steps_per_round,
         amp=amp,
         progress_desc=f"round {round_num}",
+        abandon_check=abandon_check,
     )
 
 
@@ -592,7 +775,7 @@ def evaluate_val_loss(
                 windows_seen += 1
 
                 pixel_values = pixel_values.to(device)
-                keep_indices, mask_indices = masker(pixel_values, token_grid, device)
+                keep_indices, mask_indices = masker(pixel_values, token_grid, device, pixel_values.shape[0])
                 with torch.autocast(
                     device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled
                 ):

@@ -26,6 +26,12 @@ def script(tmp_path) -> Path:
     dest.parent.mkdir(parents=True)
     shutil.copy2(REAL_SCRIPT, dest)
     dest.chmod(0o755)
+    # EXPERIMENT is validated against the config tree, so the mirror needs
+    # one too -- names only, since the script never reads their contents.
+    conf = tmp_path / "video_encoding" / "conf" / "experiment"
+    conf.mkdir(parents=True)
+    for real in (REAL_SCRIPT.parents[1] / "conf" / "experiment").glob("*.yaml"):
+        (conf / real.name).touch()
     return dest
 
 
@@ -301,3 +307,129 @@ def test_every_queued_sweep_cell_carries_quorum_k_and_weighting():
                 f"6 (run_id rounds outer_lr outer_momentum quorum_k weighting): "
                 f"{stripped!r}"
             )
+
+
+# --- GRACE_S: the below-quorum round deadline ------------------------------
+
+
+def _configs(tmp_path):
+    return json.loads(
+        (tmp_path / "runs" / "state" / "mesh_run_configs.json").read_text()
+    )
+
+
+def _register(
+    script, tmp_path, *, grace=None, chunk=None, run_id="RUN1", experiment=None
+):
+    env = {**os.environ}
+    if grace is not None:
+        env["GRACE_S"] = grace
+    if chunk is not None:
+        env["CHUNK_ROUNDS"] = chunk
+    if experiment is not None:
+        env["EXPERIMENT"] = experiment
+    return subprocess.run(
+        ["bash", str(script), run_id, "a,b,c", "10", "0.7", "0.9", "3", "token"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_grace_s_is_written_when_set(script, tmp_path):
+    """With mesh.round_budget_s=null every node runs the same step count, and
+    9600 steps needs 912s on birds -- the 900s default would time out the slow
+    tier every round."""
+    result = _register(script, tmp_path, grace="1800")
+    assert result.returncode == 0, result.stderr
+    assert _configs(tmp_path)[0]["grace_s"] == 1800.0
+
+
+def test_grace_s_key_is_absent_when_unset(script, tmp_path):
+    """Every run registered before this field existed has no value for it;
+    the key must stay absent so the dataclass default applies."""
+    result = _register(script, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "grace_s" not in _configs(tmp_path)[0]
+
+
+@pytest.mark.parametrize("bad", ["not-a-number", "0", "-5"])
+def test_a_nonsensical_grace_s_is_refused(script, tmp_path, bad):
+    """A silently-dropped bad value would leave the run on the 900s default
+    and time out the slow tier -- the exact failure GRACE_S exists to prevent."""
+    result = _register(script, tmp_path, grace=bad)
+    assert result.returncode != 0
+    assert not (tmp_path / "runs" / "state" / "mesh_run_configs.json").exists()
+
+
+# --- CHUNK_ROUNDS: rounds per worker JOB, not per run -----------------------
+
+
+def test_chunk_rounds_is_written_when_set(script, tmp_path):
+    """SallesInfo caps a job at 2h since the 2026-08-22 rebuild, so a ~11h
+    40-round run has to be split across successive jobs."""
+    result = _register(script, tmp_path, chunk="5")
+    assert result.returncode == 0, result.stderr
+    assert _configs(tmp_path)[0]["chunk_rounds"] == 5
+
+
+def test_chunk_rounds_key_is_absent_when_unset(script, tmp_path):
+    """Absent means one job per run -- the behaviour of every run registered
+    before the walltime cap existed, and the dataclass default."""
+    result = _register(script, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "chunk_rounds" not in _configs(tmp_path)[0]
+
+
+@pytest.mark.parametrize("bad", ["not-a-number", "0", "-5"])
+def test_chunk_rounds_rejects_values_that_would_train_nothing(script, tmp_path, bad):
+    result = _register(script, tmp_path, chunk=bad)
+    assert result.returncode != 0
+    assert "CHUNK_ROUNDS" in result.stdout + result.stderr
+
+
+def test_chunk_rounds_longer_than_the_run_is_rejected(script, tmp_path):
+    """It would silently mean "no chunking", which is exactly the
+    configuration the partition walltime cap makes unschedulable."""
+    result = _register(script, tmp_path, chunk="11")  # _register passes rounds=10
+    assert result.returncode != 0
+    assert "exceeds rounds" in result.stdout + result.stderr
+
+
+def test_a_chunk_equal_to_the_run_length_is_allowed(script, tmp_path):
+    """Legitimate for a short run that does fit in one job."""
+    result = _register(script, tmp_path, chunk="10")
+    assert result.returncode == 0, result.stderr
+    assert _configs(tmp_path)[0]["chunk_rounds"] == 10
+
+
+# --- EXPERIMENT: which conf/experiment/*.yaml the workers actually load ------
+
+
+def test_experiment_defaults_to_the_legacy_mesh_config(script, tmp_path):
+    """Every run registered before this env var existed loaded
+    videomae_mesh_ssl, so an unset EXPERIMENT must keep doing that."""
+    result = _register(script, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert _configs(tmp_path)[0]["experiment"] == "videomae_mesh_ssl"
+
+
+def test_experiment_is_overridable_from_the_environment(script, tmp_path):
+    """The experiment name was hardcoded, so a run launched with a
+    paper-recipe config would silently train the OLD recipe -- the arm label
+    would say one thing and every worker would do another."""
+    result = _register(
+        script, tmp_path, experiment="videomae_mesh_paper_a_stride1_timeavg"
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        _configs(tmp_path)[0]["experiment"] == "videomae_mesh_paper_a_stride1_timeavg"
+    )
+
+
+def test_experiment_must_name_a_real_config(script, tmp_path):
+    """A typo would otherwise register fine and only surface as a Hydra
+    crash on every worker, after the pool has already been seeded."""
+    result = _register(script, tmp_path, experiment="videomae_mesh_typo")
+    assert result.returncode != 0
+    assert "EXPERIMENT" in result.stdout + result.stderr

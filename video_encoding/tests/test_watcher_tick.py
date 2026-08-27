@@ -239,3 +239,109 @@ def test_run_full_check_respects_escalation_cooldown(tmp_path):
 
     mock_escalate.assert_not_called()
     assert result.action_taken is False
+
+
+def test_run_full_check_cleans_up_quota_pressure_and_skips_escalation(tmp_path):
+    state_dir, results_root = _setup(tmp_path)
+    state = WatcherState()
+
+    with (
+        patch(
+            "video_encoding.watcher.tick.collect_disk_usage_pct",
+            return_value={"node:node058": 95.0},
+        ),
+        patch(
+            "video_encoding.watcher.tick.remediate_quota_pressure",
+            return_value="deleted 2 item(s) on node058: done-run.pt, tb",
+        ) as mock_cleanup,
+        patch("video_encoding.watcher.tick.run_escalation") as mock_escalate,
+    ):
+        result = run_full_check(
+            repo_root=tmp_path,
+            state_dir=state_dir,
+            results_root=results_root,
+            now=2000.0,
+            state=state,
+        )
+
+    mock_cleanup.assert_called_once()
+    assert mock_cleanup.call_args.args[0] == "node:node058"
+    mock_escalate.assert_not_called()
+    assert any("cleanup quota:node:node058" in a for a in result.actions)
+    assert result.action_taken is True
+
+
+def test_run_full_check_falls_through_to_escalation_when_cleanup_finds_nothing(
+    tmp_path,
+):
+    state_dir, results_root = _setup(tmp_path)
+    state = WatcherState()
+
+    with (
+        patch(
+            "video_encoding.watcher.tick.collect_disk_usage_pct",
+            return_value={"home": 95.0},
+        ),
+        patch(
+            "video_encoding.watcher.tick.remediate_quota_pressure", return_value=None
+        ) as mock_cleanup,
+        patch(
+            "video_encoding.watcher.tick.run_escalation",
+            return_value=tmp_path / "transcript.md",
+        ) as mock_escalate,
+    ):
+        result = run_full_check(
+            repo_root=tmp_path,
+            state_dir=state_dir,
+            results_root=results_root,
+            now=2000.0,
+            state=state,
+        )
+
+    mock_cleanup.assert_called_once()
+    mock_escalate.assert_called_once()
+    assert result.action_taken is True
+
+
+def test_run_full_check_escalates_stalled_flag_independently_of_quota_cleanup(
+    tmp_path,
+):
+    record = JobRecord("100", "exp_a", None, "2026-07-15T09:00:00Z", "node001")
+    state_dir, results_root = _setup(
+        tmp_path,
+        squeue_jobs=[{"job_id": 100, "job_state": ["RUNNING"], "nodes": "node001"}],
+        registry_records=[record],
+    )
+    (results_root / "exp_a.json").write_text("{}")
+    import os
+
+    old_time = 1000.0
+    os.utime(results_root / "exp_a.json", (old_time, old_time))
+    state = WatcherState()
+
+    with (
+        patch(
+            "video_encoding.watcher.tick.collect_disk_usage_pct",
+            return_value={"node:node058": 95.0},
+        ),
+        patch(
+            "video_encoding.watcher.tick.remediate_quota_pressure",
+            return_value="deleted 1 item(s) on node058: tb",
+        ),
+        patch(
+            "video_encoding.watcher.tick.run_escalation",
+            return_value=tmp_path / "transcript.md",
+        ) as mock_escalate,
+    ):
+        result = run_full_check(
+            repo_root=tmp_path,
+            state_dir=state_dir,
+            results_root=results_root,
+            now=old_time + 2701,
+            state=state,
+        )
+
+    mock_escalate.assert_called_once()
+    assert mock_escalate.call_args.args[0].kind == "stalled"
+    assert any("cleanup quota:node:node058" in a for a in result.actions)
+    assert any("stalled" in a for a in result.actions)

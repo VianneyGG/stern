@@ -32,6 +32,31 @@
 #   the run's own persisted JSON config rather than passed per-launch.
 #   Omitted/empty -> no "extra_overrides" key in the JSON entry.
 #
+# EXPERIMENT (env, optional): which conf/experiment/<name>.yaml every worker
+#   sbatch for this run composes. Omitted -> videomae_mesh_ssl, the only value
+#   this script could produce before, so existing launches are unchanged.
+#   Validated against the config tree here rather than at submission: a typo
+#   otherwise registers fine and only surfaces as a Hydra crash on every
+#   worker, after the pool has already been seeded.
+#
+# CHUNK_ROUNDS (env, optional): mesh_tick.MeshRunConfig.chunk_rounds -- how many
+#   rounds ONE worker job runs before exiting cleanly, after which the watcher
+#   submits the next chunk resuming from master.pt. Omitted -> None, i.e. one
+#   job spans the whole run (correct only where a run fits in the partition
+#   walltime). Required since the 2026-08-22 cluster rebuild capped SallesInfo
+#   at 2h: size it so chunk_rounds * round_wall_s stays well under that, since
+#   overrunning kills all workers mid-round at once and every one then misses
+#   the same round, which permanently excludes the whole roster.
+#
+# GRACE_S (env, optional): mesh_tick.MeshRunConfig.grace_s -- the below-quorum
+#   fallback deadline for a round, in seconds. Omitted -> the dataclass default
+#   ROUND_TIMEOUT_S=900. Raise it for a roster whose slowest node cannot finish
+#   steps_per_round inside 900s: with mesh.round_budget_s=null every node runs
+#   the same step count, and 9600 steps takes 622s on cars but 912s on birds
+#   (medians measured from the 2026-08-21 factorial arms), so 900s would time
+#   out the slow tier every round. An env var rather than a ninth positional --
+#   every existing caller passes eight and must keep working unchanged.
+#
 # Registration alone is enough to start a run on an ALREADY-SEEDED pool: the
 # watcher's _do_assigning writes shard_assignments_<run_id>.json itself from
 # this entry's node list plus each node's verified holdings in
@@ -83,15 +108,39 @@ OUTER_MOMENTUM="${5:?${USAGE}}"
 QUORUM_K="${6:-}"
 WEIGHTING="${7:-data}"
 EXTRA_OVERRIDES="${8:-}"
+GRACE_S="${GRACE_S:-}"
+CHUNK_ROUNDS="${CHUNK_ROUNDS:-}"
+EXPERIMENT="${EXPERIMENT:-videomae_mesh_ssl}"
 
-python3 - "${RUN_ID}" "${ACTIVE_CSV}" "${ROUNDS}" "${OUTER_LR}" "${OUTER_MOMENTUM}" "${REPO_ROOT}" "${QUORUM_K}" "${WEIGHTING}" "${EXTRA_OVERRIDES}" <<'PYEOF'
+if [[ ! -f "${REPO_ROOT}/video_encoding/conf/experiment/${EXPERIMENT}.yaml" ]]; then
+  echo "register_mesh_run: EXPERIMENT=${EXPERIMENT} names no config under" \
+       "video_encoding/conf/experiment/ -- a typo here registers fine and" \
+       "only surfaces as a Hydra crash on every worker, after the pool is" \
+       "already seeded" >&2
+  exit 1
+fi
+
+python3 - "${RUN_ID}" "${ACTIVE_CSV}" "${ROUNDS}" "${OUTER_LR}" "${OUTER_MOMENTUM}" "${REPO_ROOT}" "${QUORUM_K}" "${WEIGHTING}" "${EXTRA_OVERRIDES}" "${GRACE_S}" "${CHUNK_ROUNDS}" "${EXPERIMENT}" <<'PYEOF'
 import json
 import os
 import re
 import sys
 from pathlib import Path
 
-run_id, active_csv, rounds, outer_lr, outer_momentum, repo_root, quorum_k, weighting, extra_overrides = (
+(
+    run_id,
+    active_csv,
+    rounds,
+    outer_lr,
+    outer_momentum,
+    repo_root,
+    quorum_k,
+    weighting,
+    extra_overrides,
+    grace_s,
+    chunk_rounds,
+    experiment,
+) = (
     sys.argv[1],
     sys.argv[2],
     int(sys.argv[3]),
@@ -101,6 +150,9 @@ run_id, active_csv, rounds, outer_lr, outer_momentum, repo_root, quorum_k, weigh
     sys.argv[7],
     sys.argv[8],
     sys.argv[9],
+    sys.argv[10],
+    sys.argv[11],
+    sys.argv[12],
 )
 WEIGHTING_CHOICES = ("data", "inverse_loss", "token")
 if weighting not in WEIGHTING_CHOICES:
@@ -137,7 +189,7 @@ cfgs = json.loads(path.read_text()) if path.exists() else []
 cfgs = [c for c in cfgs if c["run_id"] != run_id]
 entry = {
     "run_id": run_id,
-    "experiment": "videomae_mesh_ssl",
+    "experiment": experiment,
     "nodes": nodes,
     "n_shards": 260,
     "outer_lr": outer_lr,
@@ -150,6 +202,28 @@ if quorum_k:
     entry["quorum_k"] = int(quorum_k)
 if overrides:
     entry["extra_overrides"] = overrides
+if grace_s:
+    try:
+        grace = float(grace_s)
+    except ValueError:
+        sys.exit(f"register_mesh_run: GRACE_S={grace_s!r} is not a number")
+    if grace <= 0:
+        sys.exit(f"register_mesh_run: GRACE_S={grace} must be positive")
+    entry["grace_s"] = grace
+if chunk_rounds:
+    try:
+        chunk = int(chunk_rounds)
+    except ValueError:
+        sys.exit(f"register_mesh_run: CHUNK_ROUNDS={chunk_rounds!r} is not an integer")
+    if chunk <= 0:
+        sys.exit(f"register_mesh_run: CHUNK_ROUNDS={chunk} must be positive")
+    if chunk > rounds:
+        sys.exit(
+            f"register_mesh_run: CHUNK_ROUNDS={chunk} exceeds rounds={rounds} -- "
+            "a chunk longer than the run means the run never chunks at all, "
+            "which is what the partition walltime cap makes unschedulable"
+        )
+    entry["chunk_rounds"] = chunk
 cfgs.append(entry)
 path.parent.mkdir(parents=True, exist_ok=True)
 tmp = path.with_suffix(path.suffix + ".tmp")

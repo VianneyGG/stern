@@ -94,7 +94,8 @@ def ridge_r2(
 def _tokens(model, pixel_values: torch.Tensor) -> torch.Tensor:
     enc = model.encoder
     x = enc.patch_embed(pixel_values) + enc.pos_embed
-    return enc.forward_tokens(x, torch.arange(x.shape[1], device=x.device))[0]
+    keep = torch.arange(x.shape[1], device=x.device).expand(x.shape[0], -1)
+    return enc.forward_tokens(x, keep)[0]
 
 
 def _load(ckpt_path, cfg, device):
@@ -109,9 +110,7 @@ def _load(ckpt_path, cfg, device):
         # it through untouched, so its absence leaves the forward pass
         # identical; anything else missing means the weights really don't fit.
         params = dict(model.named_parameters())
-        missing = [
-            k for k in result.missing_keys if params[k].numel() > 0
-        ]
+        missing = [k for k in result.missing_keys if params[k].numel() > 0]
         if missing or result.unexpected_keys:
             raise ValueError(f"{ckpt_path}: key mismatch")
     return model.eval().to(device)

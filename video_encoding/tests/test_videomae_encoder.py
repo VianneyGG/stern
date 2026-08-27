@@ -142,6 +142,6 @@ def test_forward_tokens_excludes_registers_from_returned_tokens():
     cfg = _tiny_cfg(num_registers=2)
     encoder = VideoMAEEncoder(cfg)
     x = encoder.patch_embed(torch.randn(2, 3, 4, 16, 16)) + encoder.pos_embed
-    keep_indices = torch.arange(4)  # keep 4 of the 8 patch tokens
+    keep_indices = torch.arange(4).unsqueeze(0).expand(2, -1)  # (B=2, 4)
     out = encoder.forward_tokens(x, keep_indices)
     assert out.shape == (2, 4, 32)  # 4 kept patch tokens, no registers leaked through

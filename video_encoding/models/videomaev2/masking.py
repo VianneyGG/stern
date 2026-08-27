@@ -15,7 +15,29 @@ from __future__ import annotations
 import torch
 
 
-class RandomTubeMasking:
+class _PerSampleMaskingMixin:
+    """Batches a per-sample `_sample_one` into every masker's `__call__`
+    contract. `_sample_one` keeps the pre-existing single-sample logic
+    unchanged; this loop is what turns it into independent per-batch-element
+    masks instead of one mask shared across the whole batch."""
+
+    def __call__(
+        self,
+        pixel_values: "torch.Tensor | None",
+        grid: tuple[int, int, int],
+        device: torch.device,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        keeps, masks = [], []
+        for b in range(batch_size):
+            pv_b = None if pixel_values is None else pixel_values[b : b + 1]
+            k, m = self._sample_one(pv_b, grid, device)
+            keeps.append(k)
+            masks.append(m)
+        return torch.stack(keeps), torch.stack(masks)
+
+
+class RandomTubeMasking(_PerSampleMaskingMixin):
     """Sample which tokens to keep/mask for one training sample.
 
     Tokens are laid out (B, N, D) where N = T' * H' * W'.
@@ -29,7 +51,7 @@ class RandomTubeMasking:
         """
         self.mask_ratio = mask_ratio
 
-    def __call__(
+    def _sample_one(
         self,
         pixel_values: "torch.Tensor | None",
         grid: tuple[int, int, int],
@@ -76,7 +98,7 @@ class RandomTubeMasking:
         return keep_indices, mask_indices
 
 
-class RandomFrameMasking:
+class RandomFrameMasking(_PerSampleMaskingMixin):
     """Mask whole timesteps, then top up with scattered tokens.
 
     The complement of tube masking. Tube masking leaves every masked spatial
@@ -105,7 +127,7 @@ class RandomFrameMasking:
         self.mask_ratio = mask_ratio
         self.min_visible_timesteps = min_visible_timesteps
 
-    def __call__(
+    def _sample_one(
         self,
         pixel_values: "torch.Tensor | None",
         grid: tuple[int, int, int],
@@ -141,7 +163,7 @@ class RandomFrameMasking:
         return (~masked).nonzero(as_tuple=True)[0], masked.nonzero(as_tuple=True)[0]
 
 
-class MixedTubeFrameMasking:
+class MixedTubeFrameMasking(_PerSampleMaskingMixin):
     """Per-call coin flip between tube and frame-level masking.
 
     Used rather than pure frame masking for the factorial's mask arm: pure frame
@@ -166,30 +188,50 @@ class MixedTubeFrameMasking:
         pixel_values: "torch.Tensor | None",
         grid: tuple[int, int, int],
         device: torch.device,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One coin flip per call, then per-sample masks within that regime.
+
+        Overrides the mixin rather than defining `_sample_one`, because the
+        two regimes keep different numbers of tokens -- tube keeps
+        T' * round((1-r) * H'W'), frame keeps N - round(r * N), and those are
+        not equal (160 vs 157 at the production geometry). Flipping the coin
+        per batch element would therefore produce ragged rows that cannot be
+        stacked into the (B, num_kept) contract at all. Flipping once per call
+        also matches this class's documented "per-call coin flip" semantics,
+        which the pre-batching implementation had.
+        """
+        if float(torch.rand(1, device=device)) < self.p_frame:
+            return self._frame(pixel_values, grid, device, batch_size)
+        return self._tube(pixel_values, grid, device, batch_size)
+
+    def _sample_one(
+        self,
+        pixel_values: "torch.Tensor | None",
+        grid: tuple[int, int, int],
+        device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if float(torch.rand(1, device=device)) < self.p_frame:
-            return self._frame(pixel_values, grid, device)
-        return self._tube(pixel_values, grid, device)
+            return self._frame._sample_one(pixel_values, grid, device)
+        return self._tube._sample_one(pixel_values, grid, device)
 
 
-class MotionGuidedTubeMasking:
+class MotionGuidedTubeMasking(_PerSampleMaskingMixin):
     """Tube masking biased toward high-motion spatial tubelets: patches with
     large frame-to-frame pixel change are preferentially masked, forcing the
     encoder to reconstruct moving regions from static context instead of
     getting to "cheat" by keeping every visible-motion patch.
 
     Same tube structure as RandomTubeMasking: identical spatial positions
-    masked across all T' tubelets. Motion energy is averaged across BOTH time
-    and the batch to produce one shared mask per call, matching
-    RandomTubeMasking's batch-shared masking contract (STERN samples one mask
-    per training step, not one per sample -- unlike the per-sample reference
-    implementation this was adapted from).
+    masked across all T' tubelets. Motion energy is averaged over time; the
+    batch-dimension mean below is a no-op squeeze, since _PerSampleMaskingMixin
+    hands each call a batch of one.
     """
 
     def __init__(self, mask_ratio: float = 0.9):
         self.mask_ratio = mask_ratio
 
-    def __call__(
+    def _sample_one(
         self,
         pixel_values: torch.Tensor,
         grid: tuple[int, int, int],

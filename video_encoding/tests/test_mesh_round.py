@@ -37,6 +37,8 @@ from video_encoding.scripts.build_wds_shards import (
 )
 from video_encoding.training.diloco.mesh_round import (
     evaluate_val_loss,
+    mesh_round_lr,
+    round_already_merged,
     push_checkpoint_and_wait,
     run_mesh_pretrain_stage,
     train_one_round,
@@ -1636,3 +1638,187 @@ def test_append_round_metrics_rejects_a_missing_count(tmp_path):
         mesh_round._append_round_metrics(
             tmp_path / "mesh_shared", "run1", "node001", 1, 0.5, 0.4, 12.0, 3, 0.0015
         )
+
+
+def _flag(mesh_shared: Path, run_id: str, round_num: int) -> Path:
+    d = mesh_shared / "checkpoints" / "flags"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"sync_complete_{run_id}_{round_num}.flag"
+    p.write_text("")
+    return p
+
+
+def test_round_already_merged_false_when_no_flag(tmp_path):
+    assert round_already_merged(tmp_path, "RUN1", 3) is False
+
+
+def test_round_already_merged_true_for_this_round(tmp_path):
+    _flag(tmp_path, "RUN1", 3)
+    assert round_already_merged(tmp_path, "RUN1", 3) is True
+
+
+def test_round_already_merged_ignores_other_rounds(tmp_path):
+    """A prior round's flag is always present mid-run -- only the flag for
+    the round being trained means the merge went ahead without us."""
+    _flag(tmp_path, "RUN1", 0)
+    _flag(tmp_path, "RUN1", 1)
+    _flag(tmp_path, "RUN1", 2)
+    assert round_already_merged(tmp_path, "RUN1", 3) is False
+
+
+def test_round_already_merged_ignores_other_runs(tmp_path):
+    _flag(tmp_path, "RUN2", 3)
+    assert round_already_merged(tmp_path, "RUN1", 3) is False
+
+
+def test_micro_batch_size_configurable(tmp_path):
+    """micro_batch_size must reach the DataLoader as a real batch dimension.
+
+    Asserting only stats["steps"] == steps_per_round is not enough: the
+    default batch_size of 1 yields the same step count, so that assertion
+    passes unchanged even if the parameter is ignored entirely. Spying on the
+    tensor the model actually receives is what pins the behavior down.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    model = VideoMAEForPreTraining(_tiny_cfg()).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    masker = RandomTubeMasking(mask_ratio=0.5)
+    # 53 frames, overlap=0.75 -> step=1 -> 50 windows: comfortably more than
+    # the 8 loader batches * micro_batch_size 4 = 32 windows this test needs.
+    dataset = _mesh_dataset(tmp_path / "mesh", "clip0", n_frames=53, overlap=0.75)
+
+    seen_batch_dims = []
+    real_forward = model.forward
+
+    def _spy(pixel_values, *args, **kwargs):
+        seen_batch_dims.append(int(pixel_values.shape[0]))
+        return real_forward(pixel_values, *args, **kwargs)
+
+    model.forward = _spy
+    try:
+        stats = train_one_round(
+            model,
+            optimizer,
+            device,
+            masker,
+            dataset,
+            steps_per_round=8,
+            amp="off",
+            accum_steps=1,
+            grad_clip=0.0,
+            round_num=0,
+            micro_batch_size=4,
+        )
+    finally:
+        model.forward = real_forward
+
+    # stats["steps"] counts DataLoader iterations (loader batches), not
+    # samples or optimizer steps -- same convention test_train_one_round_
+    # respects_steps_per_round already relies on at the default batch_size=1.
+    assert stats["steps"] == 8
+    assert seen_batch_dims == [4] * 8, (
+        f"model saw batch dims {seen_batch_dims}, expected eight batches of 4 "
+        "-- micro_batch_size did not reach the DataLoader"
+    )
+    # 8 batches x 4 windows: the whole point of widening the micro-batch is
+    # that a round consumes micro_batch_size times more data per step.
+    assert stats["samples"] == 32
+
+
+def test_per_sample_masking_reaches_the_training_loop(tmp_path):
+    """Independent masks per batch row must survive into train_one_round.
+
+    The masker's own unit test proves per-sample masking in isolation; this
+    proves the wiring, i.e. that the loop passes the REAL batch size through
+    rather than a hardcoded 1 (which would silently restore one-shared-mask
+    -per-batch at any micro_batch_size).
+    """
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    model = VideoMAEForPreTraining(_tiny_cfg()).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    dataset = _mesh_dataset(tmp_path / "mesh", "clip0", n_frames=53, overlap=0.75)
+
+    inner = RandomTubeMasking(mask_ratio=0.5)
+    seen = []
+
+    class _SpyMasker:
+        def __call__(self, pixel_values, grid, dev, batch_size):
+            keep, mask = inner(pixel_values, grid, dev, batch_size)
+            seen.append(keep)
+            return keep, mask
+
+    train_one_round(
+        model,
+        optimizer,
+        device,
+        _SpyMasker(),
+        dataset,
+        steps_per_round=4,
+        amp="off",
+        accum_steps=1,
+        grad_clip=0.0,
+        round_num=0,
+        micro_batch_size=4,
+    )
+
+    assert seen, "masker was never called"
+    assert all(k.shape[0] == 4 for k in seen), (
+        f"masker saw batch sizes {[k.shape[0] for k in seen]}, expected 4 -- "
+        "the loop is not forwarding the real batch size"
+    )
+    assert any(not torch.equal(k[0], k[1]) for k in seen), (
+        "every batch row got the identical mask inside the training loop"
+    )
+
+
+class TestMeshRoundLR:
+    def test_warmup_ramps_linearly_to_peak(self):
+        peak = 1.0
+        total = 100
+        # warmup_frac=0.05 -> 5 warmup rounds; round 4 is the last warmup round
+        lr0 = mesh_round_lr(peak, round_num=0, total_rounds=total, warmup_frac=0.05)
+        lr4 = mesh_round_lr(peak, round_num=4, total_rounds=total, warmup_frac=0.05)
+        assert lr0 == pytest.approx(peak * 1 / 5)
+        assert lr4 == pytest.approx(peak * 5 / 5)
+
+    def test_cosine_decays_to_min_lr_at_final_round(self):
+        lr_final = mesh_round_lr(
+            1.0, round_num=99, total_rounds=100, warmup_frac=0.05, min_lr=0.01
+        )
+        assert lr_final == pytest.approx(0.01, abs=1e-3)
+
+    def test_pure_function_of_round_num(self):
+        """A chunked relaunch must reproduce the same LR from round_num alone."""
+        a = mesh_round_lr(3e-4, round_num=17, total_rounds=120)
+        b = mesh_round_lr(3e-4, round_num=17, total_rounds=120)
+        assert a == b
+
+    def test_continuous_across_the_warmup_cosine_boundary(self):
+        """The last warmup round and the first cosine round must agree.
+
+        They are computed by two different branches; an off-by-one in either
+        shows up as an LR discontinuity exactly here and nowhere else.
+        """
+        peak, total = 3e-4, 120
+        warmup_rounds = round(0.05 * total)  # 6
+        last_warmup = mesh_round_lr(peak, warmup_rounds - 1, total)
+        first_cosine = mesh_round_lr(peak, warmup_rounds, total)
+        assert last_warmup == pytest.approx(peak)
+        assert first_cosine == pytest.approx(peak)
+
+    def test_decays_monotonically_after_warmup(self):
+        peak, total = 3e-4, 120
+        after = [mesh_round_lr(peak, r, total) for r in range(6, total)]
+        assert all(b <= a for a, b in zip(after, after[1:]))
+        assert after[0] > after[-1]
+
+    def test_overrun_past_the_final_round_clamps_to_min_lr(self):
+        """A worker relaunched past `rounds` must not wrap back up the cosine."""
+        for r in (120, 150, 10_000):
+            assert mesh_round_lr(3e-4, r, 120, min_lr=1e-5) == pytest.approx(1e-5)
+
+    def test_single_round_run_still_warms_up_to_peak(self):
+        """round(0.05 * 1) == 0; the max(1, ...) floor must keep it usable."""
+        assert mesh_round_lr(3e-4, round_num=0, total_rounds=1) == pytest.approx(3e-4)

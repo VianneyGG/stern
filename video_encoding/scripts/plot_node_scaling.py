@@ -106,9 +106,7 @@ def _load_contributors(merge_metrics: Path | None) -> dict[int, int]:
     return counts
 
 
-def drop_degraded(
-    points: list[RoundPoint], *, expected_nodes: int
-) -> list[RoundPoint]:
+def drop_degraded(points: list[RoundPoint], *, expected_nodes: int) -> list[RoundPoint]:
     """Drop rounds the cell ran below full strength: with no spare nodes a
     dead worker permanently shrinks a cell, and those rounds do not measure
     the node count the cell is labelled with."""
@@ -145,8 +143,12 @@ def efficiency(n: int, t_baseline: float, t_cell: float) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--metrics-root", type=Path, default=Path.home() / "stern_mesh" / "metrics")
-    parser.add_argument("--merge-metrics-root", type=Path, default=Path("runs/results/mesh"))
+    parser.add_argument(
+        "--metrics-root", type=Path, default=Path.home() / "stern_mesh" / "metrics"
+    )
+    parser.add_argument(
+        "--merge-metrics-root", type=Path, default=Path("runs/results/mesh")
+    )
     parser.add_argument("--deadline-h", type=float, default=6.0)
     parser.add_argument(
         "--target-loss",
@@ -177,7 +179,9 @@ def main() -> None:
         series[run_id] = kept
 
     if not series:
-        raise SystemExit(f"plot_node_scaling: no cell metrics under {args.metrics_root}")
+        raise SystemExit(
+            f"plot_node_scaling: no cell metrics under {args.metrics_root}"
+        )
 
     ttl = {rid: time_to_loss(pts, args.target_loss) for rid, pts in series.items()}
 
@@ -222,6 +226,7 @@ def main() -> None:
     print(header)
     print("-" * len(header))
     for r in rows:
+
         def _fmt(key, spec):
             return format(r[key], spec) if r[key] != "" else "n/a"
 

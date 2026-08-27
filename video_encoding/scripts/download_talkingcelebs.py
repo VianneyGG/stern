@@ -40,11 +40,11 @@ SOURCES_FILENAME = "sources.yaml"
 
 class ClipSpec(NamedTuple):
     identity_id: str  # "id00000", "id00001", …
-    video_id: str     # YouTube video ID
-    clip_num: int     # 1-based clip number within the video
-    start: str        # "HH:MM:SS"
-    end: str          # "HH:MM:SS"
-    split: str        # "train" or "test"
+    video_id: str  # YouTube video ID
+    clip_num: int  # 1-based clip number within the video
+    start: str  # "HH:MM:SS"
+    end: str  # "HH:MM:SS"
+    split: str  # "train" or "test"
 
 
 def fetch_sources_yaml(dest_dir: Path) -> Path:
@@ -106,7 +106,10 @@ def limit_specs(
                 continue
             seen_identities.add(spec.identity_id)
             clip_count[spec.identity_id] = 0
-        if max_clips_per_identity is not None and clip_count[spec.identity_id] >= max_clips_per_identity:
+        if (
+            max_clips_per_identity is not None
+            and clip_count[spec.identity_id] >= max_clips_per_identity
+        ):
             continue
         clip_count[spec.identity_id] += 1
         result.append(spec)
@@ -129,9 +132,12 @@ def download_full_video(video_id: str, cache_dir: Path) -> Path:
         "--no-playlist",
         # current YouTube extraction requires a JS runtime for signature
         # decryption; deno isn't installed on the cluster, but node is.
-        "--js-runtimes", "node",
-        "-f", "best[ext=mp4]/best",
-        "-o", str(cache_path),
+        "--js-runtimes",
+        "node",
+        "-f",
+        "best[ext=mp4]/best",
+        "-o",
+        str(cache_path),
         url,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -161,14 +167,22 @@ def download_clip(spec: ClipSpec, dest_dir: Path, cache_dir: Path) -> Path:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "ffmpeg", "-y",
-        "-ss", spec.start,
-        "-to", spec.end,
-        "-i", str(full_video_path),
-        "-vf", "scale=-2:720",
-        "-r", "25",
-        "-c:v", "libx264",
-        "-c:a", "aac",
+        "ffmpeg",
+        "-y",
+        "-ss",
+        spec.start,
+        "-to",
+        spec.end,
+        "-i",
+        str(full_video_path),
+        "-vf",
+        "scale=-2:720",
+        "-r",
+        "25",
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "aac",
         str(out_path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -181,18 +195,28 @@ def download_clip(spec: ClipSpec, dest_dir: Path, cache_dir: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dest-dir", type=Path, required=True,
-                        help="root output directory (TALKINGCELEBS_ROOT/raw)")
     parser.add_argument(
-        "--splits", nargs="+", default=["train", "test"],
+        "--dest-dir",
+        type=Path,
+        required=True,
+        help="root output directory (TALKINGCELEBS_ROOT/raw)",
+    )
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        default=["train", "test"],
         help="subdatasets to download (default: train test)",
     )
     parser.add_argument(
-        "--max-identities", type=int, default=None,
+        "--max-identities",
+        type=int,
+        default=None,
         help="cap on distinct identities, for a small mini subset (default: no cap)",
     )
     parser.add_argument(
-        "--max-clips-per-identity", type=int, default=None,
+        "--max-clips-per-identity",
+        type=int,
+        default=None,
         help="cap on clips per identity, for a small mini subset (default: no cap)",
     )
     args = parser.parse_args()

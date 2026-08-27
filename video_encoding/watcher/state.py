@@ -41,6 +41,15 @@ class RunState:
         "ASSIGNING"  # ASSIGNING|RUNNING|AWAITING_CHECKPOINTS|MERGING|SYNCING|DONE
     )
     missed_rounds: dict[str, int] = field(default_factory=dict)
+    # node -> times epoch_advance.readmit_healthy_nodes has lifted this run's
+    # crash-loop exclusion for it. Caps the second chance so a node that looks
+    # healthy but keeps dying cannot flap in and out of the pool every round.
+    # Defaulted, so a state file written before this field existed still loads.
+    readmitted: dict[str, int] = field(default_factory=dict)
+    # Epoch seconds of the last mesh_tick._recover_pool probe. That pass ssh's
+    # every excluded roster node, so it is throttled rather than run on every
+    # one-minute cron tick. Defaulted, so older state files still load.
+    last_recovery_at: float = 0.0
     target_pool_size: int = 0  # 0 = not yet observed; set once by
     # mesh_tick.advance_one_run to len(run_config.nodes) the first tick
     # this run is seen, so pool_deficit (epoch_advance.py) has a stable

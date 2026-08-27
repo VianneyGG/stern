@@ -94,9 +94,9 @@ class TestMotionIsPreserved:
 class TestForwardAndLoss:
     def test_per_frame_forward_shapes_agree(self):
         model = VideoMAEForPreTraining(_tiny_cfg(target_mode="per_frame")).eval()
-        keep, mask = RandomTubeMasking(0.5)(None, (2, 2, 2), torch.device("cpu"))
+        keep, mask = RandomTubeMasking(0.5)(None, (2, 2, 2), torch.device("cpu"), batch_size=1)
         pred, target = model(torch.randn(1, 3, 4, 32, 32), keep, mask)
-        assert pred.shape == target.shape == (1, len(mask), 2 * 3 * 16 * 16)
+        assert pred.shape == target.shape == (1, mask.shape[1], 2 * 3 * 16 * 16)
         assert torch.isfinite(model.compute_loss(pred, target))
 
 

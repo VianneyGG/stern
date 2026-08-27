@@ -189,7 +189,9 @@ class TestTemporalCorrelation:
 
     def test_a_perfect_prediction_correlates_at_one(self):
         target = self._target()
-        assert abs(temporal_correlation(target, target, BIG_GRID, self.MASK) - 1.0) < 1e-5
+        assert (
+            abs(temporal_correlation(target, target, BIG_GRID, self.MASK) - 1.0) < 1e-5
+        )
 
     def test_uncorrelated_temporal_noise_correlates_at_zero(self):
         target = self._target()

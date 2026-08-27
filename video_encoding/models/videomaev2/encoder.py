@@ -141,13 +141,15 @@ class VideoMAEEncoder(nn.Module):
 
         Args:
             x: (B, N, D) embedded tokens (after patch_embed + pos_embed)
-            keep_indices: (num_kept,) indices of tokens to keep (same for all batch)
+            keep_indices: (B, num_kept) per-sample indices of tokens to keep
 
         Returns:
             (B, num_kept, D) encoder output on visible tokens only
         """
-        # Gather visible tokens from the batch
-        x = x[:, keep_indices, :]  # (B, num_kept, D)
+        # keep_indices is (B, num_kept): gather per-sample, not one shared
+        # column selection for the whole batch.
+        idx = keep_indices.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        x = torch.gather(x, 1, idx)  # (B, num_kept, D)
         x = self.registers.prepend(x)
         for block in self.blocks:
             x = block(x)

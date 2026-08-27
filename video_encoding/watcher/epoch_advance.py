@@ -9,12 +9,18 @@ invocation of run_outer_step.py belongs in a future caller, not here.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from pathlib import Path
 
 from video_encoding.mesh.pending_files import parse_pending_filename
 from video_encoding.watcher.state import RunState, WatcherState
 
 MISSED_ROUND_THRESHOLD = 2
+
+# One second chance per node per run, mirroring tick.py's
+# resubmit-once-then-escalate tolerance: enough to recover a node whose GPU a
+# foreign process had grabbed, not enough for a genuine crash-loop to flap.
+MAX_READMISSIONS = 1
 
 
 def pending_nodes(
@@ -78,6 +84,55 @@ def record_missed_round(
         )
         return True
     return False
+
+
+def readmit_healthy_nodes(
+    state: WatcherState,
+    run_id: str,
+    healthy: Collection[str],
+    *,
+    max_readmissions: int = MAX_READMISSIONS,
+) -> list[str]:
+    """Lift `run_id`'s crash-loop exclusions for nodes that are healthy again.
+
+    `exclude_node` is permanent by design, and for its original causes (quota
+    exhaustion, a node that really is broken) that is right. But the dominant
+    cause in practice is neither: on 2026-08-21 all 12 nodes excluded from
+    factorial-tube-per_frame were up, reachable and still holding their
+    shards. They had missed rounds because a foreign process held their GPU,
+    or because they had never been seeded -- both transient, both since
+    checkable via `node_health.truly_idle`. Banning them for the rest of the
+    run cost that arm 6 of its 16 workers and 46 of its 260 shards.
+
+    So a missed-round exclusion is reversible once the node passes the health
+    gate, and only then. Two things it deliberately will not do:
+
+    * touch an exclusion whose reason does not name `run_id` -- another run's
+      ban, or a hand-written one, keeps `exclude_node`'s original contract
+      that only a human clears it;
+    * re-admit without limit. A node that probes healthy but keeps dying (our
+      bug, not the cluster's) would otherwise rejoin every round and take the
+      pool down with it. `max_readmissions` is the same one-retry tolerance
+      tick.py already applies before escalating a resubmit.
+
+    Returns the re-admitted nodes, sorted for a deterministic log line.
+    """
+    suffix = f"of {run_id}"
+    run = state.run(run_id)
+    healthy_set = set(healthy)
+    recovered = []
+    for node, reason in list(state.excluded_nodes.items()):
+        if not reason.endswith(suffix):
+            continue
+        if node not in healthy_set:
+            continue
+        if run.readmitted.get(node, 0) >= max_readmissions:
+            continue
+        del state.excluded_nodes[node]
+        run.missed_rounds[node] = 0
+        run.readmitted[node] = run.readmitted.get(node, 0) + 1
+        recovered.append(node)
+    return sorted(recovered)
 
 
 def eligible_nodes(state: WatcherState, candidates: list[str]) -> list[str]:

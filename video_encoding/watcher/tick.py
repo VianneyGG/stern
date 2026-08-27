@@ -21,6 +21,7 @@ from video_encoding.watcher.escalate import (
     record_escalation,
 )
 from video_encoding.watcher.quota import collect_disk_usage_pct
+from video_encoding.watcher.quota_cleanup import remediate_quota_pressure
 from video_encoding.watcher.registry import load_registry
 from video_encoding.watcher.remediate import remediate_dead_job
 from video_encoding.watcher.results import result_json_mtimes
@@ -43,6 +44,8 @@ def run_full_check(
     now: float,
     state: WatcherState,
     mesh_run_ids: frozenset[str] = frozenset(),
+    mesh_shared: Path = Path.home() / "stern_mesh",
+    active_run_ids: frozenset[str] = frozenset(),
 ) -> TickResult:
     registry = load_registry(state_dir / "jobs_registry.json")
     squeue = load_squeue_snapshot(state_dir / "squeue.json")
@@ -112,7 +115,21 @@ def run_full_check(
             # resubmit attempt itself failed -- fall through to escalate
         _try_escalate(flag)
 
-    for flag in [*stalled_flags, *quota_flags]:
+    for flag in stalled_flags:
+        _try_escalate(flag)
+
+    done_run_ids = {rid for rid, rs in state.runs.items() if rs.status == "DONE"}
+    for flag in quota_flags:
+        summary = remediate_quota_pressure(
+            flag.subject.removeprefix("quota:"),
+            mesh_shared=mesh_shared,
+            done_run_ids=done_run_ids,
+            active_run_ids=set(active_run_ids),
+            now=now,
+        )
+        if summary:
+            actions.append(f"cleanup {flag.subject}: {summary}")
+            continue
         _try_escalate(flag)
 
     action_taken = len(actions) > 0

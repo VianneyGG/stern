@@ -210,7 +210,25 @@ def assign_static(
             f"{', '.join(orphans[:10])}" + (" ..." if len(orphans) > 10 else "")
         )
 
-    for shard in sorted(expected):
+    # Seed pass: every node that holds anything gets one shard before any
+    # node gets a second. Without this, a node whose small holding is fully
+    # replicated on earlier-sorting nodes loses every load tie while they
+    # are all still at load 0 and ends up with nothing -- which
+    # `mesh_round` reports as train_loss=nan / 0.0 samp/s and then skips
+    # the push for, silently dropping merge quorum. Scarcest node first, and
+    # each takes its most-constrained shard, so seeding a starved node never
+    # strands another one.
+    unassigned = set(expected)
+    scarcity = {node: len(set(held) & expected) for node, held in holdings.items()}
+    for node in sorted(holdings, key=lambda n: (scarcity[n], n)):
+        candidates = [s for s in unassigned if node in holders[s]]
+        if not candidates:
+            continue
+        shard = min(candidates, key=lambda s: (len(holders[s]), s))
+        assignment[node].append(shard)
+        unassigned.discard(shard)
+
+    for shard in sorted(unassigned):
         owner = min(holders[shard], key=lambda n: (len(assignment[n]), n))
         assignment[owner].append(shard)
 

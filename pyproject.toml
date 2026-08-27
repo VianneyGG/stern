@@ -23,6 +23,7 @@ dependencies = [
     "imageio-ffmpeg>=0.6.0",
     "decord>=0.6.0",
     "webdataset>=0.2.100",
+    "matplotlib>=3.9.0",
 ]
 
 # CUDA 12.8 torch for the fish cluster (RTX 3090, driver 595, cuda-12.6/12.9).

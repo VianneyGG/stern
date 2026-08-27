@@ -147,9 +147,7 @@ class TestRandomInitIsTheControl:
             still = torch.randn(1, 3, 1, 64, 64, generator=g).repeat(1, 1, 8, 1, 1)
             clip = still + 0.4 * torch.randn(1, 3, 8, 64, 64, generator=g)
             feats.append(_tokens(model, clip).numpy())
-            targs.append(
-                frame_diff_targets(clip, model.encoder.token_grid, 16).numpy()
-            )
+            targs.append(frame_diff_targets(clip, model.encoder.token_grid, 16).numpy())
         return ridge_r2(np.concatenate(feats), np.concatenate(targs), alpha=alpha)
 
     def test_the_control_sits_near_zero(self):

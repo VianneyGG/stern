@@ -71,7 +71,11 @@ def test_a_truncated_shard_is_wrong_size_and_does_not_count_toward_coverage():
 def test_a_shard_not_in_the_golden_manifest_is_unexpected_but_not_fatal():
     report = _validate(
         {
-            "node001": {"shard-000000.tar": 100, "shard-000001.tar": 100, "junk.tar": 3},
+            "node001": {
+                "shard-000000.tar": 100,
+                "shard-000001.tar": 100,
+                "junk.tar": 3,
+            },
             "node002": {"shard-000002.tar": 100},
         }
     )
@@ -85,7 +89,13 @@ def test_a_missing_val_shard_fails_the_pool():
     """A missing val/ currently yields an empty val dataset and a meaningless
     val_loss in silence (mesh_round.py). It must fail loudly instead."""
     report = _validate(
-        {"node001": {"shard-000000.tar": 100, "shard-000001.tar": 100, "shard-000002.tar": 100}},
+        {
+            "node001": {
+                "shard-000000.tar": 100,
+                "shard-000001.tar": 100,
+                "shard-000002.tar": 100,
+            }
+        },
         val_scan={"node001": {}},
     )
     assert not report.ok
@@ -94,7 +104,13 @@ def test_a_missing_val_shard_fails_the_pool():
 
 def test_a_missing_train_manifest_fails_the_pool():
     report = _validate(
-        {"node001": {"shard-000000.tar": 100, "shard-000001.tar": 100, "shard-000002.tar": 100}},
+        {
+            "node001": {
+                "shard-000000.tar": 100,
+                "shard-000001.tar": 100,
+                "shard-000002.tar": 100,
+            }
+        },
         has_manifest={"node001": (False, True)},
     )
     assert not report.ok
@@ -105,7 +121,13 @@ def test_a_missing_val_manifest_fails_the_pool_separately():
     """val/ has its own non-interchangeable manifest (seed_mesh.py) and
     MeshShardIterableDataset loads it unconditionally."""
     report = _validate(
-        {"node001": {"shard-000000.tar": 100, "shard-000001.tar": 100, "shard-000002.tar": 100}},
+        {
+            "node001": {
+                "shard-000000.tar": 100,
+                "shard-000001.tar": 100,
+                "shard-000002.tar": 100,
+            }
+        },
         has_manifest={"node001": (True, False)},
     )
     assert not report.ok

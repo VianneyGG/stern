@@ -41,13 +41,21 @@ from video_encoding.mesh.topology import NODE_GROUPS, NODE_SUBNETS
 
 MESH_DIR = "/Data/$USER/mesh"
 
-# Shared-home quota constraint (25.6/30 GB used, ~15-20 GB freeable):
-# N x 172 MB (bf16 ViT-B checkpoint) + master + momentum buffer must fit.
-# This caps how many nodes may PUSH checkpoints to shared NFS concurrently
-# (--active-nodes below) -- it does not cap how many may hold a seeded
-# shard payload, since seeded shards live on node-local /Data, which is not
-# quota'd. That's MAX_SEEDED_NODES.
-MAX_MESH_NODES = 16
+# Shared-home quota constraint: N x 172 MB (bf16 ViT-B checkpoint) + master +
+# momentum buffer must fit. This caps how many nodes may PUSH checkpoints to
+# shared NFS concurrently (--active-nodes below) -- it does not cap how many
+# may hold a seeded shard payload, since seeded shards live on node-local
+# /Data, which is not quota'd. That's MAX_SEEDED_NODES.
+#
+# Raised 16 -> 20 on 2026-08-26 so a pool can take the largest divisor of the
+# 800-shard corpus that fits a tier (20 -> 40 shards/node exactly; 16 would
+# force 50 and waste three of fish's 23 nodes).
+#
+# CAUTION: this is a PER-INVOCATION guard and the quota is GLOBAL. Four
+# concurrent pools at 20 active nodes each would be 80 x 172 MB = 13.8 GB and
+# blow a 12-13 GB budget while every individual run passes this check. Size
+# concurrent runs against `quota -s`, not against this constant.
+MAX_MESH_NODES = 20
 
 # Nodes that may be seeded with a local shard payload: the 16 active nodes
 # plus 6 backup nodes the watcher promotes into --active-nodes on
@@ -369,7 +377,11 @@ def main() -> int:
     parser.add_argument(
         "--source-node",
         required=True,
-        help="hostname that already holds the full built shard set (train + val/)",
+        help=(
+            "hostname that already holds the full built shard set (train + "
+            "val/). May be outside --nodes, in which case it serves shards "
+            "without being seeded or counted in the placement split."
+        ),
     )
     parser.add_argument(
         "--active-nodes",
@@ -437,10 +449,18 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    if args.source_node not in {n.hostname for n in nodes}:
+    # The source node only has to *serve* shards, so it may sit outside
+    # --nodes entirely (the corpus is built on a file server like node114, which
+    # is deliberately absent from tiers.tsv and would otherwise be skipped by
+    # probe_nodes and abort the run). Keeping it out of --nodes also keeps
+    # n_shards divisible by the pool size. Reachability is still enforced --
+    # _list_remote_shards below fails loudly on an unreachable source.
+    if args.source_node in set(hostnames) and args.source_node not in {
+        n.hostname for n in nodes
+    }:
         print(
-            f"seed_mesh: --source-node {args.source_node!r} was not reachable "
-            "(it must be included in --nodes and probe successfully)",
+            f"seed_mesh: --source-node {args.source_node!r} was listed in "
+            "--nodes but did not probe successfully",
             file=sys.stderr,
         )
         return 1
@@ -508,14 +528,22 @@ def main() -> int:
     shard_map = build_shard_map(placement, nodes)
     plan = rsync_plan(placement, args.source_node)
 
-    print(f"seed_mesh: symlinking {args.source_node}'s own holdings into {MESH_DIR}")
-    _symlink_source_node(
-        args.source_node,
-        placement.get(args.source_node, []),
-        val_shards,
-        mesh_dir=MESH_DIR,
-        remote_source_dir=args.shards_dir,
-    )
+    if args.source_node in placement:
+        print(
+            f"seed_mesh: symlinking {args.source_node}'s own holdings into {MESH_DIR}"
+        )
+        _symlink_source_node(
+            args.source_node,
+            placement[args.source_node],
+            val_shards,
+            mesh_dir=MESH_DIR,
+            remote_source_dir=args.shards_dir,
+        )
+    else:
+        print(
+            f"seed_mesh: {args.source_node} is a serve-only source (outside "
+            "--nodes); not seeding a mesh payload onto it"
+        )
 
     for target, source, shards in plan:
         print(f"seed_mesh: pulling {len(shards)} shard(s) {source} -> {target}")

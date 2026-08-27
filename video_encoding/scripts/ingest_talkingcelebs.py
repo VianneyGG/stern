@@ -56,8 +56,12 @@ def list_clips(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, required=True,
-                        help="downloaded TalkingCelebs directory (TALKINGCELEBS_ROOT/raw)")
+    parser.add_argument(
+        "--root",
+        type=Path,
+        required=True,
+        help="downloaded TalkingCelebs directory (TALKINGCELEBS_ROOT/raw)",
+    )
     parser.add_argument("--manifest-out", type=Path, required=True)
     args = parser.parse_args()
 

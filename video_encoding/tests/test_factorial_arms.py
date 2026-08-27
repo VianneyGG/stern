@@ -79,8 +79,8 @@ def _train(mask_type: str, target_mode: str, seed: int = 0):
     losses, frame_draws = [], 0
     torch.manual_seed(seed + 1000)  # mask draws share a stream across arms
     for _ in range(STEPS):
-        keep, mask = masker(clip, grid, torch.device("cpu"))
-        if len({int(i) // (grid[1] * grid[2]) for i in keep.tolist()}) < grid[0]:
+        keep, mask = masker(clip, grid, torch.device("cpu"), batch_size=clip.shape[0])
+        if len({int(i) // (grid[1] * grid[2]) for i in keep[0].tolist()}) < grid[0]:
             frame_draws += 1  # a tube draw keeps every timestep visible
         loss = model.compute_loss(*model(clip, keep, mask))
         opt.zero_grad()
@@ -105,7 +105,9 @@ class TestTheArmsAreDistinguishable:
         encoder weights after 8 steps on identical data are one experiment."""
         for a, b in combinations(ARMS, 2):
             delta = float((trained[a][0] - trained[b][0]).abs().max())
-            assert delta > 1e-6, f"{a} and {b} are the same experiment (max|dw|={delta})"
+            assert delta > 1e-6, (
+                f"{a} and {b} are the same experiment (max|dw|={delta})"
+            )
 
     def test_mixed_actually_draws_frame_masks(self, trained):
         """The arm most at risk of silent degeneration: if the coin flip never

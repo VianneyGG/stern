@@ -40,7 +40,9 @@ def harness(tmp_path):
     for name in ("launch_mesh_pool.sh", "tiers_lib.sh"):
         shutil.copy2(REPO_ROOT / "video_encoding" / "scripts" / name, scripts / name)
     (scripts / "launch_mesh_pool.sh").chmod(0o755)
-    shutil.copy2(REPO_ROOT / "video_encoding" / "mesh" / "tiers.tsv", mesh / "tiers.tsv")
+    shutil.copy2(
+        REPO_ROOT / "video_encoding" / "mesh" / "tiers.tsv", mesh / "tiers.tsv"
+    )
     (tmp_path / "runs" / "state").mkdir(parents=True)
 
     call_log = tmp_path / "calls.log"
@@ -97,8 +99,12 @@ def harness(tmp_path):
 def _run(harness, extra_env=None, tier="fish", run_id="RUN1"):
     env, call_log, tmp_path = harness
     result = subprocess.run(
-        ["bash", str(tmp_path / "video_encoding" / "scripts" / "launch_mesh_pool.sh"),
-         tier, run_id],
+        [
+            "bash",
+            str(tmp_path / "video_encoding" / "scripts" / "launch_mesh_pool.sh"),
+            tier,
+            run_id,
+        ],
         capture_output=True,
         text=True,
         cwd=tmp_path,
@@ -187,8 +193,11 @@ def _eval_quorum_arithmetic(n_active: int) -> str:
     ]
     assert lines, "no QUORUM_K arithmetic found in launch_mesh_pool.sh"
     snippet = "\n".join(
-        [f'ACTIVE_CSV="{",".join(f"n{i}" for i in range(n_active))}"', *lines,
-         'echo "${QUORUM_K}"']
+        [
+            f'ACTIVE_CSV="{",".join(f"n{i}" for i in range(n_active))}"',
+            *lines,
+            'echo "${QUORUM_K}"',
+        ]
     )
     return subprocess.run(
         ["bash", "-c", snippet], capture_output=True, text=True, check=True
@@ -205,3 +214,115 @@ def test_quorum_default_never_falls_below_one():
     """countries has 19 nodes total and a 1-node smoke run is a real case;
     floor(0.75 * 1) is 0, which no node count could ever reach."""
     assert _eval_quorum_arithmetic(1) == "1"
+
+
+def test_extra_overrides_env_var_reaches_register(harness):
+    """Per-arm Hydra knobs must survive the launcher.
+
+    register_mesh_run.sh has accepted extra_overrides as argument 8 all
+    along, but the launcher never forwarded it, so factorial arms
+    (mask_type/target_mode) could not be launched through the normal path
+    and were hand-written into mesh_run_configs.json instead.
+    """
+    overrides = "model.mask_type=mixed model.target_mode=per_frame"
+    result, log = _run(harness, {"EXTRA_OVERRIDES": overrides})
+    assert result.returncode == 0, result.stderr
+
+    register = next(ln for ln in log.splitlines() if ln.startswith("register "))
+    fields = register.split()
+    # register <run_id> <csv> <rounds> <lr> <momentum> <quorum_k> <weighting> <overrides...>
+    assert fields[8] == "model.mask_type=mixed", register
+    assert fields[9] == "model.target_mode=per_frame", register
+
+
+def test_extra_overrides_absent_by_default(harness):
+    """An unset EXTRA_OVERRIDES must not add a stray argument."""
+    result, log = _run(harness)
+    assert result.returncode == 0, result.stderr
+
+    register = next(ln for ln in log.splitlines() if ln.startswith("register "))
+    # "register" + 7 real args; the empty 8th collapses in "$*".
+    assert len(register.split()) == 8, register
+
+
+# --- group 4: POOL_NODES, the cross-tier roster ----------------------------
+
+# A roster spanning three tiers under a label that is deliberately absent from
+# tiers.tsv -- an arm name, not a tier.
+_CROSS = "node001,node002,node024,node025,node047,node048"
+
+
+def _seed_line(log):
+    return next(ln for ln in log.splitlines() if "seed_mesh" in ln)
+
+
+def _validate_line(log):
+    return next(ln for ln in log.splitlines() if "validate_seeding" in ln)
+
+
+def test_pool_nodes_bypasses_the_tier_poll_for_a_non_tier_label(harness):
+    """The label keys the pool's state; only POOL_NODES names hosts.
+
+    Without the guard, tier_nodes aborts the script on an unknown tier under
+    `set -e` before anything is seeded.
+    """
+    result, log = _run(harness, {"POOL_NODES": _CROSS}, tier="arm-a")
+    assert result.returncode == 0, result.stderr
+    assert "no idle poll" in result.stdout, result.stdout
+    assert any(ln.startswith("register ") for ln in log.splitlines()), log
+
+
+def test_pool_nodes_seeds_and_activates_the_identical_roster(harness):
+    """Placement must span exactly the training set.
+
+    seed_mesh plans over --nodes but only --active-nodes train, so a --nodes
+    superset spreads shards onto nodes no worker reads -- which is what left
+    the 2026-08-21 arms holding 192-250 of 260 shards each.
+    """
+    result, log = _run(harness, {"POOL_NODES": _CROSS}, tier="arm-a")
+    assert result.returncode == 0, result.stderr
+
+    seed = _seed_line(log)
+    assert f"--nodes {_CROSS}" in seed, seed
+    assert f"--active-nodes {_CROSS}" in seed, seed
+
+
+def test_pool_nodes_validates_exactly_the_roster(harness):
+    """A cross-tier pool has no tier to scan, so the gate must be told the hosts."""
+    result, log = _run(harness, {"POOL_NODES": _CROSS}, tier="arm-a")
+    assert result.returncode == 0, result.stderr
+    assert f"--nodes {_CROSS}" in _validate_line(log)
+
+
+def test_tier_pool_validates_its_own_roster_not_the_whole_tier(harness):
+    """22 of the tier's 23 nodes are the pool; the 23rd must not gate the run."""
+    result, log = _run(harness)
+    assert result.returncode == 0, result.stderr
+
+    validate = _validate_line(log)
+    roster = validate.split("--nodes ")[1].split()[0]
+    assert len(roster.split(",")) == 22, validate
+
+
+def test_pool_source_node_overrides_the_first_roster_entry(harness):
+    """Lets seeding start from a node that already holds all 260 shards
+    instead of pre-staging 223 GB onto whichever host sorted first."""
+    result, log = _run(
+        harness, {"POOL_NODES": _CROSS, "POOL_SOURCE_NODE": "node048"}, tier="arm-a"
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--source-node node048" in _seed_line(log)
+
+
+def test_chunk_rounds_defaults_to_the_measured_value():
+    """8 rounds x ~611s = 68% of the partition's 7200s walltime cap."""
+    script = REAL_SCRIPT.read_text()
+    assert 'CHUNK_ROUNDS="${CHUNK_ROUNDS:-8}"' in script
+    assert "export CHUNK_ROUNDS" in script
+
+
+def test_chunk_rounds_is_overridable_from_the_environment():
+    script = REAL_SCRIPT.read_text()
+    idx = script.index('CHUNK_ROUNDS="${CHUNK_ROUNDS:-8}"')
+    # ':-' not '=', so an explicit CHUNK_ROUNDS survives.
+    assert "${CHUNK_ROUNDS:-8}" in script[idx : idx + 60]

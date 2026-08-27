@@ -16,6 +16,7 @@ import contextlib
 import functools
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import hydra
@@ -265,6 +266,8 @@ def _train_epoch_ssl(
     amp: str = "off",
     scaler: "torch.amp.GradScaler | None" = None,
     progress_desc: str | None = None,
+    abandon_check: "Callable[[], bool] | None" = None,
+    abandon_check_every: int = 50,
 ) -> dict:
     """Train one epoch (or `max_steps` micro-steps) of SSL pretraining.
 
@@ -281,6 +284,15 @@ def _train_epoch_ssl(
     - Only steps after `timing_warmup_steps` are timed (cuDNN autotune +
       allocator growth make the first steps unrepresentative), with a single
       `cuda.synchronize()` at each end of the timed window.
+
+    `abandon_check`: polled every `abandon_check_every` steps; when it
+    returns True the epoch stops early and the returned dict carries
+    `abandoned=True`. The mesh round loop uses it to drop a round whose merge
+    has already happened without this node -- every further step would be
+    computed against a superseded master and merged by nobody. Left None (the
+    default) nothing is polled and behaviour is byte-identical to before.
+    Whatever work was done before the break is still reflected in `loss`,
+    `steps` and `samples`; the caller decides whether to keep it.
 
     `progress_desc`: when set, wraps the loader in a tqdm progress bar with
     this label (used by the mesh round loop to show "round N" progress on an
@@ -316,6 +328,7 @@ def _train_epoch_ssl(
     timed_steps = 0
     executed_steps = 0
     nan_steps = 0
+    abandoned = False
 
     iterable = loader
     if progress_desc is not None:
@@ -333,7 +346,7 @@ def _train_epoch_ssl(
         batch_size = pixel_values.shape[0]
 
         # Sample tube mask for this step
-        keep_indices, mask_indices = masker(pixel_values, token_grid, device)
+        keep_indices, mask_indices = masker(pixel_values, token_grid, device, pixel_values.shape[0])
 
         is_boundary = (step + 1) % accum_steps == 0 or (
             num_steps is not None and step + 1 == num_steps
@@ -386,6 +399,18 @@ def _train_epoch_ssl(
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
+        # After the optimizer step, never mid-accumulation: breaking between
+        # a backward and its boundary step would leave the accumulated grads
+        # unapplied, silently discarding accum_steps-1 micro-batches.
+        if (
+            abandon_check is not None
+            and is_boundary
+            and executed_steps % abandon_check_every == 0
+            and abandon_check()
+        ):
+            abandoned = True
+            break
+
         if max_steps > 0 and executed_steps >= max_steps:
             break
 
@@ -407,6 +432,7 @@ def _train_epoch_ssl(
         "steps": executed_steps,
         "samples": count,
         "nan_steps": nan_steps,
+        "abandoned": abandoned,
     }
 
 

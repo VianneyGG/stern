@@ -1,0 +1,68 @@
+# @package _global_
+#
+# Paper-faithful mesh SSL recipe on the EXISTING 2fps shard corpus.
+# Overnight 2x2 of 2026-08-23: recipe {legacy, paper} x target_mode
+# {time_avg, per_frame}. This file is the paper half; the legacy half is
+# videomae_mesh_ssl.yaml driven by EXTRA_OVERRIDES at launch.
+#
+# NOT the same cell as videomae_mesh_paper_a/b_stride1_*.yaml, which need the
+# 8fps corpus: at 2fps, 16 frames at frame_stride=1 already span 8 SECONDS,
+# four times VideoMAE's ~2s. The temporal span is therefore wrong in every arm
+# here, identically -- which is exactly why span is not an axis of this 2x2 and
+# why frame_stride is pinned to 1. Stride cannot shorten the span, only lengthen
+# it (stride 4 -> 32s, matching 0.9% of clips).
+#
+# Compute matching: 640 micro-batches x 16 = 10240 samples/round, identical to
+# the legacy arm's 10240 x 1. Equal data and equal GPU work per round is the
+# constraint that the 2026-08-21 factorial violated (round_budget_s time-boxing
+# gave some arms 23-113% more samples, which invalidated the comparison).
+# H differs as a consequence -- 40 optimizer steps/round here vs the legacy
+# arm's 160 -- and cannot be held constant too: at fixed samples/round, eff_batch
+# 256 vs 64 IS a 4x difference in optimizer steps. That is a property of the
+# treatment, not an uncontrolled confound.
+
+defaults:
+  - override /train: ssl
+
+experiment:
+  name: videomae_mesh_paper2fps_per_frame
+  description: "Paper-faithful recipe on 2fps shards, target_mode=per_frame (overnight 2x2, paper arm)."
+  stage: pretrain
+
+mesh:
+  # rounds is set at launch (launch_mesh_pool.sh's positional) from the
+  # measured round wall-clock; this default is only a placeholder.
+  rounds: 40
+  # Micro-batches per round, NOT optimizer steps: 40 opt steps x accum 16.
+  steps_per_round: 640
+  micro_batch_size: 16
+  merge: true
+  outer_lr: 0.7
+  outer_momentum: 0.9
+  lr_warmup_frac: 0.05
+  lr_min: 1e-5
+  # Uniform step count for every node. Non-null would re-introduce the
+  # time-boxing confound described above.
+  round_budget_s: null
+  sync_timeout_s: 1800.0
+  subnet: "/254"
+
+preprocess:
+  window:
+    frame_stride: 1
+  augment: true
+
+model:
+  target_mode: per_frame
+  decoder_embed_dim: 384
+  decoder_num_heads: 6
+
+train:
+  # eff_batch = micro_batch_size(16) * accum_steps(16) = 256. _scaled_lr
+  # derives lr = base_lr * 256/256 * lr_mult = 3e-4 as the schedule's peak.
+  accum_steps: 16
+  weight_decay: 0.05
+  base_lr: 1.5e-4
+  lr_mult: 2.0
+  grad_clip: 1.0
+  amp: bf16

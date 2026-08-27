@@ -145,7 +145,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Verify a mesh pool's seeded shards against the golden reference."
     )
-    parser.add_argument("--pool", required=True, help="tier name, e.g. fish")
+    parser.add_argument(
+        "--pool",
+        required=True,
+        help=(
+            "pool label -- a tier name (fish) or, for a cross-tier roster, "
+            "the arm name. Used as the key under which verified holdings are "
+            "recorded, and as the tier to scan when --nodes is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--nodes",
+        default=None,
+        help=(
+            "comma-separated roster to scan. Defaults to every node in the "
+            "tier named by --pool. Pass this for a roster that is not a whole "
+            "tier -- a cross-tier pool has no tier to look up, and scanning a "
+            "whole tier would gate the launch on nodes the run never uses."
+        ),
+    )
     parser.add_argument("--golden-host", default=GOLDEN_HOST)
     parser.add_argument("--golden-dir", default=GOLDEN_DIR)
     parser.add_argument("--mesh-dir", default=MESH_DIR)
@@ -163,7 +181,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    nodes = tier_nodes(args.pool)
+    if args.nodes is not None:
+        nodes = [h.strip() for h in args.nodes.split(",") if h.strip()]
+        if not nodes:
+            print(
+                "validate_seeding: --nodes was empty -- refusing to report a "
+                "pool with no nodes as valid",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        nodes = tier_nodes(args.pool)
     scan, val_scan, has_manifest = scan_pool(
         nodes, mesh_dir=args.mesh_dir, run_ssh=_run_ssh
     )
@@ -175,7 +203,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     holdings_path = args.metadata_dir / "verified_holdings.json"
     all_holdings = json.loads(holdings_path.read_text()) if holdings_path.exists() else {}
-    all_holdings[args.pool] = holdings_from_scan(scan)
+    fresh = holdings_from_scan(scan)
+    # A node holds one payload, so it belongs to one pool. Drop it from every
+    # other pool's entry: mesh_tick._verified_holdings flattens all pools into
+    # {node: shards} and the last key wins, and keys are written sorted -- so a
+    # node moved from "cars" to an arm-named pool would silently resolve to its
+    # stale "cars" holdings purely because "cars" sorts later. That is the
+    # 2026-08-20 failure mode (attribution disagreeing with reality) with a
+    # different cause.
+    for pool, held in all_holdings.items():
+        if pool == args.pool:
+            continue
+        for node in fresh:
+            held.pop(node, None)
+    all_holdings[args.pool] = fresh
     _write_json(holdings_path, all_holdings)
 
     print(
