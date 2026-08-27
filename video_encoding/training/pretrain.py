@@ -346,7 +346,9 @@ def _train_epoch_ssl(
         batch_size = pixel_values.shape[0]
 
         # Sample tube mask for this step
-        keep_indices, mask_indices = masker(pixel_values, token_grid, device, pixel_values.shape[0])
+        keep_indices, mask_indices = masker(
+            pixel_values, token_grid, device, pixel_values.shape[0]
+        )
 
         is_boundary = (step + 1) % accum_steps == 0 or (
             num_steps is not None and step + 1 == num_steps
@@ -360,8 +362,14 @@ def _train_epoch_ssl(
             with torch.autocast(
                 device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled
             ):
-                pred, target = model(pixel_values, keep_indices, mask_indices)
-                loss = core.compute_loss(pred, target) / accum_steps
+                # return_aux is the *training* path only: the E2b arms add their
+                # terms here, while evaluate_val_loss deliberately omits them so
+                # val loss stays plain masked MSE and stays comparable across
+                # arms (and save_best's all-time-best guard keeps its meaning).
+                pred, target, aux = model(
+                    pixel_values, keep_indices, mask_indices, return_aux=True
+                )
+                loss = core.compute_loss(pred, target, aux=aux) / accum_steps
             # bf16/fp16 forward on a freshly-initialized deep ViT occasionally
             # produces a non-finite loss on an isolated batch (observed on real
             # data; not reproducible in fp32). Skip backward entirely rather

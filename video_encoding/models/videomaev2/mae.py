@@ -11,6 +11,8 @@ reconstructs full resolution, and only masked-token predictions are penalized.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 from omegaconf import DictConfig
 from torch import nn
@@ -21,6 +23,77 @@ from video_encoding.models.videomaev2.encoder import (
     _IMAGENET_MEAN,
     _IMAGENET_STD,
 )
+
+
+class MAEAux(NamedTuple):
+    """Auxiliary loss terms for the E2b ablation arms.
+
+    Every field is empty under the committed recipe, so `compute_loss` with a
+    default-config model returns the same scalar it always did.
+    """
+
+    visible_pred: torch.Tensor | None = None
+    visible_target: torch.Tensor | None = None
+    visible_weights: torch.Tensor | None = None
+    deep_preds: list[torch.Tensor] = []  # noqa: RUF012 - NamedTuple field default
+
+
+def visible_isolation_weights(
+    keep_indices: torch.Tensor,
+    token_grid: tuple[int, int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """`w_i = 1 - exp(-d_i)` for each visible token, `d_i` its Euclidean distance
+    in the (H', W') *spatial* plane to the nearest visible token outside its own
+    tube.
+
+    A visible patch with a visible spatial neighbour can be reconstructed by
+    copying sideways, so it exerts no pressure to carry its own content through
+    depth. An isolated one has nowhere to copy from: the only route to its
+    reconstruction is its own token surviving all twelve blocks. Weighting by
+    isolation aims arm B's extra term at exactly the tokens whose loss the
+    residual stream has to preserve, which is what the ablation is about.
+
+    Two properties of the mask geometry force this definition (measured on the
+    production (8, 14, 14) grid; see test_mae_e2b_arms.py):
+
+    - **Distance to the nearest *masked* token cannot work.** At mask_ratio 0.9
+      every visible token sits at d=1.0 from a hole -- only 10% of tokens
+      survive, so none is ever deep inside a visible region. It is still
+      degenerate at 0.75, and only spreads at 0.5, far below anything we run.
+    - **The distance must ignore T'.** Tube masking keeps or drops a whole
+      (h, w) column across every temporal position, so a token's own tube is
+      always visible at d=1 along T' and a 3D metric collapses to a constant
+      regardless of ratio.
+
+    Isolation behaves the other way round: it spreads *best* at the production
+    ratio (six distinct values, max 3.16, at 0.9) and degenerates as masking
+    falls -- so this arm is only meaningful in the regime we actually train in.
+
+    The length scale is one grid cell. It is fixed rather than configurable: the
+    arm already has a free parameter (`visible_loss_weight`) to be chosen by
+    smoke run, and a second interacting one would make that choice unreadable.
+    """
+    t, h, w = token_grid
+    coords = torch.stack(
+        torch.meshgrid(
+            torch.arange(t, device=device, dtype=torch.float32),
+            torch.arange(h, device=device, dtype=torch.float32),
+            torch.arange(w, device=device, dtype=torch.float32),
+            indexing="ij",
+        ),
+        dim=-1,
+    ).reshape(-1, 3)  # (N, 3), matching TubeletEmbed's token order
+
+    keep_hw = coords[keep_indices][..., 1:]  # (B, num_kept, 2) -- drop T'
+    d = torch.cdist(keep_hw, keep_hw)  # (B, num_kept, num_kept)
+    # d == 0 covers both the token itself and its temporal copies: same (h, w),
+    # so neither is a spatial neighbour to copy from.
+    d = d.masked_fill(d == 0, float("inf"))
+    nearest = d.amin(dim=-1)  # (B, num_kept)
+    # A single visible column leaves every distance infinite -> exp(-inf) = 0
+    # -> w = 1 uniformly. Degenerate but finite; no NaN reaches the loss.
+    return 1.0 - torch.exp(-nearest)
 
 
 class VideoMAEForPreTraining(nn.Module):
@@ -97,22 +170,48 @@ class VideoMAEForPreTraining(nn.Module):
             self.decoder_embed_dim, out_frames * 3 * self.patch_size * self.patch_size
         )
 
+        # --- E2b ablation knobs. All three default to the committed recipe, so
+        # arm A is bit-comparable to the runs already on the cluster.
+        self.visible_loss_weight = float(model_cfg.get("visible_loss_weight", 0.0))
+        self.visible_loss_isolation_weighting = bool(
+            model_cfg.get("visible_loss_isolation_weighting", False)
+        )
+        depth = int(model_cfg.depth)
+        # 1-based to match the prompt's [4, 8, 12]; 0 would silently mean "the
+        # last block" under Python indexing, which is the opposite of intent.
+        self.deep_supervision_layers = [
+            int(i) for i in (model_cfg.get("deep_supervision_layers") or [])
+        ]
+        for layer in self.deep_supervision_layers:
+            if not 1 <= layer <= depth:
+                raise ValueError(
+                    f"deep_supervision_layers: {layer} out of range for a "
+                    f"{depth}-block encoder (expected 1..{depth}, 1-based)"
+                )
+
     def forward(
         self,
         pixel_values: torch.Tensor,
         keep_indices: torch.Tensor | None = None,
         mask_indices: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, "MAEAux"]
+    ):
         """Encode, mask, decode, predict.
 
         Args:
             pixel_values: (B, C, T, H, W) video frames
             keep_indices: (B, num_kept) token indices to keep (sampled at train time)
             mask_indices: (B, num_masked) token indices to mask
+            return_aux: also return the E2b auxiliary terms. Off by default, so
+                the committed `pred, target = model(...)` call sites are
+                untouched and the eval path keeps measuring plain masked MSE.
 
         Returns:
             pred: (B, num_masked, 3*patch_size^2) predicted pixel values
             target: (B, num_masked, 3*patch_size^2) target pixel values
+            aux: `MAEAux`, only when `return_aux=True`
         """
         B, C, T, H, W = pixel_values.shape
 
@@ -142,7 +241,76 @@ class VideoMAEForPreTraining(nn.Module):
 
         # Encode only the visible tokens (the whole point of MAE: the encoder
         # never sees masked tokens, so its compute scales with ~10% of N).
-        visible = self.encoder.forward_tokens(x, keep_indices)  # (B, num_kept, D)
+        if self.deep_supervision_layers and return_aux:
+            visible, intermediates = self.encoder.forward_tokens(
+                x, keep_indices, return_layers=self.deep_supervision_layers
+            )
+        else:
+            visible = self.encoder.forward_tokens(x, keep_indices)
+            intermediates = []
+
+        pred_full = self._decode(visible, keep_indices, mask_indices, B, N)
+
+        pred_idx = mask_indices.unsqueeze(-1).expand(-1, -1, pred_full.shape[-1])
+        pred = torch.gather(pred_full, 1, pred_idx)
+
+        target_full = self._patchify_targets(pixel_values)  # (B, N, out_dim)
+        target_idx = mask_indices.unsqueeze(-1).expand(-1, -1, target_full.shape[-1])
+        target = torch.gather(target_full, 1, target_idx)
+
+        if not return_aux:
+            return pred, target
+
+        visible_pred = visible_target = visible_weights = None
+        if self.visible_loss_weight > 0.0:
+            # No extra decoder compute: pred_full already covers all N tokens,
+            # so the visible term is a second gather, at keep_indices.
+            keep_out_idx = keep_indices.unsqueeze(-1).expand(
+                -1, -1, pred_full.shape[-1]
+            )
+            visible_pred = torch.gather(pred_full, 1, keep_out_idx)
+            visible_target = torch.gather(target_full, 1, keep_out_idx)
+            if self.visible_loss_isolation_weighting:
+                visible_weights = visible_isolation_weights(
+                    keep_indices,
+                    self.encoder.token_grid,
+                    pixel_values.device,
+                )
+
+        # Each supervised layer is decoded by the *same* decoder and head. A
+        # per-layer decoder would confound "layer 4 carries reconstructable
+        # information" with "layer 4's private decoder learned to read it".
+        deep_preds = [
+            torch.gather(
+                self._decode(tokens, keep_indices, mask_indices, B, N), 1, pred_idx
+            )
+            for tokens in intermediates
+        ]
+
+        return (
+            pred,
+            target,
+            MAEAux(
+                visible_pred=visible_pred,
+                visible_target=visible_target,
+                visible_weights=visible_weights,
+                deep_preds=deep_preds,
+            ),
+        )
+
+    def _decode(
+        self,
+        visible: torch.Tensor,
+        keep_indices: torch.Tensor,
+        mask_indices: torch.Tensor,
+        B: int,
+        N: int,
+    ) -> torch.Tensor:
+        """Encoder tokens -> per-token pixel predictions over all N positions.
+
+        Factored out of `forward` so deep supervision can push an intermediate
+        block's tokens through the identical decoder path.
+        """
         visible = self.encoder_to_decoder(visible)  # (B, num_kept, decoder_embed_dim)
 
         num_masked = mask_indices.shape[1]
@@ -163,15 +331,7 @@ class VideoMAEForPreTraining(nn.Module):
             decoder_tokens = block(decoder_tokens)
         decoder_tokens = self.decoder_norm(decoder_tokens)
 
-        pred_full = self.predict_head(decoder_tokens)  # (B, N, out_dim)
-        pred_idx = mask_indices.unsqueeze(-1).expand(-1, -1, pred_full.shape[-1])
-        pred = torch.gather(pred_full, 1, pred_idx)
-
-        target_full = self._patchify_targets(pixel_values)  # (B, N, out_dim)
-        target_idx = mask_indices.unsqueeze(-1).expand(-1, -1, target_full.shape[-1])
-        target = torch.gather(target_full, 1, target_idx)
-
-        return pred, target
+        return self.predict_head(decoder_tokens)  # (B, N, out_dim)
 
     def _patchify_targets(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Reconstruction target: per-tubelet, per-patch z-scored pixel patches
@@ -213,15 +373,48 @@ class VideoMAEForPreTraining(nn.Module):
         sigma = x.std(dim=-1, keepdim=True)
         return (x - mu) / (sigma + 1e-6)
 
-    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """MSE loss on masked token predictions.
+    def compute_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        aux: "MAEAux | None" = None,
+    ) -> torch.Tensor:
+        """MSE loss on masked token predictions, plus any E2b auxiliary terms.
 
         Args:
             pred: (B, num_masked, 3*patch_size^2) model predictions
             target: (B, num_masked, 3*patch_size^2) ground truth pixel values
+            aux: auxiliary terms from `forward(..., return_aux=True)`. Omitted
+                by the eval path, so val loss stays plain masked MSE and remains
+                comparable across arms.
 
         Returns:
-            loss: scalar, MSE over masked positions
+            loss: scalar. Stays a scalar under every arm so both training
+            entrypoints are unchanged at the call site.
         """
         loss = torch.mean((pred - target) ** 2)
+        if aux is None:
+            return loss
+
+        if aux.visible_pred is not None:
+            se = (aux.visible_pred - aux.visible_target) ** 2
+            if aux.visible_weights is None:
+                visible = se.mean()
+            else:
+                # Weighted mean over tokens: normalise by the weight sum so the
+                # term's scale does not drift with the mask draw.
+                per_token = se.mean(dim=-1)  # (B, num_kept)
+                w = aux.visible_weights.to(per_token.dtype)
+                visible = (per_token * w).sum() / (w.sum() + 1e-6)
+            loss = loss + self.visible_loss_weight * visible
+
+        if aux.deep_preds:
+            # Averaged over layers, then added at unit weight, so the auxiliary
+            # term's magnitude is comparable to the main one regardless of how
+            # many layers are supervised.
+            deep = torch.stack(
+                [torch.mean((p - target) ** 2) for p in aux.deep_preds]
+            ).mean()
+            loss = loss + deep
+
         return loss

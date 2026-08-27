@@ -145,3 +145,63 @@ def test_forward_tokens_excludes_registers_from_returned_tokens():
     keep_indices = torch.arange(4).unsqueeze(0).expand(2, -1)  # (B=2, 4)
     out = encoder.forward_tokens(x, keep_indices)
     assert out.shape == (2, 4, 32)  # 4 kept patch tokens, no registers leaked through
+
+
+# --- opt-in intermediate outputs (E2b arm C) ------------------------------
+
+
+def test_forward_tokens_default_return_type_is_unchanged():
+    """Existing callers unpack a bare Tensor. Adding the opt-in must not turn
+    the default return into a tuple."""
+    cfg = _tiny_cfg()
+    encoder = VideoMAEEncoder(cfg)
+    x = encoder.patch_embed(torch.randn(2, 3, 4, 16, 16)) + encoder.pos_embed
+    keep_indices = torch.arange(4).unsqueeze(0).expand(2, -1)
+
+    out = encoder.forward_tokens(x, keep_indices)
+
+    assert isinstance(out, torch.Tensor)
+
+
+def test_forward_tokens_returns_requested_intermediates():
+    cfg = _tiny_cfg(depth=4)
+    encoder = VideoMAEEncoder(cfg)
+    x = encoder.patch_embed(torch.randn(2, 3, 4, 16, 16)) + encoder.pos_embed
+    keep_indices = torch.arange(4).unsqueeze(0).expand(2, -1)
+
+    out, intermediates = encoder.forward_tokens(x, keep_indices, return_layers=[1, 3])
+
+    assert out.shape == (2, 4, 32)
+    assert len(intermediates) == 2
+    for tokens in intermediates:
+        assert tokens.shape == out.shape  # registers stripped, same as the final
+
+
+def test_forward_tokens_intermediates_do_not_change_the_final_output():
+    """Instrumentation must be observation-only: asking for intermediates must
+    not perturb the value the encoder returns."""
+    cfg = _tiny_cfg(depth=4)
+    encoder = VideoMAEEncoder(cfg).eval()
+    x = encoder.patch_embed(torch.randn(2, 3, 4, 16, 16)) + encoder.pos_embed
+    keep_indices = torch.arange(4).unsqueeze(0).expand(2, -1)
+
+    with torch.no_grad():
+        plain = encoder.forward_tokens(x, keep_indices)
+        instrumented, _ = encoder.forward_tokens(x, keep_indices, return_layers=[2])
+
+    assert torch.equal(plain, instrumented)
+
+
+def test_forward_tokens_last_intermediate_matches_the_final_output():
+    """Requesting the final layer must hand back the same tensor the function
+    returns -- a cheap guard that the layer indices are 1-based and not off by
+    one."""
+    cfg = _tiny_cfg(depth=4)
+    encoder = VideoMAEEncoder(cfg).eval()
+    x = encoder.patch_embed(torch.randn(2, 3, 4, 16, 16)) + encoder.pos_embed
+    keep_indices = torch.arange(4).unsqueeze(0).expand(2, -1)
+
+    with torch.no_grad():
+        out, intermediates = encoder.forward_tokens(x, keep_indices, return_layers=[4])
+
+    assert torch.equal(out, intermediates[0])

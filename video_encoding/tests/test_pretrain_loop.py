@@ -109,11 +109,11 @@ def test_train_epoch_skips_nonfinite_loss_without_poisoning_average():
     real_compute_loss = model.compute_loss
     calls = {"n": 0}
 
-    def flaky_compute_loss(pred, target):
+    def flaky_compute_loss(pred, target, aux=None):
         calls["n"] += 1
         if calls["n"] == 1:
-            return real_compute_loss(pred, target) * float("nan")
-        return real_compute_loss(pred, target)
+            return real_compute_loss(pred, target, aux=aux) * float("nan")
+        return real_compute_loss(pred, target, aux=aux)
 
     model.compute_loss = flaky_compute_loss
 

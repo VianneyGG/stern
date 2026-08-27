@@ -35,3 +35,26 @@ target_mode: time_avg     # time_avg | per_frame. per_frame keeps one patch per 
                           # between modes -- predict_head shapes differ.
 decoder_mask_ratio: 0.0   # V2 dual masking: fraction of masked tokens the decoder skips reconstructing (0.0 = reconstruct all, V1 behavior)
                           # >0.0 makes masked-token count data-dependent (torch.randperm-sliced in mae.py forward) -> breaks torch.compile's static-shape assumption; re-benchmark train.compile if enabling this
+
+# --- E2b depth-collapse ablation (docs/research/2026-08-27-depth-collapse-3pool-prompt.md)
+# All three default to the committed recipe, so arm A is bit-comparable to the
+# runs already on the cluster. Set via EXTRA_OVERRIDES, not by editing this file.
+visible_loss_weight: 0.0  # arm B: weight on an MSE term over the *visible* patches.
+                          # Costs no extra decoder compute -- pred_full already spans
+                          # all N tokens, so it is a second gather at keep_indices.
+visible_loss_isolation_weighting: false
+                          # Weight the arm-B term by 1-exp(-d), d = distance in the
+                          # (H',W') plane to the nearest visible token outside this
+                          # token's own tube. Isolated visible patches cannot be
+                          # copied from a neighbour, so they are the ones whose
+                          # content the residual stream must actually carry.
+                          # Spreads best at mask_ratio 0.9 (six distinct weights);
+                          # degenerates below ~0.5. Distance-to-nearest-MASKED was
+                          # tried first and is a no-op at every ratio we run --
+                          # see visible_isolation_weights' docstring.
+deep_supervision_layers: []
+                          # arm C: 1-based encoder blocks to also decode and penalise,
+                          # e.g. [4, 8, 12]. Reuses the same decoder+head, so it tests
+                          # "does this layer carry reconstructable information", not
+                          # "can a private decoder learn to read it". Adds one decoder
+                          # pass per listed layer.

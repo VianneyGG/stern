@@ -211,6 +211,7 @@ Append here **before** deleting. One row per removal.
 | Removed | Commit | Last experiment that used it | Why it is safe to remove |
 |---|---|---|---|
 | `video_encoding/mesh/fetch.py` + `video_encoding/tests/test_mesh_fetch.py` | *(the commit that follows this one)* | **None — never wired.** Its replacement was motivated by `factorial-tube-per_frame` (2026-08-21) | Imported only by its own test; no `.sh`/`.sbatch`/`.yaml`/`.json` reference. `watcher/shard_transfer.py` states in its module docstring that "the P2P fetch path is gone" as settled fact, and exists precisely because it was: that run dropped 46 of 260 shards (17.7%) because orphaned shards could not be fetched. `shard_transfer.py` moves shards by rsync pull instead. |
+| `visible_distance_weights` / `model.visible_loss_distance_weighting` — arm B weighted by `exp(-d)` to the nearest **masked** token | `392ebc4` | **None — never launched.** Written and deleted the same day (2026-08-27) | Provably a no-op at every ratio we train at, for two independent reasons, measured on the production (8, 14, 14) grid. (a) At `mask_ratio: 0.9` only 10% of tokens survive, so *every* visible token sits at d=1.0 from a hole — one distinct weight, which normalises away entirely; still one value at 0.75; spreads only at 0.5. (b) Tube masking keeps a whole (h, w) column across all of T', so a token's own tube is always present at d=1 along the temporal axis and any 3D metric is constant regardless of ratio. Replaced by `visible_isolation_weights`, which measures distance in the (H', W') plane only, to the nearest visible token outside the tube — six distinct weights at 0.9, and it degenerates as masking *falls*, the opposite regime. Had this shipped, arm B's weighted pool would have been a bit-identical duplicate of its unweighted one for 120 rounds. |
 
 ### Kept, with reasons — evaluated 2026-08-27 and *not* deleted
 
@@ -275,6 +276,58 @@ wrong; see *How knobs actually reach a run* above.
 
 Per the prompt's "do not improve anything else while you are in there", no
 renames, reformatting or comment rewrites were made to these files.
+
+---
+
+### `e2b-*` — depth-collapse ablation, **pre-registered 2026-08-27, NOT yet launched**
+
+Written before launch deliberately: the arm→pool mapping and the two decisions
+below are the parts a post-hoc reading of the results could not recover.
+
+Base recipe `conf/experiment/videomae_mesh_paper_a_stride1_timeavg.yaml`
+unchanged for all four arms — 120 rounds × 2400 steps, eff batch 256, bf16,
+`target_mode: time_avg`, `frame_stride: 1`, augment on, `quorum_k=15`,
+`chunk_rounds=4`. Everything varies through `EXTRA_OVERRIDES` only.
+
+| Arm | Pool | Override | Question |
+|---|---|---|---|
+| A | fish | *(none)* | control |
+| B | orchids | `model.visible_loss_weight=0.25` | does reconstructing visible patches keep the stream alive? |
+| C | cars | `model.deep_supervision_layers=[4,8,12]` | do layers 4/8/12 carry reconstructable information? |
+| D | countries | `model.visible_loss_weight=1.0` | is arm B's effect W-sensitive or robust? |
+
+**Why one tier per arm is safe here, though it was not in the 2×2.** With one
+tier per arm, "arm" and "tier" are the same variable, and the tiers differ by
+1.47× in throughput (`MEMORY.md` → tier-throughput-vs-vram). That is only a
+confound while a round ends on *wall-clock*: `videomae_mesh_ssl.yaml` sets
+`mesh.round_budget_s: 750.0`, so a faster tier would take more steps per round
+and the arms would be trained for different amounts. Every `paper_*` recipe
+already sets `round_budget_s: null`, so a round ends on step count and tier
+speed changes only how long the pool takes in hours. This is the same fix the
+`xtier2-*` wave applied for the same reason; it is a property of the base
+config, so **re-check it if the base recipe ever changes.**
+
+Pool size is held at 16 active nodes for all four arms, not at each tier's
+roster size (fish 23, birds 23, cars 23, countries 19, orchids 25). Node count
+sets the DiLoCo averaging width, so an unequal roster would be a real confound
+even with `round_budget_s: null`. `birds` is skipped as the slowest tier — it
+would add roughly a third to the critical path for no scientific gain; it is the
+fallback if `orchids` turns out not to be seeded.
+
+**Two decisions worth recording, both of which could otherwise look arbitrary:**
+
+1. **Pool D brackets `W`, it does not test the isolation weighting.** `W` is the
+   only parameter that decides whether arm B does anything at all, so a single
+   untested value risks a null result that cannot be distinguished from "the
+   weight was wrong". Two points 4× apart answer that; the weighting can be
+   revisited only if plain arm B moves the probe curve.
+2. **`visible_loss_isolation_weighting` is implemented, tested and left OFF.**
+   It is a hypothesis formed on 2026-08-27, not something from the literature.
+   Turning it on in both arm-B pools would confound every arm-B result with an
+   untested metric. See the *Retired code* note below for why the definition it
+   replaced could never have worked.
+
+**Result:** *not yet run.*
 
 ---
 

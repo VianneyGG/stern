@@ -137,6 +137,47 @@ def test_registers_extra_overrides_when_provided(script, tmp_path):
     ]
 
 
+def test_the_e2b_arm_overrides_survive_registration(script, tmp_path):
+    """The E2b arms are delivered entirely through EXTRA_OVERRIDES, so this
+    validator is the one place they can die silently before a 120-round launch.
+
+    Two things it pins. First, the bracketed list survives: the value is split
+    on whitespace, so `[4,8,12]` stays one token only while it contains no
+    spaces. Second, none of these carries a '+' prefix -- the validator's regex
+    rejects those, and the knobs are defined in conf/model/videomae_base.yaml,
+    so Hydra needs no '+' to set them. Adding a knob without a yaml default
+    would make it unregisterable here rather than failing at the worker.
+    """
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "RUN1",
+            "a,b,c",
+            "10",
+            "0.7",
+            "0.9",
+            "2",
+            "token",
+            "model.visible_loss_weight=0.5 "
+            "model.visible_loss_isolation_weighting=true "
+            "model.deep_supervision_layers=[4,8,12]",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    cfgs = json.loads(
+        (tmp_path / "runs" / "state" / "mesh_run_configs.json").read_text()
+    )
+    assert cfgs[0]["extra_overrides"] == [
+        "model.visible_loss_weight=0.5",
+        "model.visible_loss_isolation_weighting=true",
+        "model.deep_supervision_layers=[4,8,12]",
+    ]
+
+
 def test_omits_extra_overrides_key_when_not_provided(script, tmp_path):
     result = subprocess.run(
         ["bash", str(script), "RUN1", "a,b,c", "10", "0.7", "0.9", "2", "token"],

@@ -20,6 +20,8 @@ oversight; expect a low CCC ceiling until more data (or pretraining) is added.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 import torch
 from omegaconf import DictConfig
@@ -135,26 +137,48 @@ class VideoMAEEncoder(nn.Module):
         return self.norm(x).mean(dim=1)
 
     def forward_tokens(
-        self, x: torch.Tensor, keep_indices: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        keep_indices: torch.Tensor,
+        return_layers: Sequence[int] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Encode a subset of tokens (used during MAE pretraining).
 
         Args:
             x: (B, N, D) embedded tokens (after patch_embed + pos_embed)
             keep_indices: (B, num_kept) per-sample indices of tokens to keep
+            return_layers: optional 1-based block indices whose outputs to also
+                return, for deep supervision. Each is register-stripped and
+                passed through the *same* `self.norm` as the final output, so a
+                shared decoder can consume any of them interchangeably.
 
         Returns:
-            (B, num_kept, D) encoder output on visible tokens only
+            (B, num_kept, D) encoder output on visible tokens only, or
+            `(output, intermediates)` when `return_layers` is given. The default
+            return type is a bare tensor -- existing callers unpack it directly.
         """
         # keep_indices is (B, num_kept): gather per-sample, not one shared
         # column selection for the whole batch.
         idx = keep_indices.unsqueeze(-1).expand(-1, -1, x.shape[-1])
         x = torch.gather(x, 1, idx)  # (B, num_kept, D)
         x = self.registers.prepend(x)
-        for block in self.blocks:
+
+        if return_layers is None:
+            for block in self.blocks:
+                x = block(x)
+            x = self.registers.strip(x)
+            return self.norm(x)
+
+        wanted = set(return_layers)
+        intermediates: dict[int, torch.Tensor] = {}
+        for i, block in enumerate(self.blocks, start=1):
             x = block(x)
+            if i in wanted:
+                intermediates[i] = self.norm(self.registers.strip(x))
         x = self.registers.strip(x)
-        return self.norm(x)
+        out = self.norm(x)
+        # Ordered by the caller's request, not by block index.
+        return out, [intermediates[i] for i in return_layers]
 
 
 def preprocess_window(
