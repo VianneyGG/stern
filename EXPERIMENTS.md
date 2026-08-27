@@ -87,8 +87,8 @@ recovered rows differ from what the scratchpad claimed.
 
 | Run ID | Config | Pool (tier) | Rounds logged | Last round | Contributors min–max | Timeout-forced |
 |---|---|---|---|---|---|---|
-| `recipe2x2-legacy-per_frame-20260823` | *(pre-registration)* | birds, 10 | 20 | 19 | 7–10 | 3/20 |
-| `recipe2x2-legacy-time_avg-20260823` | *(pre-registration)* | fish, 14 | 22 | 21 | 11–14 | 18/22 |
+| `recipe2x2-legacy-per_frame-20260823` | `videomae_mesh_ssl` + `steps_per_round=10240 round_budget_s=null target_mode=per_frame` | birds, 10 | 20 | 19 | 7–10 | 3/20 |
+| `recipe2x2-legacy-time_avg-20260823` | `videomae_mesh_ssl` + `steps_per_round=10240 round_budget_s=null target_mode=time_avg` | fish, 14 | 22 | 21 | 11–14 | 18/22 |
 | `recipe2x2-paper-per_frame-20260823` | `videomae_mesh_paper2fps_per_frame` | countries, 16 | 24 | 23 | 13–16 | 8/24 |
 | `recipe2x2-paper-time_avg-20260823` | `videomae_mesh_paper2fps_time_avg` | cars, 16 | 25 | 24 | 14–16 | 14/25 |
 | `recipe2x2-carscmp-paper-per_frame-20260825` | `videomae_mesh_paper2fps_per_frame` | cars, 16 | 100 | 99 | 12–16 | 90/100 |
@@ -169,6 +169,39 @@ merged on timeout — see the two caveats under the recovered-runs table. Read
 these runs as "the new recipe produces depth collapse", not as
 "per_frame beats time_avg" or vice versa.
 
+### `xtier2-*` — cross-tier repeat of the factorial (2026-08-22)
+Four runs, missing from the ledger above and recovered from
+`mesh_run_configs.json` on 2026-08-27:
+`xtier2-{tube,mixed}-{time_avg,per_frame}-20260822`, all
+`videomae_mesh_ssl` plus
+`mesh.round_budget_s=null model.mask_type=<m> model.target_mode=<t>`.
+The `round_budget_s=null` override is the tell: this wave removed the per-round
+wall-clock budget so that a round ends on step count rather than on time, which
+is what makes a cross-tier comparison meaningful given the 1.47× throughput
+spread (`MEMORY.md` → tier-throughput-vs-vram).
+**Conclusion:** *backfill* — round logs are on login-node, not local.
+
+---
+
+## How knobs actually reach a run
+
+Recorded 2026-08-27 because it invalidates an obvious-looking cleanup heuristic.
+
+Model knobs are **not** set in `conf/experiment/*.yaml`. They are passed as
+Hydra tokens through `EXTRA_OVERRIDES` →
+`launch_mesh_pool.sh` → `register_mesh_run.sh`, and stored per run in the
+`extra_overrides` field of `runs/state/mesh_run_configs.json` (14 of 46 records
+carry them). Only `target_mode` appears in any experiment yaml.
+
+So **"no experiment yaml sets this knob" is not evidence the knob is dead.**
+Applied literally it would flag `model.mask_type` as clutter, when eight runs
+(the four `factorial-*` and the four `xtier2-*`) set it via overrides — and
+`mask_type` is precisely the knob this repo already lost data to when
+`mesh_round` silently ignored it (`MEMORY.md` → factorial-mask-type-trap).
+
+To check whether a knob is live, grep `extra_overrides` in
+`mesh_run_configs.json`, not the yaml directory.
+
 ---
 
 ## Retired code and configs
@@ -177,7 +210,71 @@ Append here **before** deleting. One row per removal.
 
 | Removed | Commit | Last experiment that used it | Why it is safe to remove |
 |---|---|---|---|
-| *(none yet — the Stage 0 cleanup pass populates this)* | | | |
+| `video_encoding/mesh/fetch.py` + `video_encoding/tests/test_mesh_fetch.py` | *(the commit that follows this one)* | **None — never wired.** Its replacement was motivated by `factorial-tube-per_frame` (2026-08-21) | Imported only by its own test; no `.sh`/`.sbatch`/`.yaml`/`.json` reference. `watcher/shard_transfer.py` states in its module docstring that "the P2P fetch path is gone" as settled fact, and exists precisely because it was: that run dropped 46 of 260 shards (17.7%) because orphaned shards could not be fetched. `shard_transfer.py` moves shards by rsync pull instead. |
+
+### Kept, with reasons — evaluated 2026-08-27 and *not* deleted
+
+The Stage 0 sweep of `docs/research/2026-08-27-depth-collapse-3pool-prompt.md`
+proposed five candidates. Only one passed all five criteria. The rest, and why
+each survived — recorded so the next pass does not re-litigate them:
+
+- **`conf/experiment/videomae_mesh_paper2fps_{per_frame,time_avg}.yaml`** —
+  **criterion 4 fails.** Three runs referencing them are *non-terminal* in
+  `login-node:~/stern/runs/state/watcher_state.json`:
+  `recipe2x2-paper-per_frame-20260823` (RUNNING),
+  `recipe2x2-paper-time_avg-20260823` (DEGRADED) and `depthprobe-lr025-20260826`
+  (DEGRADED, 0 rounds). No SLURM job holds them now, but per `MEMORY.md` →
+  scancel-triggers-chunk-relaunch an abandoned run can be resurrected by chunk
+  relaunch, and it would then fail on a missing config. Re-evaluate only after
+  those three are driven to a terminal state.
+- **`cache/store.py`** — kept because the prompt's own gate ("confirm nothing in
+  the VA-probe path is about to need it") **does not hold**. E2b's primary metric
+  is a per-layer attentive probe over 12 layers × 3 merged checkpoints, and this
+  module's docstring describes exactly that workflow: "compute frozen embeddings
+  once, write here, all probe training reads tensors from this cache." It is 40
+  lines and still unwired; the right resolution is for the E2b probe work to
+  either wire it or delete it, not for a cleanup pass to remove it a fortnight
+  before it is needed.
+- **`landmark_encoding/`** — **criterion 3 fails.** Named in both `CLAUDE.md`
+  and `README.md` as the deliberate placeholder for the landmark arm. Kept
+  *as* a placeholder; this note is what makes it unambiguous rather than
+  forgotten.
+- **`data/loaders.py`'s `NotImplementedError` stubs** — **already gone.** No
+  `NotImplementedError` remains anywhere in non-test code; the only surviving
+  match is a docstring that mentions the name. Nothing to do.
+
+### Readability pass on the E2b path — 2026-08-27, zero deletions
+
+The second half of Stage 0: audit the seven files E2b is about to edit
+(`models/videomaev2/{mae,encoder,masking}.py`, `training/diloco/mesh_round.py`,
+`training/pretrain.py`, `data/{mesh_shard_dataset,loaders}.py`) for config
+branches and dead parameters kept alive only by a superseded experiment.
+
+**Result: nothing qualified.** All eleven `conf/model/videomae_base.yaml` knobs
+are read behind a `model_cfg.get(...)` default and **every one is covered by at
+least two test files** — `dropout` 12, `target_mode` 6, `mask_type` 5,
+`num_registers` 4, `motion_mask`/`qk_norm`/`mlp_type`/`norm_type` 3,
+`layer_scale_init`/`decoder_mask_ratio`/`drop_path_rate` 2. The prompt's
+criterion is "no live experiment sets it **and** no test covers it"; the second
+clause fails for all eleven, so the pass removed nothing.
+
+One genuine dead *value*, recorded rather than deleted:
+
+- **`mask_type="frame"` → `RandomFrameMasking`** (`masking.py:292`). Across all
+  46 records in `mesh_run_configs.json` only `tube` (4 runs) and `mixed` (4 runs)
+  were ever set; `frame` has never run on the mesh. It stays because it is
+  test-covered and is one arm of a three-way dispatch whose other two arms are
+  live — deleting it would make `mask_type` a boolean in fact but not in name.
+  If the factorial is never revisited, retire the value and the branch together.
+
+`motion_mask` reads as dead from the yamls alone (no experiment sets it) but is
+**live** — it is what the motion-decodability probe campaign exercised, and
+`select_masking` documents it as authoritative over `mask_type` precisely so old
+configs do not change meaning. Another instance of the yaml-only heuristic being
+wrong; see *How knobs actually reach a run* above.
+
+Per the prompt's "do not improve anything else while you are in there", no
+renames, reformatting or comment rewrites were made to these files.
 
 ---
 
