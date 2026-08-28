@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from video_encoding.watcher.epoch_advance import exclude_node
+from video_encoding.mesh.outer_step import BOOTSTRAP_MASTER_VERSION
 from video_encoding.watcher.mesh_tick import (
     MeshRunConfig,
     _clean_stale_run_artifacts,
@@ -579,11 +580,16 @@ def test_merging_calls_run_outer_step_with_correct_args(tmp_path):
     assert cmd[weighting_idx + 1] == "data"
 
 
-def test_merging_passes_tb_dir_matching_local_dir(tmp_path):
-    """TB scalars land in the same watcher-local run directory as the
-    momentum/residual buffers -- run_outer_step.py derives its mesh_shared
-    root from --pending-dir itself, so mesh_tick.py only needs to pass
-    --tb-dir."""
+def test_merging_does_not_pass_tb_dir(tmp_path):
+    """The merge subprocess must not write TensorBoard scalars.
+
+    run_outer_step's _write_tb_scalars rescans every node's entire metrics
+    JSONL on every merge, so its cost grows with round count against a fixed
+    300s subprocess timeout. On 2026-08-28 it overran that budget ~90s after
+    the merge had already durably completed on two runs; the resulting
+    SIGKILL is not catchable by its own except clause, and the watcher threw
+    away 722 finished merges. flush_final_tb_rounds at DONE still writes the
+    scalars once per run (see the mock_flush test below)."""
     mesh_shared = tmp_path / "mesh_shared"
     (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
 
@@ -605,10 +611,7 @@ def test_merging_passes_tb_dir_matching_local_dir(tmp_path):
         )
 
     cmd = m.call_args[0][0]
-    tb_dir = Path(cmd[cmd.index("--tb-dir") + 1])
-    momentum = Path(cmd[cmd.index("--momentum") + 1])
-    assert tb_dir.parent == momentum.parent
-    assert tb_dir.name == "tb"
+    assert "--tb-dir" not in cmd
 
 
 def test_merging_passes_metrics_out_pointing_at_results_mesh_run_id(tmp_path):
@@ -785,10 +788,13 @@ def test_merging_bootstraps_master_from_pending_when_missing(tmp_path):
     assert master_path.exists()
     payload = torch.load(master_path, map_location="cpu", weights_only=False)
     assert "model_state_dict" in payload
-    # Phase 3.2: 0 predates every real round_num merge_round ever stamps, so
-    # every worker's first real diff (against a genuine merge) is never
-    # rejected as stale by comparison to a bootstrap master.
-    assert payload["master_version"] == 0
+    # Phase 3.2: BOOTSTRAP_MASTER_VERSION predates every real round_num
+    # merge_round ever stamps, so every worker's first real diff (against a
+    # genuine merge) is never rejected as stale by comparison to a bootstrap
+    # master -- and being negative it cannot be mistaken for round 0's own
+    # completed merge by merge_round's already-merged recovery.
+    assert payload["master_version"] == BOOTSTRAP_MASTER_VERSION
+    assert BOOTSTRAP_MASTER_VERSION < 0
 
 
 def test_merging_bootstraps_master_upcasts_fp16_pending_to_fp32(tmp_path):
@@ -3087,6 +3093,29 @@ def test_degraded_run_is_not_advanced_further(tmp_path):
     assert run.status == "DEGRADED"
 
 
+def test_degraded_run_resumes_once_quorum_is_recovered(tmp_path):
+    """A DEGRADED run whose replenished/relaunched roster later meets
+    quorum_k on the current round must not need a manual status write --
+    2026-08-28's e2b-b-birds recurrence, where checkpoints had fully landed
+    and only a hand edit to watcher_state.json ever moved the run forward."""
+    run_config, run, state, mesh_shared = _quorum_fixture(
+        tmp_path, quorum_k=3, checked_in=["node001", "node002", "node003"]
+    )
+    run.status = "DEGRADED"
+
+    note = advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=1.0,
+    )
+
+    assert run.status == "MERGING"
+    assert "DEGRADED -> MERGING" in note
+
+
 def test_awaiting_checkpoints_halts_on_the_timeout_path_below_quorum(tmp_path):
     """The grace-expired fall-through merges "whatever arrived", which is the
     other way a sub-quorum merge slips through."""
@@ -3338,3 +3367,34 @@ def test_submit_worker_job_composes_with_chunk_rounds_for_every_mesh_experiment(
             overrides=[f"experiment={experiment}", *hydra_overrides],
         )
     assert cfg.mesh.chunk_rounds == 4
+
+
+def test_merge_timeout_leaves_headroom_over_the_measured_durable_phase(tmp_path):
+    """The merge's durable phase measured 210s on a 16-node round (2026-08-28,
+    e2b-c-cars). A budget close to that is what let a finished merge get
+    SIGKILLed and discarded, so pin that the timeout keeps real headroom and
+    that _do_merging actually passes it."""
+    from video_encoding.watcher.mesh_tick import MERGE_TIMEOUT_S
+
+    assert MERGE_TIMEOUT_S >= 3 * 210
+
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "MERGING"
+
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as m:
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert m.call_args.kwargs["timeout"] == MERGE_TIMEOUT_S

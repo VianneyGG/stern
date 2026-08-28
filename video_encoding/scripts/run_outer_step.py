@@ -9,7 +9,13 @@ overwrites `master.pt` and the momentum buffer. Deliberately does *not*
 delete the pending checkpoints or advance any round counter -- that is the
 caller's job (Task 11), so this module stays a pure, retryable merge step:
 a crash or non-zero exit here just means the next cron tick tries again
-against the same pending/ contents.
+against the same pending/ contents. That retryability has one hard limit:
+once master.pt has been rewritten the round is applied, and a *later* failure
+-- including the caller SIGKILLing this process on its own timeout, which is
+not catchable here -- cannot undo it. `merge_round` therefore detects an
+already-applied round on the next attempt (master.pt stamped with the round
+being merged) and reports a no-op success rather than retrying a round whose
+pending deltas are now all stale against the master this merge produced.
 
 Weighting is `data` (FedAvg sample-count proportional) by default and
 intentionally never falls back silently: a worker checkpoint missing
@@ -364,6 +370,41 @@ def merge_round(
     master_sd: StateDict = to_fp32_state_dict(master_payload["model_state_dict"])
     current_master_version = master_payload.get("master_version")
 
+    if round_num is not None and current_master_version == round_num:
+        # This round is already applied: merge_round is the only writer of
+        # master.pt and it stamps the round it just merged, so reaching here
+        # means a previous attempt got as far as that write and still failed
+        # to report success. Observed 2026-08-28 on e2b-c-cars and
+        # e2b-d-countries: mesh_tick.py runs this module under
+        # subprocess.run(..., timeout=300) and SIGKILLed it ~90s AFTER every
+        # durable write had landed (master.pt, the momentum buffer and the
+        # residual all carry that run's mtime), while main() was still in its
+        # trailing diagnostics. A SIGKILL from the parent cannot be caught
+        # here, so _write_tb_scalars' own "never fail the merge" except
+        # clause was no defence. The caller saw a non-zero exit, never
+        # unlinked pending/, and retried the same round every tick forever --
+        # each retry correctly dropping all 16 deltas as stale, because they
+        # were computed against the master this very round had replaced, and
+        # then dying on the resulting empty weight dict (722 failures).
+        #
+        # Re-merging is not an option (the deltas no longer apply to this
+        # master) and is not needed (the round is in master.pt already), so
+        # report a no-op success and let the caller clear pending/ and
+        # advance. Only if the interrupting failure fell between the master
+        # and momentum writes is anything lost, and then only that round's
+        # momentum, never the round itself.
+        print(
+            f"run_outer_step: WARNING master.pt is already stamped "
+            f"master_version={round_num} (run_id={run_id!r}) -- this round was "
+            "already merged and a retry would drop every pending delta as "
+            "stale; treating as a no-op success. Check that the momentum "
+            f"buffer at {momentum_path} carries that merge's mtime: if the "
+            "interrupted attempt died between the two writes, this round's "
+            "momentum update was lost.",
+            file=sys.stderr,
+        )
+        return {"n_workers": 0, "alphas": {}, "already_merged": True}
+
     checkpoints = _load_worker_checkpoints(pending_dir, run_id, round_num=round_num)
     checkpoints, nonfinite = filter_nonfinite(checkpoints)
     if nonfinite:
@@ -386,6 +427,13 @@ def merge_round(
             f"run_outer_step: WARNING dropped {len(stale)} checkpoint(s) pushed "
             f"against a stale master (run_id={run_id!r}): {sorted(stale)}",
             file=sys.stderr,
+        )
+    if not checkpoints:
+        raise ValueError(
+            f"merge_round: every worker checkpoint for run_id={run_id!r} "
+            f"round_num={round_num!r} was pushed against a stale master "
+            f"({sorted(stale)}); master.pt is at master_version="
+            f"{current_master_version!r} -- refusing to merge nothing"
         )
     alphas = _compute_alphas(checkpoints, weighting)
 
@@ -531,6 +579,13 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"run_outer_step: {exc}", file=sys.stderr)
         return 1
+
+    if result.get("already_merged"):
+        print(
+            f"run_outer_step: round {args.round_num} of {args.run_id} was "
+            "already merged into master.pt -- nothing to do"
+        )
+        return 0
 
     if args.metrics_out is not None:
         _append_merge_metrics(

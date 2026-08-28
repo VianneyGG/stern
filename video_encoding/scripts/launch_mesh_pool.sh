@@ -13,7 +13,10 @@
 # Environment overrides: NEED (idle nodes to wait for), DATASET_HOLDER,
 # EXPECTED_SHARDS, QUORUM_K, WEIGHTING, SKIP_SEED_VALIDATION, CHUNK_ROUNDS,
 # EXPERIMENT (conf/experiment/<name>.yaml the workers compose; default
-# videomae_mesh_ssl), GRACE_S
+# videomae_mesh_ssl), GRACE_S, REPLICATION (seed_mesh.py's --replication;
+# default 1 -- a dead node is replenished on demand by watcher/shard_transfer.py
+# rather than served from a pre-replicated peer, so paying the extra transfer
+# and disk cost for a second copy of every shard is no longer the default)
 # (inherited by register_mesh_run.sh, not read here -- raise it above the
 # 900s default for a roster whose slowest tier cannot finish a round in time),
 # EXTRA_OVERRIDES (space-separated Hydra tokens, e.g.
@@ -138,7 +141,7 @@ uv run python -m video_encoding.scripts.seed_mesh \
   --shards-dir /Data/$USER/voxceleb2_shards \
   --shard-map "${HOME}/stern_mesh/metadata/shard_map_${TIER}16.json" \
   --dataset-gb 223 \
-  --replication 2
+  --replication "${REPLICATION:-1}"
 
 # Verify what actually landed on every node before anything trains against
 # it. seed_mesh reports success per rsync, not per shard, and on 2026-08-20 a

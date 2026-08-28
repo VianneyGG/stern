@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from video_encoding.mesh.outer_step import BOOTSTRAP_MASTER_VERSION
 from video_encoding.scripts.run_outer_step import (
     _load_worker_checkpoints,
     _quantize_broadcast_with_error_feedback,
@@ -1191,5 +1192,137 @@ def test_merge_refuses_a_round_where_every_worker_is_nan(tmp_path):
             lr=1.0,
             momentum=0.0,
             round_num=1,
+            allow_missing_momentum=True,
+        )
+
+
+def test_a_killed_merge_that_already_stamped_master_is_a_no_op_on_retry(tmp_path):
+    """The 2026-08-28 crash loop: mesh_tick.py's `subprocess.run(...,
+    timeout=300)` killed the merge *after* `_atomic_save(master_path)` had
+    landed but before the process exited 0, so the watcher never unlinked
+    pending/ and retried the same round forever. On every retry master.pt is
+    already stamped with this round while the pending deltas still carry the
+    previous version, so filter_stale_deltas drops all of them and the merge
+    died in the weighting function on an empty dict (`total weight is zero
+    (stats={})`, 722 times across two runs).
+
+    A merge whose master write already landed has, by definition, already
+    been applied: report it as a no-op success so the caller clears pending/
+    and advances instead of retrying a round that can never succeed again.
+    """
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+
+    _write_master(master_path, 1.0, master_version=27)
+    for node in ("a", "b"):
+        _write_worker_delta(
+            pending_dir / f"run1_27_{node}.pt", 1.0, n_samples=100, master_version=26
+        )
+
+    result = merge_round(
+        pending_dir,
+        master_path,
+        tmp_path / "momentum.pt",
+        run_id="run1",
+        lr=0.7,
+        momentum=0.9,
+        round_num=27,
+    )
+
+    assert result["already_merged"] is True
+    assert result["n_workers"] == 0
+    assert result["alphas"] == {}
+    # The already-merged master must not be touched a second time.
+    payload = torch.load(master_path, weights_only=False)
+    assert payload["master_version"] == 27
+    assert payload["model_state_dict"]["w"][0, 0].item() == pytest.approx(1.0)
+
+
+def test_already_merged_round_exits_zero_and_writes_no_metrics(tmp_path):
+    """mesh_tick.py unlinks pending/ only on returncode 0, so the recovery
+    above is only worth anything if the CLI reports success. The metrics
+    JSONL must stay clean of the no-op: a 0-contributor record there would
+    read as a real round that merged nothing."""
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    metrics_out = tmp_path / "rounds.jsonl"
+
+    _write_master(master_path, 1.0, master_version=4)
+    _write_worker_delta(
+        pending_dir / "run1_4_a.pt", 1.0, n_samples=100, master_version=3
+    )
+
+    rc = main(
+        [
+            "--pending-dir",
+            str(pending_dir),
+            "--run-id",
+            "run1",
+            "--master",
+            str(master_path),
+            "--momentum",
+            str(tmp_path / "momentum.pt"),
+            "--round",
+            "4",
+            "--metrics-out",
+            str(metrics_out),
+        ]
+    )
+
+    assert rc == 0
+    assert not metrics_out.exists()
+
+
+def test_bootstrap_master_version_does_not_short_circuit_round_zero(tmp_path):
+    """_bootstrap_master (watcher/mesh_tick.py) seeds master.pt before round
+    0's own merge runs, so its sentinel version must be one no round_num can
+    ever equal -- otherwise the already-merged recovery above would skip the
+    first real merge of every run."""
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+
+    _write_master(master_path, 1.0, master_version=BOOTSTRAP_MASTER_VERSION)
+    _write_worker(pending_dir / "run1_0_a.pt", 0.5, n_samples=100)
+
+    result = merge_round(
+        pending_dir,
+        master_path,
+        tmp_path / "momentum.pt",
+        run_id="run1",
+        lr=1.0,
+        momentum=0.0,
+        round_num=0,
+    )
+
+    assert result["n_workers"] == 1
+    assert torch.load(master_path, weights_only=False)["master_version"] == 0
+
+
+def test_all_stale_checkpoints_report_the_version_mismatch(tmp_path):
+    """Not the already-merged case (master is ahead of neither this round nor
+    the deltas by one) -- this is a genuinely unmergeable set, and it has to
+    say so instead of falling through to `total weight is zero (n_samples={})`
+    from inside the weighting function."""
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+
+    _write_master(master_path, 1.0, master_version=27)
+    _write_worker_delta(
+        pending_dir / "run1_28_a.pt", 1.0, n_samples=100, master_version=25
+    )
+
+    with pytest.raises(ValueError, match="stale master"):
+        merge_round(
+            pending_dir,
+            master_path,
+            tmp_path / "momentum.pt",
+            run_id="run1",
+            lr=0.7,
+            momentum=0.9,
+            round_num=28,
             allow_missing_momentum=True,
         )

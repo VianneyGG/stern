@@ -43,7 +43,13 @@ _TERMINAL = frozenset(
 # Statuses where the workers are expected to be running. Deliberately not
 # MERGING/SYNCING: those are watcher-side steps the workers wait through, and
 # a run sitting in them briefly has no bearing on whether a chunk ended.
-RELAUNCHABLE = frozenset({"RUNNING", "AWAITING_CHECKPOINTS"})
+#
+# DEGRADED is included even though it's a halt state: a chunk boundary exits
+# every worker at once regardless of quorum, so a run can land in DEGRADED
+# with its whole roster already gone. Without relaunching here, that roster
+# never comes back and the run can only progress via a manual status write
+# (observed repeatedly on e2b-b-birds, 2026-08-28).
+RELAUNCHABLE = frozenset({"RUNNING", "AWAITING_CHECKPOINTS", "DEGRADED"})
 
 
 def _submitted_at_epoch(record: JobRecord) -> float | None:

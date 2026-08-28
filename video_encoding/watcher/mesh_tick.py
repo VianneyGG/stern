@@ -28,6 +28,7 @@ from pathlib import Path
 
 import torch
 
+from video_encoding.mesh.outer_step import BOOTSTRAP_MASTER_VERSION
 from video_encoding.mesh.assignment import (
     assign_static,
     reassign_failed,
@@ -327,6 +328,8 @@ def advance_one_run(
         return _do_merging(run_config, run, repo_root, mesh_shared)
     if run.status == "SYNCING":
         return _do_syncing(run_config, run, state, mesh_shared, repo_root, now)
+    if run.status == "DEGRADED":
+        return _do_degraded(run_config, run, state, mesh_shared)
     return None  # DONE, or an unrecognized status -- nothing to do
 
 
@@ -711,6 +714,35 @@ def _do_awaiting_checkpoints(
     return result
 
 
+def _do_degraded(
+    run_config: MeshRunConfig,
+    run: RunState,
+    state: WatcherState,
+    mesh_shared: Path,
+) -> str | None:
+    """Recheck a DEGRADED run's current round for quorum before giving up.
+
+    DEGRADED used to be a dead end: nothing dispatched on it, so a run that
+    halted below quorum_k stayed halted even after replenishment or a chunk
+    relaunch (both still act on it -- see RELAUNCHABLE in chunk_relaunch.py)
+    brought enough checkpoints back in. Observed repeatedly on e2b-b-birds,
+    2026-08-28: quorum was satisfied but only a manual status write ever
+    moved the run forward.
+    """
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    checked_in = pending_nodes(pending_dir, run_config.run_id, round_num=run.round)
+    eligible = set(eligible_nodes(state, run_config.nodes))
+    if run_config.quorum_k is None or len(checked_in) < run_config.quorum_k:
+        return None
+    run.status = "MERGING"
+    run.timeout_forced = True
+    return (
+        f"{run_config.run_id}: DEGRADED -> MERGING "
+        f"(quorum {run_config.quorum_k}/{len(eligible)} recovered, "
+        f"{len(checked_in)} nodes)"
+    )
+
+
 # --- periodic pool recovery ---------------------------------------------
 
 # _recover_pool ssh-probes every excluded roster node, so it must not run on
@@ -1073,11 +1105,17 @@ def _bootstrap_master(pending_dir: Path, run_id: str, master_path: Path) -> None
         for k, v in payload["model_state_dict"].items()
     }
     master_path.parent.mkdir(parents=True, exist_ok=True)
-    # master_version=0 predates every real round_num merge_round stamps
-    # (Phase 3.2), so a worker's first real diff is never rejected as stale
-    # by comparison to this bootstrap master.
+    # BOOTSTRAP_MASTER_VERSION (-1) predates every real round_num merge_round
+    # stamps (Phase 3.2), so a worker's first real diff is never rejected as
+    # stale by comparison to this bootstrap master -- and, being negative, it
+    # can never collide with round 0, whose merge would otherwise be skipped
+    # by merge_round's already-merged recovery.
     ckpt_io.save(
-        master_path, {"model_state_dict": model_state_dict, "master_version": 0}
+        master_path,
+        {
+            "model_state_dict": model_state_dict,
+            "master_version": BOOTSTRAP_MASTER_VERSION,
+        },
     )
 
 
@@ -1096,6 +1134,20 @@ def _uv_bin() -> str:
     return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
 
 
+# Wall-clock budget for one merge subprocess. Measured 2026-08-28 on
+# e2b-c-cars: 210s for the durable phase alone (load a 191 MiB master plus 16
+# ~95 MiB deltas off NFS, upcast, average, Nesterov step, fp16 quantize, write
+# master + momentum + residual). 300s left ~90s of headroom, and NFS
+# contention plus the since-removed TB tail ate it on two runs the same day.
+# Overrunning this SIGKILLs a merge that may already have rewritten master.pt,
+# which run_outer_step now recovers from as a no-op rather than a crash loop
+# -- but a breach still throws away a round's merge work, so the budget is
+# sized for ~3x the measured cost instead of 1.4x. Ticks cannot pile up behind
+# it: watch_training.py holds a non-blocking flock for the whole tick, so a
+# long merge just means the next ticks exit immediately.
+MERGE_TIMEOUT_S = 900
+
+
 def _do_merging(
     run_config: MeshRunConfig, run: RunState, repo_root: Path, mesh_shared: Path
 ) -> str | None:
@@ -1104,7 +1156,6 @@ def _do_merging(
     local_dir = _mesh_local_root() / run_config.run_id
     momentum_path = local_dir / "outer_momentum.pt"
     residual_path = local_dir / "broadcast_residual.pt"
-    tb_dir = local_dir / "tb"
     local_dir.mkdir(parents=True, exist_ok=True)
     if not master_path.exists():
         _bootstrap_master(pending_dir, run_config.run_id, master_path)
@@ -1149,14 +1200,29 @@ def _do_merging(
             / "mesh"
             / f"{run_config.run_id}_rounds.jsonl"
         ),
-        "--tb-dir",
-        str(tb_dir),
+        # No --tb-dir: TensorBoard scalars are deliberately NOT written from
+        # inside the merge subprocess. run_outer_step's _write_tb_scalars
+        # rescans every node's full metrics JSONL on every merge
+        # (tb_logger.write_mesh_round_scalars reads and json-parses all of
+        # it, then filters), so its cost grows with round count while the
+        # timeout below stays fixed. On 2026-08-28 that tail ran past the
+        # 300s budget on e2b-c-cars (round 27) and e2b-d-countries (round
+        # 42) roughly 90s AFTER the merge itself had durably completed, and
+        # the resulting SIGKILL -- which _write_tb_scalars' own "never fail
+        # the merge" except clause cannot catch -- made the watcher discard
+        # 722 finished merges and retry them forever. Diagnostics must not
+        # be able to spend the critical section's budget. The scalars are
+        # still written once per run by flush_final_tb_rounds at DONE.
     ]
     if run.timeout_forced:
         cmd.append("--timeout-forced")
     try:
         result = subprocess.run(
-            cmd, cwd=repo_root, capture_output=True, text=True, timeout=300
+            cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=MERGE_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return f"{run_config.run_id}: MERGING failed ({exc}) -- retrying next tick"

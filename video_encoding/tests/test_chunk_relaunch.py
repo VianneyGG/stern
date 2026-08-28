@@ -71,15 +71,13 @@ def test_another_runs_live_job_does_not_mask_this_runs_departure():
     assert _call(registry=[_job("1", "run-b")], snapshot={}) is False
 
 
-@pytest.mark.parametrize(
-    "status", ["MERGING", "SYNCING", "DONE", "DEGRADED", "ASSIGNING"]
-)
+@pytest.mark.parametrize("status", ["MERGING", "SYNCING", "DONE", "ASSIGNING"])
 def test_only_relaunches_from_states_where_workers_should_be_running(status):
     assert _call(status=status) is False
 
 
-@pytest.mark.parametrize("status", ["RUNNING", "AWAITING_CHECKPOINTS"])
-def test_relaunches_from_both_worker_running_states(status):
+@pytest.mark.parametrize("status", ["RUNNING", "AWAITING_CHECKPOINTS", "DEGRADED"])
+def test_relaunches_from_all_worker_running_states(status):
     assert _call(status=status) is True
 
 

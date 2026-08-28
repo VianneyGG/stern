@@ -31,6 +31,13 @@ import torch
 
 StateDict = dict[str, torch.Tensor]
 
+# Version watcher/mesh_tick.py::_bootstrap_master stamps on the master it
+# seeds before round 0's own merge has ever run. Negative on purpose, so it
+# can collide with no real round_num: `filter_stale_deltas` must not reject a
+# worker's first diff against it, and run_outer_step's already-merged
+# recovery must not mistake a bootstrap master for round 0's completed merge.
+BOOTSTRAP_MASTER_VERSION = -1
+
 
 def to_fp32_state_dict(state_dict: StateDict) -> StateDict:
     """Upcasts every floating-point tensor to fp32, leaving non-float
