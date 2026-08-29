@@ -75,15 +75,39 @@ def record_missed_round(
     -escalate tolerance). `threshold` consecutive misses excludes the node.
     Returns True iff this call caused an exclusion.
     """
-    run = state.run(run_id)
-    count = run.missed_rounds.get(node, 0) + 1
-    run.missed_rounds[node] = count
+    count = missed_round_count(state, run_id, node)
     if count >= threshold:
         exclude_node(
             state, node, f"crash-loop: missed {count} consecutive rounds of {run_id}"
         )
         return True
     return False
+
+
+def missed_round_count(state: WatcherState, run_id: str, node: str) -> int:
+    """Bump `node`'s missed_rounds counter for `run_id` and return the new
+    count. Counting only -- the caller decides whether the count crosses an
+    exclusion threshold (design §5.1: a node must not be excluded while no
+    replacement is available for it, so the count-then-decide split lets a
+    call site bump the counter without committing to an exclusion)."""
+    run = state.run(run_id)
+    count = run.missed_rounds.get(node, 0) + 1
+    run.missed_rounds[node] = count
+    return count
+
+
+def clear_missed_rounds(run: RunState, checked_in: Collection[str]) -> None:
+    """Reset missed_rounds to 0 for every node that checked in this round.
+
+    Nothing else in the codebase resets this counter -- state.py's own
+    docstring claimed a successful round did, but no call site ever existed.
+    Over a 40-100 round run this made any node that hiccupped twice EVER
+    (not consecutively) permanently excluded, which is a better explanation
+    of the e2b-b-birds node loss than "the threshold is too strict".
+    """
+    for node in checked_in:
+        if node in run.missed_rounds:
+            run.missed_rounds[node] = 0
 
 
 def readmit_healthy_nodes(

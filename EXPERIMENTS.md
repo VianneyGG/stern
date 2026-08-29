@@ -504,7 +504,7 @@ renames, reformatting or comment rewrites were made to these files.
 
 ---
 
-### `e2b-*` — depth-collapse ablation, **pre-registered 2026-08-27, launched 2026-08-28, IN FLIGHT**
+### `e2b-*` — depth-collapse ablation, **pre-registered 2026-08-27, launched 2026-08-28, STOPPED INCOMPLETE 2026-08-29**
 
 Written before launch deliberately: the arm→pool mapping and the two decisions
 below are the parts a post-hoc reading of the results could not recover. The
@@ -647,6 +647,108 @@ scancel-triggers-chunk-relaunch).
 `--dependency` as of 2026-08-28, so every chunk boundary still depends on the
 watcher cron firing. That remains a single point of failure worth removing —
 it just is not the explanation for this particular stall.
+
+### Resolved, then stopped — what the stall actually was (2026-08-29)
+
+The section above recorded the symptoms correctly and **the mechanism wrong on
+three counts**. All three are corrected here; the run was then stopped
+deliberately, mid-flight, with the arms unequal.
+
+**1. The retry loop did not destroy its own input.** The hypothesis above —
+"the timeout killed `run_outer_step` after it had consumed or moved the pending
+checkpoints" — is false. `mesh_tick.py` unlinks `pending/` only on
+`returncode == 0`, so all 16 of C's checkpoints sat on disk untouched through
+all 327 failures. The section even notes this ("nothing deletes pending files on
+failure") without connecting it.
+
+**What actually happened.** The 300 s timeout was not an unrelated first
+failure — it is the whole cause. `subprocess.run(..., timeout=300)` SIGKILLed
+the merge **~90 s after every durable write had already landed**: on
+`e2b-c-cars`, `broadcast_residual.pt` 15:46:54, `master.pt` 15:46:56 and
+`outer_momentum.pt` 15:46:56 (UTC, same second) — the durable phase finished at
+~210 s and the kill at 300 s caught `main()` in its trailing diagnostics. So the
+merge *succeeded* and `master.pt` advanced to `master_version=27`, while the
+watcher saw a non-zero exit, kept `pending/` and never advanced the round.
+
+Every retry then re-loaded the same round-27 deltas, each stamped
+`master_version=26` because they were diffed against the master that round 27
+had just replaced. `filter_stale_deltas` **correctly** dropped all 16 as stale,
+and the empty dict fell through to the weighting function with no guard. The
+weighting crash was a true statement about a stale set, not a bug in weighting.
+That also explains what the section called a second mystery — D's *zero* pending
+checkpoints with the same error: a consequence of the same loop, not a
+second defect.
+
+The two arms failed through different weighting modes (`token` for C, `data` for
+D) for the same reason, which is why "one shared step upstream of the mode split"
+was the right instinct even though the located step was wrong.
+
+**2. The watcher *did* die, ~4 h after this section was written.** "Not the
+cause and was never down" was true at 21:14 UTC and false by 23:50 CEST: the
+`node089` crontab was found **completely empty**, with the last tick at
+21:18:15 UTC. Cause unknown — it was reinstalled and verified firing. Note the
+consequence for diagnosis: a dead watcher and a crash-looping watcher produce
+*the same* observable ("nothing has merged since 13:54"), and only the log's
+**mtime** separates them. Check liveness against `runs/state/squeue.json`, which
+every tick rewrites, not against `watcher.log`, whose ticks are mostly silent.
+
+**3. A and B were never a separate bug.** "Relaunching without advancing" is the
+correct behaviour of a run that is below quorum: the round cannot advance, so
+each chunk boundary legitimately relaunches the same `start_round`. The cause
+was **cluster oversubscription** — 9 live runs claiming ~126 roster slots against
+~62 schedulable slots. B held a 22-node roster and could reach 3 of the 15
+workers it needed. No `chunk_relaunch.py` / `start_round` defect exists.
+
+**The fix** — `5addb16`, `Tests: 1187 passed`:
+
+- `merge_round` recognises an already-applied round (`master_version == round_num`)
+  and returns a no-op success, so the caller clears `pending/` and advances
+  instead of retrying forever.
+- Bootstrap sentinel `0 → BOOTSTRAP_MASTER_VERSION = -1` in `mesh/outer_step.py`,
+  so a seeded master can never be mistaken for round 0's own merge.
+- A fail-closed guard on any *other* all-stale set, naming both versions.
+- `--tb-dir` removed from the merge subprocess. This was the budget: 
+  `write_mesh_round_scalars` re-reads and `json.loads`-es **every line of every
+  node's** metrics JSONL on every merge, so its cost grows with round count
+  against a fixed timeout. `flush_final_tb_rounds` still writes the scalars at
+  DONE, so nothing is lost.
+- `MERGE_TIMEOUT_S = 900` (was 300, against a measured 210 s durable phase).
+
+**Verified live, not just in tests:** 21:55 UTC, under cron,
+`e2b-c-cars: MERGING -> SYNCING`, `SYNCING -> RUNNING (round 28/50)` — a real
+merge, after 722 consecutive failures across the two arms.
+
+**Then stopped on purpose (2026-08-29 ~00:10 UTC).** All runs marked `DONE` and
+73 SLURM jobs cancelled. Final state of the four arms, all **incomplete and
+unequal**:
+
+| Arm | Pool | Round reached | Of | Status at stop |
+|---|---|---|---|---|
+| A | fish | 26 | 50 | DEGRADED (below quorum) |
+| B | birds | 13 | 50 | DEGRADED (roster 22, ~3 alive) |
+| C | cars | 28 | 50 | RUNNING, merging normally again |
+| D | countries | 43 | 50 | RUNNING, merging normally again |
+
+**These four arms are not comparable to each other as they stand** — 13 vs 43
+rounds is not an ablation. Any encoder ranking from these checkpoints must
+either re-run the arms to a common round or state the round each was frozen at.
+
+**Stopping procedure, for reuse.** `scancel` alone resurrects runs:
+`advance_all_runs` re-creates a fresh `RunState` (default `ASSIGNING`) for any
+config lacking state, and all 50 configs stay in `mesh_run_configs.json`
+permanently. Mark each run `DONE` in `watcher_state.json` *first* — that is the
+proven terminal marker (11 runs have held it for days without restarting) and it
+blocks both paths: `advance_all_runs`'s `while status != "DONE"` and
+`chunk_relaunch.RELAUNCHABLE`. Pause cron while writing the state file, since a
+tick rewrites it wholesale.
+
+**Nine zombie runs surfaced during the stop** — carrying live state and
+re-entering the state machine every tick, long after anyone was watching:
+`videomae_mesh_ssl-pool-cars` / `-birds` / `-fish` (stuck `MERGING` at round 0),
+`pool-cars-best-120r` (`RUNNING` at round 231), `pool-cars-phase4-fix`,
+`diloco-lit-8h`, `cand2a-8h`, `videomae_mesh_ssl-diloco-cand2c` and `-cand2e`.
+A run that ends by any path other than `SYNCING -> DONE` leaves its state
+behind; nothing sweeps it.
 
 ---
 

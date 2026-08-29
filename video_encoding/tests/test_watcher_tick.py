@@ -271,11 +271,12 @@ def test_run_full_check_cleans_up_quota_pressure_and_skips_escalation(tmp_path):
     assert result.action_taken is True
 
 
-def test_run_full_check_falls_through_to_escalation_when_cleanup_finds_nothing(
+def test_run_full_check_notifies_instead_of_escalating_on_quota_with_nothing_to_delete(
     tmp_path,
 ):
     state_dir, results_root = _setup(tmp_path)
     state = WatcherState()
+    notified = []
 
     with (
         patch(
@@ -286,9 +287,10 @@ def test_run_full_check_falls_through_to_escalation_when_cleanup_finds_nothing(
             "video_encoding.watcher.tick.remediate_quota_pressure", return_value=None
         ) as mock_cleanup,
         patch(
-            "video_encoding.watcher.tick.run_escalation",
-            return_value=tmp_path / "transcript.md",
-        ) as mock_escalate,
+            "video_encoding.watcher.tick.notify",
+            side_effect=lambda subject, detail: notified.append((subject, detail)),
+        ),
+        patch("video_encoding.watcher.tick.run_escalation") as mock_escalate,
     ):
         result = run_full_check(
             repo_root=tmp_path,
@@ -299,7 +301,8 @@ def test_run_full_check_falls_through_to_escalation_when_cleanup_finds_nothing(
         )
 
     mock_cleanup.assert_called_once()
-    mock_escalate.assert_called_once()
+    mock_escalate.assert_not_called()  # claude -p never spawned for this path
+    assert notified
     assert result.action_taken is True
 
 

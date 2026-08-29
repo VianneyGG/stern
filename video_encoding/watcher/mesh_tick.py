@@ -18,10 +18,12 @@ covers them for free; this module only tracks round progress.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,12 +45,15 @@ from video_encoding.training.tb_logger import flush_final_tb_rounds
 from video_encoding.watcher.cluster import query_idle_nodes
 from video_encoding.watcher.node_health import query_node_health, truly_idle
 from video_encoding.watcher.epoch_advance import (
+    MISSED_ROUND_THRESHOLD,
     candidate_replacements,
+    clear_missed_rounds,
     eligible_nodes,
+    exclude_node,
+    missed_round_count,
     pending_nodes,
     pool_deficit,
     readmit_healthy_nodes,
-    record_missed_round,
     select_idle_nodes,
 )
 from video_encoding.watcher.chunk_relaunch import (
@@ -325,7 +330,7 @@ def advance_one_run(
             run_config, run, state, mesh_shared, now, repo_root, run_configs_path
         )
     if run.status == "MERGING":
-        return _do_merging(run_config, run, repo_root, mesh_shared)
+        return _do_merging(run_config, run, state, repo_root, mesh_shared)
     if run.status == "SYNCING":
         return _do_syncing(run_config, run, state, mesh_shared, repo_root, now)
     if run.status == "DEGRADED":
@@ -353,6 +358,7 @@ def _submit_worker_job(
     submitted_at: str,
     *,
     start_round: int = 0,
+    extra_overrides: list[str] = (),
 ) -> str | None:
     """Submits one sbatch job for `node`, appends its record to
     registry_path on success. Returns the parsed job id, or None if
@@ -387,6 +393,7 @@ def _submit_worker_job(
     if run_config.chunk_rounds is not None:
         cmd.append(f"++mesh.chunk_rounds={run_config.chunk_rounds}")
     cmd.extend(run_config.extra_overrides)
+    cmd.extend(extra_overrides)
     try:
         result = subprocess.run(
             cmd, cwd=repo_root, capture_output=True, text=True, timeout=300
@@ -406,6 +413,33 @@ def _submit_worker_job(
             ),
         )
     return job_id
+
+
+def resubmit_with_override(
+    run_config: MeshRunConfig,
+    node: str,
+    repo_root: Path,
+    registry_path: Path,
+    submitted_at: str,
+    *,
+    start_round: int,
+    override: str,
+) -> str | None:
+    """Public entrypoint for escalate.py's scripted NaN retry: submits
+    `node` for `run_config` with one extra Hydra override appended (e.g. a
+    halved inner LR), reusing _submit_worker_job's sbatch command building.
+    Kept separate from _submit_worker_job's own extra_overrides plumbing
+    since escalate.py must not import MeshRunConfig's private submission
+    internals directly."""
+    return _submit_worker_job(
+        run_config,
+        node,
+        repo_root,
+        registry_path,
+        submitted_at,
+        start_round=start_round,
+        extra_overrides=[override],
+    )
 
 
 def _verified_holdings(mesh_shared: Path) -> dict[str, list[str]]:
@@ -598,6 +632,53 @@ def _round_elapsed_s(
     return now - min(f.stat().st_mtime for f in files)
 
 
+def _has_replacement_available(
+    run_config: MeshRunConfig,
+    run: RunState,
+    state: WatcherState,
+    run_configs_path: Path | None,
+) -> bool:
+    """Whether excluding a node right now has somewhere to go (design §5.1):
+    a tier-wide check, since any missing node draws on the same deficit and
+    candidate pool."""
+    if run_configs_path is None:
+        return True  # no way to check -- matches the pre-existing behaviour
+    roster = _live_roster(run_configs_path, run_config.run_id, run_config.nodes)
+    if pool_deficit(run, roster, state) <= 0:
+        return True  # pool isn't short -- exclusion doesn't need a replacement
+    tier = NODE_GROUPS[roster[0]]
+    tier_roster = [h for h, g in NODE_GROUPS.items() if g == tier]
+    idle = query_idle_nodes()
+    candidates = candidate_replacements(
+        tier_roster, in_use=set(roster), excluded=set(state.excluded_nodes)
+    )
+    healthy = truly_idle(
+        query_node_health([n for n in candidates if n in idle], idle=idle)
+    )
+    return bool(healthy)
+
+
+def effective_quorum_k(
+    run_config: MeshRunConfig,
+    run: RunState,
+    state: WatcherState,
+    *,
+    roster: list[str],
+    missing_unreplaceable: Collection[str] = (),
+) -> int:
+    """quorum_k minus unreplaceable-missing nodes, clamped at 60% of
+    target_pool_size, recomputed every round and NEVER written back to
+    mesh_run_configs.json (design §5.2) -- a config edit would be a
+    one-way ratchet that never restores when the pool grows back; this
+    re-derives upward for free once nodes return."""
+    del state  # unused -- kept for interface parity with the design doc
+    if run_config.quorum_k is None:
+        return len(roster)  # no floor configured -- nothing to relax
+    floor = math.ceil(0.6 * run.target_pool_size) if run.target_pool_size else 0
+    relaxed = run_config.quorum_k - len(missing_unreplaceable)
+    return max(relaxed, floor)
+
+
 def _do_awaiting_checkpoints(
     run_config: MeshRunConfig,
     run: RunState,
@@ -610,8 +691,20 @@ def _do_awaiting_checkpoints(
     pending_dir = mesh_shared / "checkpoints" / "pending"
     checked_in = pending_nodes(pending_dir, run_config.run_id, round_num=run.round)
     eligible = set(eligible_nodes(state, run_config.nodes))
+    # A quarantined node under self-requeue's enforcement window can still be
+    # training and dropping checkpoints for a few more rounds -- its stale
+    # file must not count toward quorum (design §5.1b). pending_nodes() only
+    # parses filenames, it has no notion of roster membership.
+    checked_in &= eligible
+
+    roster = (
+        _live_roster(run_configs_path, run_config.run_id, run_config.nodes)
+        if run_configs_path is not None
+        else run_config.nodes
+    )
 
     if checked_in >= eligible:
+        clear_missed_rounds(run, checked_in)
         # quorum_k is a floor on how many nodes may contribute to a merge, but
         # this fast path was written for the happy case and skipped it: once
         # permanent exclusions shrink `eligible` below quorum_k, "everyone
@@ -619,8 +712,15 @@ def _do_awaiting_checkpoints(
         # factorial-tube-per_frame merged its last four rounds 10-wide against
         # quorum_k=12, logged as a clean "MERGING (10 nodes)", and still
         # reported DONE 40/40. Halt instead: a run that reaches DONE has to
-        # mean its configured floor held every round.
-        if run_config.quorum_k is not None and len(checked_in) < run_config.quorum_k:
+        # mean its configured floor held every round -- relaxed downward by
+        # effective_quorum_k (design §5.2) rather than fixed at quorum_k, so
+        # a tier with no idle replacement doesn't halt a run it could still
+        # legitimately finish.
+        eff_quorum_k = effective_quorum_k(run_config, run, state, roster=roster)
+        quorum_relaxed = (
+            run_config.quorum_k is not None and eff_quorum_k < run_config.quorum_k
+        )
+        if run_config.quorum_k is not None and len(checked_in) < eff_quorum_k:
             run.status = "DEGRADED"
             return (
                 f"{run_config.run_id}: AWAITING_CHECKPOINTS -> DEGRADED "
@@ -631,6 +731,13 @@ def _do_awaiting_checkpoints(
             )
         run.status = "MERGING"
         run.timeout_forced = False
+        run.quorum_relaxed = quorum_relaxed
+        run.any_round_quorum_relaxed = run.any_round_quorum_relaxed or quorum_relaxed
+        run.round_misses_charged = 0
+        run.round_exclusions_suspended = 0
+        run.round_effective_quorum_k = (
+            eff_quorum_k if run_config.quorum_k is not None else None
+        )
         return (
             f"{run_config.run_id}: AWAITING_CHECKPOINTS -> MERGING "
             f"({len(checked_in)} nodes)"
@@ -657,8 +764,13 @@ def _do_awaiting_checkpoints(
             # (2.2: run_config.weighting="token" -- run_outer_step.py's
             # _token_weights -- corrects the bias this used to carry via
             # plain renormalization; run quorum-configured pools with it).
+            clear_missed_rounds(run, checked_in)
             run.status = "MERGING"
             run.timeout_forced = True
+            run.quorum_relaxed = False  # reached the configured floor as-is
+            run.round_misses_charged = 0
+            run.round_exclusions_suspended = 0
+            run.round_effective_quorum_k = run_config.quorum_k
             return (
                 f"{run_config.run_id}: AWAITING_CHECKPOINTS -> MERGING "
                 f"(quorum {run_config.quorum_k}/{len(eligible)} reached, "
@@ -675,9 +787,27 @@ def _do_awaiting_checkpoints(
     # is the only place that redistributes an excluded node's shards to a
     # survivor afterward -- it always does so, even when no replacement
     # node is found, so shard coverage does not silently shrink.
-    excluded = [
-        node for node in missing if record_missed_round(state, run_config.run_id, node)
-    ]
+    #
+    # Exclusion itself is gated on a replacement actually existing (design
+    # §5.1, the direct fix for the birds cascade): a tier with zero slack
+    # stops bleeding nodes it can never replace. The counter still bumps
+    # either way -- a node ineligible for exclusion today because no
+    # replacement exists is still excluded on a LATER miss once one does.
+    excluded = []
+    unreplaceable = set()
+    for node in missing:
+        count = missed_round_count(state, run_config.run_id, node)
+        if count < MISSED_ROUND_THRESHOLD:
+            continue
+        if not _has_replacement_available(run_config, run, state, run_configs_path):
+            unreplaceable.add(node)
+            continue
+        exclude_node(
+            state,
+            node,
+            f"crash-loop: missed {count} consecutive rounds of {run_config.run_id}",
+        )
+        excluded.append(node)
     replenish_notes = [
         note
         for node in excluded
@@ -692,7 +822,13 @@ def _do_awaiting_checkpoints(
     # Same floor as the all-checked-in path above, applied after the
     # exclusion/replenish bookkeeping so the log still records what went wrong
     # and a replacement still gets submitted for a human to pick up from.
-    if run_config.quorum_k is not None and len(checked_in) < run_config.quorum_k:
+    eff_quorum_k = effective_quorum_k(
+        run_config, run, state, roster=roster, missing_unreplaceable=unreplaceable
+    )
+    quorum_relaxed = (
+        run_config.quorum_k is not None and eff_quorum_k < run_config.quorum_k
+    )
+    if run_config.quorum_k is not None and len(checked_in) < eff_quorum_k:
         run.status = "DEGRADED"
         degraded = (
             f"{run_config.run_id}: AWAITING_CHECKPOINTS -> DEGRADED "
@@ -705,6 +841,13 @@ def _do_awaiting_checkpoints(
         return degraded
     run.status = "MERGING"
     run.timeout_forced = True
+    run.quorum_relaxed = quorum_relaxed
+    run.any_round_quorum_relaxed = run.any_round_quorum_relaxed or quorum_relaxed
+    run.round_misses_charged = len(missing)
+    run.round_exclusions_suspended = len(unreplaceable)
+    run.round_effective_quorum_k = (
+        eff_quorum_k if run_config.quorum_k is not None else None
+    )
     result = (
         f"{run_config.run_id}: AWAITING_CHECKPOINTS -> MERGING "
         f"(timeout, missing {missing}{excluded_note})"
@@ -732,6 +875,7 @@ def _do_degraded(
     pending_dir = mesh_shared / "checkpoints" / "pending"
     checked_in = pending_nodes(pending_dir, run_config.run_id, round_num=run.round)
     eligible = set(eligible_nodes(state, run_config.nodes))
+    checked_in &= eligible  # a quarantined node cannot satisfy quorum either
     if run_config.quorum_k is None or len(checked_in) < run_config.quorum_k:
         return None
     run.status = "MERGING"
@@ -895,7 +1039,7 @@ def _live_roster(run_configs_path: Path, run_id: str, fallback: list[str]) -> li
     return fallback
 
 
-def _replenish_pool(
+def submit_replacement(
     run_config: MeshRunConfig,
     run: RunState,
     state: WatcherState,
@@ -903,36 +1047,27 @@ def _replenish_pool(
     repo_root: Path,
     run_configs_path: Path | None,
     excluded_node: str,
-) -> str | None:
+) -> tuple[list[str], str | None]:
     """Called right after `excluded_node` is freshly excluded (a NEW
     exclusion this tick, not a pre-existing one from before this
     feature existed -- see Task 5 call site). Tops the pool back up
-    toward run.target_pool_size with idle same-tier nodes and hands
-    them excluded_node's orphaned shards. Returns a status string
-    describing what happened, or None if there was nothing to do at all
-    (no run_configs_path and no shard reassignment to make either).
-
-    Shard reassignment (below) always runs when possible, independent of
-    whether a replacement node is found: assign_locality_first only runs
-    once per run (at ASSIGNING), so this is the only place that ever
-    updates shard_assignments_<run_id>.json again. Returning early before
-    reaching it -- as this function previously did whenever deficit <= 0
-    or no idle node was available -- left excluded_node's shards assigned
-    to a node that will never train again, silently shrinking shard
-    coverage for the rest of the run.
+    toward run.target_pool_size with idle same-tier nodes. Returns
+    (picked_nodes, status_note) -- shard handoff for `picked` is the
+    caller's job via `redistribute_shards` (design §5.1: replacement
+    availability and shard redistribution are two separable decisions).
 
     A picked replacement only ever receives shards via excluded_node's own
-    handoff below -- if excluded_node has no entry (or an empty one) in
-    shard_assignments, a submitted replacement would start with nothing to
-    train on and crash immediately on read_my_shards, which then excludes
-    IT too and repeats the pick with the next idle node. Observed live on
-    login-node 2026-08-05 (pool-cars-2r, node066/node051 both submitted with
-    zero shard_assignments entries), so replenishment is skipped rather
-    than submitted in that case -- an under-filled pool is a safe failure
-    mode, a guaranteed-crash job is not. A missing assignments file
-    entirely (no shard-tracking started for this run yet) does not gate
-    replenishment; only a present file where excluded_node's own entry is
-    absent or empty does.
+    handoff in `redistribute_shards` -- if excluded_node has no entry (or an
+    empty one) in shard_assignments, a submitted replacement would start
+    with nothing to train on and crash immediately on read_my_shards, which
+    then excludes IT too and repeats the pick with the next idle node.
+    Observed live on login-node 2026-08-05 (pool-cars-2r, node066/node051 both
+    submitted with zero shard_assignments entries), so replenishment is
+    skipped rather than submitted in that case -- an under-filled pool is a
+    safe failure mode, a guaranteed-crash job is not. A missing assignments
+    file entirely (no shard-tracking started for this run yet) does not
+    gate replenishment; only a present file where excluded_node's own entry
+    is absent or empty does.
     """
     picked: list[str] = []
     replenish_note: str | None = None
@@ -1028,44 +1163,84 @@ def _replenish_pool(
                     f"available (deficit {deficit})"
                 )
 
-    reassign_note = None
-    if assignments is not None and excluded_node in assignments:
-        placement = _verified_holdings(mesh_shared)
-        for node in picked:
-            assignments.setdefault(node, [])
-        assignments, dropped = reassign_failed(excluded_node, assignments, placement)
-        reassign_note = (
-            f"{run_config.run_id}: reassigned {excluded_node}'s shards to survivors"
-        )
-        if dropped and picked:
-            # No survivor holds these, but excluded_node still does -- it was
-            # excluded because it could not RUN a worker (foreign process on
-            # its GPU, or never seeded), not because it went away. It stays up
-            # and reachable, so copying the files to the replacement turns a
-            # permanent coverage loss back into a transfer. Replication is 1x
-            # for 40-68% of the corpus on every tier but fish, so this is the
-            # common path, not an edge case: it is what dropped 46 of birds'
-            # 260 shards on 2026-08-21.
-            recovered = copy_shards(excluded_node, picked[0], dropped)
-            if recovered:
-                assignments[picked[0]] = assignments.get(picked[0], []) + recovered
-                dropped = [s for s in dropped if s not in recovered]
-                reassign_note += (
-                    f"; recovered {len(recovered)} shard(s) to {picked[0]} "
-                    f"({', '.join(recovered[:5])}"
-                    f"{' ...' if len(recovered) > 5 else ''})"
-                )
-        if dropped:
-            # Coverage genuinely shrank: no survivor holds these and the copy
-            # did not land them. Say so -- the alternative is handing them to
-            # a node that cannot open them, which raises inside the worker and
-            # gets IT excluded two rounds later.
-            reassign_note += (
-                f"; dropped {len(dropped)} shard(s) no survivor holds "
-                f"({', '.join(dropped[:5])}{' ...' if len(dropped) > 5 else ''})"
-            )
-        _write_json_atomic(assignments_path, assignments)
+    return picked, replenish_note
 
+
+def redistribute_shards(
+    run_config: MeshRunConfig,
+    mesh_shared: Path,
+    excluded_node: str,
+    picked: list[str],
+) -> str | None:
+    """Always runs on a miss-with-no-checkin, independent of whether a
+    replacement was found (design §5.1) -- reassigns excluded_node's shards
+    to survivors so shard coverage never silently shrinks during a
+    replacement-suspension window.
+
+    assign_locality_first only runs once per run (at ASSIGNING), so this is
+    the only place that ever updates shard_assignments_<run_id>.json again --
+    returning early here (as the old combined function did whenever deficit
+    <= 0 or no idle node was available) left excluded_node's shards assigned
+    to a node that will never train again, silently shrinking shard coverage
+    for the rest of the run.
+    """
+    assignments_path = (
+        mesh_shared / "metadata" / f"shard_assignments_{run_config.run_id}.json"
+    )
+    if not assignments_path.exists():
+        return None
+    assignments = json.loads(assignments_path.read_text())
+    if excluded_node not in assignments:
+        return None
+    placement = _verified_holdings(mesh_shared)
+    for node in picked:
+        assignments.setdefault(node, [])
+    assignments, dropped = reassign_failed(excluded_node, assignments, placement)
+    note = f"{run_config.run_id}: reassigned {excluded_node}'s shards to survivors"
+    if dropped and picked:
+        # No survivor holds these, but excluded_node still does -- it was
+        # excluded because it could not RUN a worker (foreign process on
+        # its GPU, or never seeded), not because it went away. It stays up
+        # and reachable, so copying the files to the replacement turns a
+        # permanent coverage loss back into a transfer. Replication is 1x
+        # for 40-68% of the corpus on every tier but fish, so this is the
+        # common path, not an edge case: it is what dropped 46 of birds'
+        # 260 shards on 2026-08-21.
+        recovered = copy_shards(excluded_node, picked[0], dropped)
+        if recovered:
+            assignments[picked[0]] = assignments.get(picked[0], []) + recovered
+            dropped = [s for s in dropped if s not in recovered]
+            note += (
+                f"; recovered {len(recovered)} shard(s) to {picked[0]} "
+                f"({', '.join(recovered[:5])}"
+                f"{' ...' if len(recovered) > 5 else ''})"
+            )
+    if dropped:
+        # Coverage genuinely shrank: no survivor holds these and the copy
+        # did not land them. Say so -- the alternative is handing them to
+        # a node that cannot open them, which raises inside the worker and
+        # gets IT excluded two rounds later.
+        note += (
+            f"; dropped {len(dropped)} shard(s) no survivor holds "
+            f"({', '.join(dropped[:5])}{' ...' if len(dropped) > 5 else ''})"
+        )
+    _write_json_atomic(assignments_path, assignments)
+    return note
+
+
+def _replenish_pool(
+    run_config: MeshRunConfig,
+    run: RunState,
+    state: WatcherState,
+    mesh_shared: Path,
+    repo_root: Path,
+    run_configs_path: Path | None,
+    excluded_node: str,
+) -> str | None:
+    picked, replenish_note = submit_replacement(
+        run_config, run, state, mesh_shared, repo_root, run_configs_path, excluded_node
+    )
+    reassign_note = redistribute_shards(run_config, mesh_shared, excluded_node, picked)
     notes = [n for n in (replenish_note, reassign_note) if n]
     return "; ".join(notes) if notes else None
 
@@ -1149,7 +1324,11 @@ MERGE_TIMEOUT_S = 900
 
 
 def _do_merging(
-    run_config: MeshRunConfig, run: RunState, repo_root: Path, mesh_shared: Path
+    run_config: MeshRunConfig,
+    run: RunState,
+    state: WatcherState,
+    repo_root: Path,
+    mesh_shared: Path,
 ) -> str | None:
     pending_dir = mesh_shared / "checkpoints" / "pending"
     master_path = mesh_shared / "checkpoints" / run_config.run_id / "master.pt"
@@ -1200,6 +1379,8 @@ def _do_merging(
             / "mesh"
             / f"{run_config.run_id}_rounds.jsonl"
         ),
+        "--eligible-nodes",
+        ",".join(sorted(eligible_nodes(state, run_config.nodes))),
         # No --tb-dir: TensorBoard scalars are deliberately NOT written from
         # inside the merge subprocess. run_outer_step's _write_tb_scalars
         # rescans every node's full metrics JSONL on every merge
@@ -1216,6 +1397,20 @@ def _do_merging(
     ]
     if run.timeout_forced:
         cmd.append("--timeout-forced")
+    if run.quorum_relaxed:
+        cmd.append("--quorum-relaxed")
+    cmd.extend(["--misses-charged", str(run.round_misses_charged)])
+    cmd.extend(
+        ["--exclusions-suspended-no-replacement", str(run.round_exclusions_suspended)]
+    )
+    if run.round_effective_quorum_k is not None:
+        cmd.extend(["--effective-quorum-k", str(run.round_effective_quorum_k)])
+    # misses_excused_job_absent/misses_correlated are omitted (default 0):
+    # this codebase counts every miss via the plain missed_round_count, not
+    # Task 9's blame-aware split. requeues_seen is also omitted (default 0):
+    # it's counted by the worker's own per-node journal
+    # (mesh_continue_allowed.sh), and aggregating that from the watcher
+    # side has no mechanism specified yet.
     try:
         result = subprocess.run(
             cmd,
@@ -1460,11 +1655,17 @@ def _do_syncing(
         cancel_note = _cancel_run_workers(run_config.run_id, repo_root)
         swept = _sweep_pending_checkpoints(run_config.run_id, mesh_shared)
         clear_run_state(state, run_config.run_id)
-        return (
+        done_note = (
             f"{run_config.run_id}: SYNCING -> DONE "
             f"(round {run.round}/{run_config.rounds}); {transfer_note}; "
             f"{cancel_note}; swept {swept} pending checkpoint(s)"
         )
+        if run.any_round_quorum_relaxed:
+            done_note += (
+                " -- WARNING: one or more rounds merged under a relaxed "
+                "quorum, not a clean DONE"
+            )
+        return done_note
     # Not ASSIGNING: Task 2's worker job is a single long-lived SLURM
     # allocation that loops over every round internally, polling this exact
     # flag between rounds -- it never exits and needs no resubmission. Shard

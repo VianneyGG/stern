@@ -36,6 +36,8 @@
 # ~11h, so it is chunked into successive jobs (mesh.chunk_rounds) that each
 # exit cleanly under this cap and resume via +mesh.start_round + master.pt.
 #SBATCH --time=02:00:00
+#SBATCH --signal=B:USR1@180
+#SBATCH --requeue
 #SBATCH --output=video_encoding/slurm/logs/%x-%j.out
 
 set -euo pipefail

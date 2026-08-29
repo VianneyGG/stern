@@ -103,6 +103,10 @@ def main() -> int:
 
     state_path = STATE_DIR / "watcher_state.json"
     state = load_state(state_path)
+    state.last_tick_at = now
+    save_state(state_path, state)  # unconditional -- must land even on an
+    # otherwise-no-op fast-path tick (the "if now < state.next_full_check_at:
+    # return 0" branch below currently never calls save_state at all).
 
     # Mesh round advancement is unconditional -- not gated by the health-check
     # backoff timer below, since worker jobs push checkpoints and wait on sync

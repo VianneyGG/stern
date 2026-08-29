@@ -72,5 +72,26 @@ chmod 700 "${STERN_CHECKPOINT_ROOT}"
 # every worker in the pool re-downloads and rewrites the same package into
 # the same shared NFS venv at launch, all at once. The venv must already be
 # provisioned (launch_mesh_pool.sh runs `uv sync` once, from the login node).
+export MESH_STOP_FILE="${MESH_STOP_FILE:-${MESH_SHARED}/state/stop/${MESH_RUN_ID}-$(hostname -s)}"
+mkdir -p "$(dirname "${MESH_STOP_FILE}")"
+
+_on_usr1() {
+  touch "${MESH_STOP_FILE}"
+}
+trap _on_usr1 USR1
+
 uv run --no-sync python -m video_encoding.training.pretrain \
-  experiment="${EXPERIMENT}" "$@"
+  experiment="${EXPERIMENT}" "$@" &
+TRAINER_PID=$!
+wait "${TRAINER_PID}"
+TRAINER_EXIT=$?
+
+if [[ "${TRAINER_EXIT}" -ne 0 ]]; then
+  exit "${TRAINER_EXIT}"
+fi
+
+if bash "${REPO_ROOT}/video_encoding/scripts/mesh_continue_allowed.sh" "${MESH_RUN_ID}" "$(hostname -s)"; then
+  scontrol requeue "${SLURM_JOB_ID}"
+  exit 0
+fi
+exit 0

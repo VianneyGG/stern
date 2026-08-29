@@ -140,3 +140,77 @@ def query_node_health(
             )
         )
     return healths
+
+
+def foreign_gpu_pids(
+    gpu_pids: Collection[int], job_pid_tree: Collection[int]
+) -> set[int]:
+    """GPU compute PIDs not in this SLURM job's own process tree."""
+    return set(gpu_pids) - set(job_pid_tree)
+
+
+_GPU_PROC_PROBE = (
+    "nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader"
+)
+
+
+def query_gpu_process_pids(node: str, *, timeout_s: float = 10.0) -> set[int] | None:
+    """GPU compute PIDs currently running on `node`. None on any probe
+    failure -- never raises, mirrors query_node_health."""
+    try:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                f"ConnectTimeout={int(timeout_s)}",
+                node,
+                _GPU_PROC_PROBE,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        if result.returncode != 0:
+            return None
+        pids = set()
+        for line in result.stdout.splitlines():
+            pid_str = line.split(",")[0].strip()
+            if pid_str.isdigit():
+                pids.add(int(pid_str))
+        return pids
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def query_job_pid_tree(
+    node: str, slurm_job_id: str, *, timeout_s: float = 10.0
+) -> set[int] | None:
+    """PIDs SLURM attributes to `slurm_job_id` on `node` (`scontrol listpids`).
+    None on any probe failure."""
+    try:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                f"ConnectTimeout={int(timeout_s)}",
+                node,
+                f"scontrol listpids {slurm_job_id}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        if result.returncode != 0:
+            return None
+        pids = set()
+        for line in result.stdout.splitlines()[1:]:  # header row
+            parts = line.split()
+            if parts and parts[0].isdigit():
+                pids.add(int(parts[0]))
+        return pids
+    except (OSError, subprocess.SubprocessError):
+        return None

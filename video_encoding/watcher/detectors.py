@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -101,6 +102,34 @@ def detect_stalled(
     return flags
 
 
+DEFAULT_FOREIGN_GPU_PROBE_INTERVAL_S = 300.0
+
+
+def detect_foreign_gpu_process(
+    node: str,
+    slurm_job_id: str,
+    *,
+    gpu_pids: Collection[int] | None,
+    job_pid_tree: Collection[int] | None,
+) -> Flag | None:
+    """Pure: takes pre-fetched probe results (caller does the ssh I/O via
+    node_health.query_gpu_process_pids/query_job_pid_tree, throttled like
+    _recover_pool's RECOVERY_INTERVAL_S -- no probing every node every tick).
+    None input (probe failed) yields no flag, matching truly_idle's
+    fail-closed-on-unknown stance inverted for this read-only check: an
+    unreachable probe should not manufacture a false positive."""
+    if gpu_pids is None or job_pid_tree is None:
+        return None
+    foreign = set(gpu_pids) - set(job_pid_tree)
+    if not foreign:
+        return None
+    return Flag(
+        subject=f"foreign_gpu:{slurm_job_id}:{node}",
+        kind="foreign_gpu_process",
+        detail=f"{node}: foreign GPU PID(s) {sorted(foreign)} outside job {slurm_job_id}'s process tree",
+    )
+
+
 def detect_quota(
     disk_usage_pct: dict[str, float],
     *,
@@ -189,11 +218,25 @@ def detect_nan(
             if job_state is not None and job_state.auto_resubmit_count > 0
             else "nan"
         )
-        flags.append(
-            Flag(
-                subject,
-                kind,
-                f"{node}: train_loss={loss} round={record.get('round')} run_id={run_id}",
-            )
+        # Detection-only annotation (design §2): a coarse proxy for "a
+        # MERGING->SYNCING transition just preceded this NaN" -- a bad peer
+        # may have been averaged in before exclusion, not necessarily this
+        # node's own divergence. Reconstructing exact round history from the
+        # metrics JSONL is out of scope; this changes the diagnosis in the
+        # detail string, not the action.
+        poisoned_merge = (
+            run_state is not None
+            and run_state.status in ("SYNCING", "RUNNING")
+            and run_state.round > 0
         )
+        detail = (
+            f"{node}: train_loss={loss} round={record.get('round')} run_id={run_id}"
+        )
+        if poisoned_merge:
+            detail += (
+                " (a MERGING->SYNCING transition just preceded this -- a bad "
+                "peer may have been averaged in before exclusion, not "
+                "necessarily this node's own divergence)"
+            )
+        flags.append(Flag(subject, kind, detail))
     return flags

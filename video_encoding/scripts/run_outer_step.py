@@ -31,6 +31,7 @@ import json
 import math
 import sys
 import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +66,11 @@ BROADCAST_DTYPE_CHOICES = ("fp32", "fp16")
 
 
 def _load_worker_checkpoints(
-    pending_dir: Path, run_id: str, *, round_num: int | None = None
+    pending_dir: Path,
+    run_id: str,
+    *,
+    round_num: int | None = None,
+    eligible: Collection[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Load this run's pending checkpoints, keyed by node name.
 
@@ -85,6 +90,12 @@ def _load_worker_checkpoints(
     just because its file happened to still be sitting in the directory.
     `round_num=None` keeps every matching file regardless of round (the
     caller's choice, e.g. a cold-start bootstrap with nothing else to go on).
+
+    `eligible=None` (default) keeps every node; otherwise a node not in
+    `eligible` is dropped (logged, not raised -- design §5.1b: a quarantined
+    node under self-requeue's enforcement window is still training and
+    still writing checkpoints for a few more rounds, which is expected here,
+    not exceptional).
 
     Validates `n_samples` and exactly one of `model_state_dict` (round 0, or
     a pre-3.2/merge=False push -- full weights, nothing to diff against yet)
@@ -109,6 +120,13 @@ def _load_worker_checkpoints(
         if parsed is None:
             continue  # not this run_id's pattern (or predates round-tagging)
         _, node = parsed
+        if eligible is not None and node not in eligible:
+            print(
+                f"run_outer_step: dropped non-roster checkpoint '{f.name}' "
+                f"(node={node!r} not eligible for run_id={run_id!r})",
+                file=sys.stderr,
+            )
+            continue
         payload = torch.load(f, map_location="cpu", weights_only=False)
         if "n_samples" not in payload:
             raise ValueError(
@@ -224,6 +242,13 @@ def _append_merge_metrics(
     round_num: int | None,
     result: dict,
     timeout_forced: bool,
+    quorum_relaxed: bool = False,
+    effective_quorum_k: int | None = None,
+    misses_charged: int = 0,
+    misses_excused_job_absent: int = 0,
+    misses_correlated: int = 0,
+    exclusions_suspended_no_replacement: int = 0,
+    requeues_seen: int = 0,
 ) -> None:
     """Append one JSONL record for this merge round to `metrics_out`.
 
@@ -232,6 +257,15 @@ def _append_merge_metrics(
     process's stdout -- unworkable to scrape across an 8-run sweep. A failed
     write is logged and swallowed: metrics must never fail a merge that
     otherwise succeeded.
+
+    misses_excused_job_absent/misses_correlated stay 0 (design §8's
+    blame-aware categories, design §4) -- this codebase counts every miss
+    via the plain missed_round_count, not Task 9's blame-aware split, which
+    is still gated on Task 1's live-deployment replay data. requeues_seen
+    also stays 0: it's counted by the worker's own journal
+    (mesh_continue_allowed.sh's per-node requeue journal), and aggregating
+    that from the watcher side has no mechanism specified yet -- flagged
+    explicitly rather than fabricated.
     """
     record = {
         "run_id": run_id,
@@ -240,6 +274,13 @@ def _append_merge_metrics(
         "contributors": sorted(result["alphas"]),
         "alphas": result["alphas"],
         "timeout_forced": timeout_forced,
+        "quorum_relaxed": quorum_relaxed,
+        "effective_quorum_k": effective_quorum_k,
+        "misses_charged": misses_charged,
+        "misses_excused_job_absent": misses_excused_job_absent,
+        "misses_correlated": misses_correlated,
+        "exclusions_suspended_no_replacement": exclusions_suspended_no_replacement,
+        "requeues_seen": requeues_seen,
         "ts": time.time(),
     }
     try:
@@ -343,6 +384,7 @@ def merge_round(
     allow_missing_momentum: bool = False,
     broadcast_dtype: str = "fp32",
     residual_path: Path | None = None,
+    eligible: Collection[str] | None = None,
 ) -> dict:
     """Run one DiLoCo outer-optimizer merge round.
 
@@ -405,7 +447,9 @@ def merge_round(
         )
         return {"n_workers": 0, "alphas": {}, "already_merged": True}
 
-    checkpoints = _load_worker_checkpoints(pending_dir, run_id, round_num=round_num)
+    checkpoints = _load_worker_checkpoints(
+        pending_dir, run_id, round_num=round_num, eligible=eligible
+    )
     checkpoints, nonfinite = filter_nonfinite(checkpoints)
     if nonfinite:
         print(
@@ -560,8 +604,32 @@ def main(argv: list[str] | None = None) -> int:
             "(back-compat, no file created)."
         ),
     )
+    parser.add_argument(
+        "--eligible-nodes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated roster to accept checkpoints from; drop "
+            "(log, don't raise) any others."
+        ),
+    )
+    parser.add_argument(
+        "--quorum-relaxed",
+        action="store_true",
+        help=(
+            "Set by the watcher when this round's quorum floor was relaxed "
+            "below quorum_k for unreplaceable-missing nodes (design §5.2) "
+            "-- recorded verbatim into --metrics-out."
+        ),
+    )
+    parser.add_argument("--effective-quorum-k", type=int, default=None)
+    parser.add_argument("--misses-charged", type=int, default=0)
+    parser.add_argument("--misses-excused-job-absent", type=int, default=0)
+    parser.add_argument("--misses-correlated", type=int, default=0)
+    parser.add_argument("--exclusions-suspended-no-replacement", type=int, default=0)
     args = parser.parse_args(argv)
 
+    eligible = set(args.eligible_nodes.split(",")) if args.eligible_nodes else None
     try:
         result = merge_round(
             args.pending_dir,
@@ -575,6 +643,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_missing_momentum=args.allow_missing_momentum,
             broadcast_dtype=args.broadcast_dtype,
             residual_path=args.residual,
+            eligible=eligible,
         )
     except ValueError as exc:
         print(f"run_outer_step: {exc}", file=sys.stderr)
@@ -594,6 +663,12 @@ def main(argv: list[str] | None = None) -> int:
             round_num=args.round_num,
             result=result,
             timeout_forced=args.timeout_forced,
+            quorum_relaxed=args.quorum_relaxed,
+            effective_quorum_k=args.effective_quorum_k,
+            misses_charged=args.misses_charged,
+            misses_excused_job_absent=args.misses_excused_job_absent,
+            misses_correlated=args.misses_correlated,
+            exclusions_suspended_no_replacement=args.exclusions_suspended_no_replacement,
         )
 
     if args.tb_dir is not None:

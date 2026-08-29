@@ -4,6 +4,7 @@ import json
 
 from video_encoding.watcher.detectors import (
     detect_dead,
+    detect_foreign_gpu_process,
     detect_nan,
     detect_quota,
     detect_stalled,
@@ -28,6 +29,17 @@ def test_detect_dead_flags_job_not_in_squeue_with_no_result():
 
 def test_detect_dead_skips_job_present_in_squeue():
     squeue = {"1": {"state": "RUNNING", "nodelist": "node001"}}
+    flags = detect_dead(
+        REGISTRY, squeue=squeue, result_mtimes={}, job_states={}, now=2000.0
+    )
+    assert {f.subject for f in flags} == {"2"}
+
+
+def test_detect_dead_does_not_flag_a_requeued_pending_job():
+    """Pins existing-and-correct behaviour once restart_cnt is threaded
+    through the snapshot: a requeued job is still in squeue, so the
+    existing `if jid in squeue: continue` already treats it as not dead."""
+    squeue = {"1": {"state": "PENDING", "nodelist": "", "restart_cnt": 1}}
     flags = detect_dead(
         REGISTRY, squeue=squeue, result_mtimes={}, job_states={}, now=2000.0
     )
@@ -215,6 +227,56 @@ def test_detect_nan_classifies_as_nan_after_retry_once_already_retried(tmp_path)
     flags = detect_nan("run1", tmp_path, state)
     assert len(flags) == 1
     assert flags[0].kind == "nan_after_retry"
+
+
+def test_detect_nan_annotates_poisoned_merge_after_syncing_transition(tmp_path):
+    _write_metrics(
+        tmp_path / "metrics" / "run1" / "nodeA.jsonl",
+        [_round_record("nodeA", 1, float("nan"))],
+    )
+    state = WatcherState()
+    run = state.run("run1")
+    run.status = "SYNCING"
+    run.round = 1
+    flags = detect_nan("run1", tmp_path, state)
+    assert len(flags) == 1
+    assert "MERGING->SYNCING" in flags[0].detail
+
+
+def test_detect_nan_does_not_annotate_poisoned_merge_before_round_one(tmp_path):
+    _write_metrics(
+        tmp_path / "metrics" / "run1" / "nodeA.jsonl",
+        [_round_record("nodeA", 1, float("nan"))],
+    )
+    state = WatcherState()
+    run = state.run("run1")
+    run.status = "SYNCING"
+    run.round = 0
+    flags = detect_nan("run1", tmp_path, state)
+    assert len(flags) == 1
+    assert "MERGING->SYNCING" not in flags[0].detail
+
+
+def test_detect_foreign_gpu_process_flags_unowned_pid():
+    flag = detect_foreign_gpu_process(
+        "node001", "123", gpu_pids={111, 222}, job_pid_tree={111}
+    )
+    assert flag is not None
+    assert flag.kind == "foreign_gpu_process"
+
+
+def test_detect_foreign_gpu_process_none_when_all_pids_owned():
+    assert (
+        detect_foreign_gpu_process("node001", "123", gpu_pids={111}, job_pid_tree={111})
+        is None
+    )
+
+
+def test_detect_foreign_gpu_process_none_on_probe_failure():
+    assert (
+        detect_foreign_gpu_process("node001", "123", gpu_pids=None, job_pid_tree={111})
+        is None
+    )
 
 
 def test_detect_nan_skips_run_already_marked_done(tmp_path):

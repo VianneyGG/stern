@@ -20,6 +20,7 @@ from video_encoding.watcher.escalate import (
     should_escalate,
     record_escalation,
 )
+from video_encoding.watcher.notify import notify
 from video_encoding.watcher.quota import collect_disk_usage_pct
 from video_encoding.watcher.quota_cleanup import remediate_quota_pressure
 from video_encoding.watcher.registry import load_registry
@@ -130,7 +131,10 @@ def run_full_check(
         if summary:
             actions.append(f"cleanup {flag.subject}: {summary}")
             continue
-        _try_escalate(flag)
+        notify(
+            flag.subject, f"quota pressure with nothing safe to delete: {flag.detail}"
+        )
+        actions.append(f"notify {flag.subject}: nothing safe to delete")
 
     action_taken = len(actions) > 0
     advance_backoff(state, now=now, action_taken=action_taken)

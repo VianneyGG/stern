@@ -206,6 +206,16 @@ def _require_local_shards(
     )
 
 
+def _write_current_round_marker(
+    mesh_shared: Path, run_id: str, node: str, round_num: int
+) -> None:
+    marker = mesh_shared / "state" / "requeue" / f"{run_id}-{node}-current_round"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp = marker.with_suffix(".tmp")
+    tmp.write_text(str(round_num))
+    tmp.replace(marker)
+
+
 def mesh_round_lr(
     peak_lr: float,
     round_num: int,
@@ -418,7 +428,14 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     final_round = -1
     consecutive_abandons = 0
 
+    mesh_stop_file = os.environ.get("MESH_STOP_FILE")
     for round_num in range(start_round, stop_round):
+        if mesh_stop_file and Path(mesh_stop_file).exists():
+            # Checked only at the round boundary -- checkpoint semantics are
+            # unchanged, and round-in-progress loss stays bounded by one
+            # round, exactly as at today's chunk boundary (design §1.1).
+            break
+        _write_current_round_marker(mesh_shared, run_id, node, round_num)
         lr = mesh_round_lr(
             peak_lr, round_num, rounds, warmup_frac=lr_warmup_frac, min_lr=lr_min
         )
@@ -775,7 +792,9 @@ def evaluate_val_loss(
                 windows_seen += 1
 
                 pixel_values = pixel_values.to(device)
-                keep_indices, mask_indices = masker(pixel_values, token_grid, device, pixel_values.shape[0])
+                keep_indices, mask_indices = masker(
+                    pixel_values, token_grid, device, pixel_values.shape[0]
+                )
                 with torch.autocast(
                     device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled
                 ):

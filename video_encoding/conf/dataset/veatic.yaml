@@ -1,11 +1,20 @@
 name: veatic
 role: probe            # 124 Hollywood/documentary/home-video clips, continuous per-frame VA (WACV 2024)
-# `present: true` hardcoded here would be a lie for any checkout except
-# login-node:/Data/$USER/veatic (fetched + manifest built there,
-# 2026-07-07). Env-driven so it defaults safely to false everywhere else;
-# set VEATIC_PRESENT=true on login-node before running. oc.decode parses the
-# env var's string value as a real bool (a bare oc.env default would make
-# VEATIC_PRESENT=false truthy, since any non-empty string is truthy).
+# `present: true` hardcoded here would be a lie for any checkout, so this stays
+# env-driven and defaults safely to false everywhere; set VEATIC_PRESENT=true
+# only where the data has actually been extracted. oc.decode parses the value as
+# a real bool (a bare oc.env default would make VEATIC_PRESENT=false truthy,
+# since any non-empty string is truthy).
+#
+# Locality, re-verified 2026-08-28: the copy this comment used to name
+# (login-node:/Data/$USER/veatic, built 2026-07-07) is GONE, almost
+# certainly wiped by the 2026-08-22 SallesInfo rebuild. That directory now holds
+# only `uv-cache/` and `voxceleb2/`, and nothing matching *veatic* exists under
+# /Data or $HOME on login-node. Rebuilt at `.data/veatic` on the workstation via
+# fetch_veatic.py. VEATIC.zip has no scriptable download URL, so any other node
+# needs the extracted tree copied to it -- there is no re-fetch step to automate.
+# Check `$VEATIC_ROOT/manifest.csv` exists on a host before flipping the flag
+# there; a stale `present: true` costs a whole run.
 present: ${oc.decode:${oc.env:VEATIC_PRESENT,false}}
 # VA numeric range is NOT documented on the repo/paper/project page; [-1,1] was an educated guess,
 # CONFIRMED against the real downloaded data (observed range across all 124 clips: [-0.9146, 0.8893]).

@@ -65,6 +65,20 @@ class RunState:
     # AWAITING_CHECKPOINTS timeout can still fire if the whole pool dies
     # before checking in even once -- pending-checkpoint mtimes alone can't
     # cover that case.
+    quorum_relaxed: bool = False  # set by _do_awaiting_checkpoints each time
+    # it decides AWAITING_CHECKPOINTS -> MERGING (every branch, so it never
+    # carries a stale value); read by _do_merging to pass run_outer_step.py's
+    # --quorum-relaxed, recorded into the round metrics JSONL (design §5.2).
+    any_round_quorum_relaxed: bool = False  # OR'd, never cleared -- a run
+    # that relaxed quorum even once must not be reported as a clean DONE
+    # (design §5.2).
+    # All four set once, in _do_awaiting_checkpoints, every branch that
+    # transitions to MERGING -- read once by _do_merging for this round's
+    # metrics record, same lifecycle as timeout_forced/quorum_relaxed
+    # (design §8).
+    round_misses_charged: int = 0
+    round_exclusions_suspended: int = 0
+    round_effective_quorum_k: int | None = None
 
 
 @dataclass
@@ -83,6 +97,12 @@ class WatcherState:
     # `now - value` exceeds the caller's concurrency_timeout_s, not by an
     # explicit pop (see escalate.remediate_nan_node).
     nan_escalations_in_flight: dict[str, float] = field(default_factory=dict)
+    # Epoch seconds of the last cron tick, stamped unconditionally at the
+    # top of watch_training.main() -- even on a fast-path tick that returns
+    # before run_full_check. Read by mesh_continue_allowed.sh's fifth stop
+    # signal (design §1.2/§3b) to detect a dead/wedged watcher in ~10 min
+    # instead of a multi-hour futile-requeue cycle.
+    last_tick_at: float = 0.0
 
     def job(self, slurm_job_id: str) -> JobState:
         return self.jobs.setdefault(slurm_job_id, JobState(slurm_job_id=slurm_job_id))
@@ -108,6 +128,7 @@ def load_state(path: Path) -> WatcherState:
         runs=runs,
         excluded_nodes=payload.get("excluded_nodes", {}),
         nan_escalations_in_flight=payload.get("nan_escalations_in_flight", {}),
+        last_tick_at=payload.get("last_tick_at", 0.0),
     )
 
 
@@ -122,6 +143,7 @@ def save_state(path: Path, state: WatcherState) -> None:
         "runs": {k: asdict(v) for k, v in state.runs.items()},
         "excluded_nodes": state.excluded_nodes,
         "nan_escalations_in_flight": state.nan_escalations_in_flight,
+        "last_tick_at": state.last_tick_at,
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2))

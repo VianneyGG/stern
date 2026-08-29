@@ -19,6 +19,7 @@ from pathlib import Path
 
 from video_encoding.watcher.detectors import Flag
 from video_encoding.watcher.epoch_advance import exclude_node
+from video_encoding.watcher.notify import notify
 from video_encoding.watcher.registry import JobRecord
 from video_encoding.watcher.state import WatcherState
 
@@ -167,6 +168,36 @@ def build_nan_prompt(flag: Flag, *, run_id: str, node: str) -> str:
     )
 
 
+def _resubmit_nan_node(
+    *, run_id: str, node: str, round_num: int, repo_root: Path
+) -> str | None:
+    """Reload this run's MeshRunConfig from mesh_run_configs.json and
+    resubmit `node` with a halved inner-LR override, reloading from the
+    run's last merged master checkpoint (mesh_round.py's cold-start
+    contract already handles a fresh worker picking up master.pt)."""
+    from video_encoding.watcher.mesh_tick import (
+        load_run_configs,
+        resubmit_with_override,
+    )
+
+    configs_path = repo_root / "runs" / "state" / "mesh_run_configs.json"
+    matching = [c for c in load_run_configs(configs_path) if c.run_id == run_id]
+    if not matching:
+        return None
+    run_config = matching[0]
+    registry_path = repo_root / "runs" / "state" / "jobs_registry.json"
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    return resubmit_with_override(
+        run_config,
+        node,
+        repo_root,
+        registry_path,
+        submitted_at,
+        start_round=round_num + 1,
+        override="train.lr_mult=0.5",
+    )
+
+
 def remediate_nan_node(
     flag: Flag,
     *,
@@ -181,17 +212,11 @@ def remediate_nan_node(
     dry_run: bool = False,
     concurrency_timeout_s: float = DEFAULT_NAN_CONCURRENCY_TIMEOUT_S,
 ) -> str:
-    """React to a `detect_nan` Flag: exclude the node, then either spawn one
-    detached diagnostic `claude -p` retry or drain the node for the rest of
-    this run. Returns one of "retried" | "drained" | "capped" | "dry_run" |
-    "spawn_failed" for the caller's action log.
-
-    Never blocks: this runs inside watch_training.py's per-tick flock
-    (spec: the whole main() holds LOCK_PATH), so a multi-minute `claude -p`
-    call via `.wait()` would stall every subsequent 60s tick -- the exact
-    stall this watcher exists to prevent. `subprocess.Popen` is spawned
-    detached (`start_new_session=True`) and never waited on; the report is
-    read back, if at all, on a later tick.
+    """React to a `detect_nan` Flag: exclude the node, then either resubmit
+    it once with a scripted halved-LR retry (no `claude -p`; NaN's cause is
+    divergence, not something needing LLM judgment) or drain the node for
+    the rest of this run. Returns one of "retried_scripted" | "drained" |
+    "capped" | "dry_run" | "spawn_failed" for the caller's action log.
     """
     exclude_node(
         state, node, f"nan: train_loss NaN/Inf on round {round_num} of {run_id}"
@@ -224,38 +249,23 @@ def remediate_nan_node(
     if in_flight_since is not None and now - in_flight_since < concurrency_timeout_s:
         return "capped"
 
-    transcript_dir.mkdir(parents=True, exist_ok=True)
-    prompt = build_nan_prompt(flag, run_id=run_id, node=node)
-    cmd = [
-        _claude_bin(),
-        "-p",
-        "--max-turns",
-        str(DEFAULT_MAX_TURNS),
-        "--allowed-tools",
-        _NAN_ALLOWED_TOOLS,
-        prompt,
-    ]
-
-    fh = transcript_path.open("w")
-    try:
-        subprocess.Popen(
-            cmd,
-            stdout=fh,
-            stderr=subprocess.STDOUT,
-            text=True,
-            cwd=repo_root,
-            start_new_session=True,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        fh.write(f"ERROR: failed to launch claude -p: {exc}\n")
-        fh.close()
+    job_id = _resubmit_nan_node(
+        run_id=run_id, node=node, round_num=round_num, repo_root=repo_root
+    )
+    if job_id is None:
         return "spawn_failed"
-    # Closing our copy of fh does not truncate the child's writes -- Popen
-    # dup'd the fd for the child before returning (POSIX), and this process
-    # exits right after main() returns, so holding it open would only leak
-    # an fd across ticks.
-    fh.close()
 
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path.write_text(
+        "Scripted NaN remediation (no claude -p) -- exclude, halve inner LR, "
+        f"resubmit.\nRun: {run_id}\nNode: {node}\nRound: {round_num}\n"
+        f"Detail: {flag.detail}\nResubmitted as job {job_id}.\n"
+    )
+    notify(
+        f"nan:{run_id}:{node}",
+        f"{node} NaN'd on round {round_num} of {run_id}; excluded and resubmitted "
+        f"(one retry, halved inner LR) as job {job_id}",
+    )
     job_state.auto_resubmit_count += 1
     state.nan_escalations_in_flight[run_id] = now
-    return "retried"
+    return "retried_scripted"

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 from video_encoding.watcher.node_health import (
     NodeHealth,
+    foreign_gpu_pids,
     query_node_health,
     truly_idle,
 )
@@ -186,3 +187,13 @@ def test_a_node_whose_gpu_is_held_by_a_foreign_process_is_still_rejected():
         _health("node025", 2453),
     ]
     assert truly_idle(occupied) == set()
+
+
+def test_foreign_pids_excludes_job_pid_tree():
+    gpu_pids = {111, 222, 333}
+    job_pid_tree = {111, 222}
+    assert foreign_gpu_pids(gpu_pids, job_pid_tree) == {333}
+
+
+def test_foreign_pids_empty_when_all_pids_belong_to_job():
+    assert foreign_gpu_pids({111, 222}, {111, 222}) == set()

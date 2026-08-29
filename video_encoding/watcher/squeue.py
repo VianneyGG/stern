@@ -31,7 +31,7 @@ def refresh_squeue_snapshot(out_path: Path, *, user: str) -> None:
     """
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     result = subprocess.run(
-        ["squeue", "-u", user, "-h", "-o", "%i|%T|%N"],
+        ["squeue", "-u", user, "-h", "-o", "%i|%T|%N|%r"],
         capture_output=True,
         text=True,
         check=True,
@@ -42,14 +42,21 @@ def refresh_squeue_snapshot(out_path: Path, *, user: str) -> None:
         line = line.strip()
         if not line:
             continue
-        job_id, state, nodes = line.split("|", 2)
-        jobs.append({"job_id": int(job_id), "job_state": [state], "nodes": nodes})
+        job_id, state, nodes, restart_cnt = line.split("|", 3)
+        jobs.append(
+            {
+                "job_id": int(job_id),
+                "job_state": [state],
+                "nodes": nodes,
+                "restart_cnt": int(restart_cnt) if restart_cnt.isdigit() else 0,
+            }
+        )
     tmp.write_text(json.dumps({"jobs": jobs}))
     tmp.replace(out_path)
 
 
 def load_squeue_snapshot(path: Path) -> dict[str, dict[str, Any]]:
-    """Load squeue.json -> {slurm_job_id (str): {"state": str, "nodelist": str}}.
+    """Load squeue.json -> {slurm_job_id (str): {"state", "nodelist", "restart_cnt"}}.
 
     Missing file (before the first refresh) returns {} rather than raising --
     callers treat "no snapshot yet" the same as "no jobs running".
@@ -62,5 +69,9 @@ def load_squeue_snapshot(path: Path) -> dict[str, dict[str, Any]]:
         job_id = str(job["job_id"])
         state = job.get("job_state", ["UNKNOWN"])
         state = state[0] if isinstance(state, list) else state
-        snapshot[job_id] = {"state": state, "nodelist": job.get("nodes", "")}
+        snapshot[job_id] = {
+            "state": state,
+            "nodelist": job.get("nodes", ""),
+            "restart_cnt": job.get("restart_cnt", 0),
+        }
     return snapshot

@@ -56,6 +56,27 @@ def test_nan_escalations_in_flight_round_trips(tmp_path):
     assert loaded.nan_escalations_in_flight == {"run1": 1234.0}
 
 
+def test_watcher_state_defaults_last_tick_at_to_zero():
+    state = WatcherState()
+    assert state.last_tick_at == 0.0
+
+
+def test_watcher_state_roundtrips_last_tick_at(tmp_path):
+    path = tmp_path / "watcher_state.json"
+    state = WatcherState()
+    state.last_tick_at = 12345.0
+    save_state(path, state)
+    loaded = load_state(path)
+    assert loaded.last_tick_at == 12345.0
+
+
+def test_load_state_defaults_last_tick_at_for_a_pre_existing_file(tmp_path):
+    path = tmp_path / "watcher_state.json"
+    path.write_text('{"jobs": {}, "runs": {}, "excluded_nodes": {}}')
+    loaded = load_state(path)
+    assert loaded.last_tick_at == 0.0
+
+
 def test_advance_backoff_grows_toward_ceiling_when_no_action():
     state = WatcherState(current_interval_s=1000.0)
     advance_backoff(state, now=5000.0, action_taken=False)

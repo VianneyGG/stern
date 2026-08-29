@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from video_encoding.watcher.epoch_advance import (
     candidate_replacements,
+    clear_missed_rounds,
     eligible_nodes,
     exclude_node,
     pending_nodes,
@@ -43,14 +44,26 @@ def test_two_consecutive_missed_rounds_excludes():
     assert "node001" in state.excluded_nodes
 
 
-def test_a_successful_round_resets_the_miss_counter():
+def test_miss_then_checkin_then_miss_does_not_exclude():
+    """The bug this fixes: nothing today resets missed_rounds on a
+    successful check-in, so any node that hiccups twice ever (not
+    consecutively) is permanently excluded."""
     state = WatcherState()
-    record_missed_round(state, "RUN1", "node001")
-    state.run("RUN1").missed_rounds["node001"] = 0  # a successful round resets it
-
-    excluded = record_missed_round(state, "RUN1", "node001")
+    record_missed_round(state, "RUN1", "node001")  # miss 1
+    clear_missed_rounds(state.run("RUN1"), {"node001"})  # checks in
+    excluded = record_missed_round(state, "RUN1", "node001")  # miss 2 (non-consecutive)
     assert excluded is False
     assert "node001" not in state.excluded_nodes
+
+
+def test_clear_missed_rounds_only_touches_checked_in_nodes():
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.missed_rounds["node001"] = 1
+    run.missed_rounds["node002"] = 1
+    clear_missed_rounds(run, {"node001"})
+    assert run.missed_rounds["node001"] == 0
+    assert run.missed_rounds["node002"] == 1
 
 
 def test_excluded_nodes_are_never_eligible():

@@ -9,6 +9,7 @@ import torch
 
 from video_encoding.mesh.outer_step import BOOTSTRAP_MASTER_VERSION
 from video_encoding.scripts.run_outer_step import (
+    _append_merge_metrics,
     _load_worker_checkpoints,
     _quantize_broadcast_with_error_feedback,
     main,
@@ -380,6 +381,29 @@ def test_load_worker_checkpoints_upcasts_fp16_to_fp32(tmp_path):
     checkpoints = _load_worker_checkpoints(pending_dir, "run1")
 
     assert checkpoints["a"]["model_state_dict"]["w"].dtype == torch.float32
+
+
+def test_load_worker_checkpoints_drops_non_eligible_node(tmp_path, capsys):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    _write_worker(pending_dir / "run1_0_a.pt", 1.0)
+    _write_worker(pending_dir / "run1_0_quarantined.pt", 1.0)
+
+    checkpoints = _load_worker_checkpoints(pending_dir, "run1", eligible={"a"})
+
+    assert set(checkpoints) == {"a"}
+    assert "quarantined" in capsys.readouterr().err
+
+
+def test_load_worker_checkpoints_eligible_none_keeps_everyone(tmp_path):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    _write_worker(pending_dir / "run1_0_a.pt", 1.0)
+    _write_worker(pending_dir / "run1_0_b.pt", 1.0)
+
+    checkpoints = _load_worker_checkpoints(pending_dir, "run1", eligible=None)
+
+    assert set(checkpoints) == {"a", "b"}
 
 
 def test_inverse_loss_weighting_is_available_as_an_option(tmp_path):
@@ -899,6 +923,115 @@ def test_metrics_out_records_timeout_forced_flag(tmp_path):
     assert rc == 0
     record = json.loads(metrics_out.read_text().splitlines()[0])
     assert record["timeout_forced"] is True
+
+
+def test_metrics_out_records_quorum_relaxed_flag(tmp_path):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+    metrics_out = tmp_path / "run1_rounds.jsonl"
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_1_a.pt", 0.5, n_samples=100)
+
+    rc = main(
+        _cli_argv(
+            pending_dir,
+            master_path,
+            momentum_path,
+            "run1",
+            extra=[
+                "--round",
+                "1",
+                "--allow-missing-momentum",
+                "--metrics-out",
+                str(metrics_out),
+                "--quorum-relaxed",
+            ],
+        )
+    )
+
+    assert rc == 0
+    record = json.loads(metrics_out.read_text().splitlines()[0])
+    assert record["quorum_relaxed"] is True
+
+
+def test_metrics_out_defaults_quorum_relaxed_to_false(tmp_path):
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+    metrics_out = tmp_path / "run1_rounds.jsonl"
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_1_a.pt", 0.5, n_samples=100)
+
+    rc = main(
+        _cli_argv(
+            pending_dir,
+            master_path,
+            momentum_path,
+            "run1",
+            extra=[
+                "--round",
+                "1",
+                "--allow-missing-momentum",
+                "--metrics-out",
+                str(metrics_out),
+            ],
+        )
+    )
+
+    assert rc == 0
+    record = json.loads(metrics_out.read_text().splitlines()[0])
+    assert record["quorum_relaxed"] is False
+
+
+def test_append_merge_metrics_includes_observability_fields(tmp_path):
+    metrics_path = tmp_path / "metrics.jsonl"
+    _append_merge_metrics(
+        metrics_path,
+        run_id="R",
+        round_num=3,
+        result={"n_workers": 2, "alphas": {"a": 0.5, "b": 0.5}},
+        timeout_forced=False,
+        quorum_relaxed=True,
+        effective_quorum_k=2,
+        misses_charged=1,
+        misses_excused_job_absent=1,
+        misses_correlated=0,
+        exclusions_suspended_no_replacement=1,
+        requeues_seen=3,
+    )
+    record = json.loads(metrics_path.read_text().splitlines()[0])
+    assert record["quorum_relaxed"] is True
+    assert record["effective_quorum_k"] == 2
+    assert record["misses_charged"] == 1
+    assert record["misses_excused_job_absent"] == 1
+    assert record["misses_correlated"] == 0
+    assert record["exclusions_suspended_no_replacement"] == 1
+    assert record["requeues_seen"] == 3
+
+
+def test_append_merge_metrics_defaults_observability_fields_to_zero(tmp_path):
+    """Every existing call site (predating this task) must keep working
+    with no new keyword arguments."""
+    metrics_path = tmp_path / "metrics.jsonl"
+    _append_merge_metrics(
+        metrics_path,
+        run_id="R",
+        round_num=1,
+        result={"n_workers": 1, "alphas": {"a": 1.0}},
+        timeout_forced=False,
+    )
+    record = json.loads(metrics_path.read_text().splitlines()[0])
+    assert record["effective_quorum_k"] is None
+    assert record["misses_charged"] == 0
+    assert record["misses_excused_job_absent"] == 0
+    assert record["misses_correlated"] == 0
+    assert record["exclusions_suspended_no_replacement"] == 0
+    assert record["requeues_seen"] == 0
 
 
 class _RecordingWriter:

@@ -20,7 +20,10 @@ from video_encoding.watcher.mesh_tick import (
     _submit_worker_job,
     advance_all_runs,
     advance_one_run,
+    effective_quorum_k,
     load_run_configs,
+    redistribute_shards,
+    resubmit_with_override,
     sweep_orphaned_pending,
 )
 from video_encoding.watcher.state import WatcherState
@@ -97,6 +100,47 @@ def test_meshrunconfig_extra_overrides_round_trips_through_load_run_configs(tmp_
     )
     configs = load_run_configs(path)
     assert configs[0].extra_overrides == ["train.accum_steps=128", "train.lr_mult=1.5"]
+
+
+def test_effective_quorum_k_unchanged_when_pool_healthy():
+    state = WatcherState()
+    run_config = _run_config(nodes=["a", "b", "c"], n_shards=3, quorum_k=3)
+    run = state.run("RUN1")
+    run.target_pool_size = 3
+    assert effective_quorum_k(run_config, run, state, roster=["a", "b", "c"]) == 3
+
+
+def test_effective_quorum_k_relaxes_for_unreplaceable_missing_nodes():
+    state = WatcherState()
+    run_config = _run_config(nodes=["a", "b", "c"], n_shards=3, quorum_k=3)
+    run = state.run("RUN1")
+    run.target_pool_size = 3
+    result = effective_quorum_k(
+        run_config, run, state, roster=["a", "b", "c"], missing_unreplaceable={"c"}
+    )
+    assert result == 2
+
+
+def test_effective_quorum_k_clamps_at_60_percent_floor():
+    state = WatcherState()
+    run_config = _run_config(nodes=["a", "b", "c", "d", "e"], n_shards=5, quorum_k=5)
+    run = state.run("RUN1")
+    run.target_pool_size = 5
+    result = effective_quorum_k(
+        run_config,
+        run,
+        state,
+        roster=["a", "b", "c", "d", "e"],
+        missing_unreplaceable={"b", "c", "d", "e"},
+    )
+    assert result == 3  # ceil(0.6 * 5) = 3, not 1
+
+
+def test_effective_quorum_k_no_floor_configured_returns_roster_size():
+    state = WatcherState()
+    run_config = _run_config(nodes=["a", "b", "c"], n_shards=3)  # quorum_k=None
+    run = state.run("RUN1")
+    assert effective_quorum_k(run_config, run, state, roster=["a", "b"]) == 2
 
 
 def _seed_shard_map(mesh_shared) -> None:
@@ -457,6 +501,39 @@ def test_awaiting_checkpoints_merges_early_when_quorum_reached_before_full_arriv
     assert "quorum" in action
 
 
+def test_awaiting_checkpoints_quarantined_stale_checkpoint_does_not_satisfy_quorum(
+    tmp_path,
+):
+    """Task 11 (design §5.1b): a quarantined node can still be training
+    under self-requeue's enforcement window and drop a stale checkpoint --
+    that file must not count toward quorum_k."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    (pending_dir / "RUN1_0_node001.pt").write_text("x")  # 1 genuinely eligible
+    (pending_dir / "RUN1_0_node003.pt").write_text("x")  # quarantined, stale
+
+    run_config = _run_config(quorum_k=2, grace_s=900.0)
+    state = WatcherState()
+    state.run("RUN1").status = "AWAITING_CHECKPOINTS"
+    state.run("RUN1").round_started_at = 1000.0
+    exclude_node(state, "node003", "crash-loop: missed 2 consecutive rounds of RUN1")
+
+    action = advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=1010.0,  # nowhere near grace_s
+    )
+
+    # Without the eligible-only fix, {"node001", "node003"} would meet
+    # quorum_k=2 on a naive count of pending files.
+    assert state.run("RUN1").status == "AWAITING_CHECKPOINTS"
+    assert action is None
+
+
 def test_awaiting_checkpoints_quorum_configured_still_waits_below_quorum(tmp_path):
     """Below quorum_k, a quorum-configured run waits exactly like the
     default path does below ROUND_TIMEOUT_S -- grace_s hasn't expired yet
@@ -580,6 +657,37 @@ def test_merging_calls_run_outer_step_with_correct_args(tmp_path):
     assert cmd[weighting_idx + 1] == "data"
 
 
+def test_merging_passes_eligible_nodes_excluding_quarantined(tmp_path):
+    """Task 11 (design §5.1b): a quarantined node's stale checkpoint must
+    not be averaged into the merge -- run_outer_step.py drops anything not
+    named in --eligible-nodes."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "MERGING"
+    exclude_node(state, "node003", "crash-loop: missed 2 consecutive rounds of RUN1")
+
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    cmd = mock_run.call_args[0][0]
+    idx = cmd.index("--eligible-nodes")
+    assert cmd[idx + 1] == "node001,node002"
+    assert "node003" not in cmd[idx + 1]
+
+
 def test_merging_does_not_pass_tb_dir(tmp_path):
     """The merge subprocess must not write TensorBoard scalars.
 
@@ -671,6 +779,63 @@ def test_merging_passes_timeout_forced_when_run_state_flag_is_set(tmp_path):
         )
 
     assert "--timeout-forced" in mock_run.call_args[0][0]
+
+
+def test_merging_passes_observability_counters(tmp_path):
+    """Task 15 (design §8): _do_merging reads the counters
+    _do_awaiting_checkpoints stashed on RunState for this round."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+
+    run_config = _run_config()
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.status = "MERGING"
+    run.round_misses_charged = 2
+    run.round_exclusions_suspended = 1
+    run.round_effective_quorum_k = 2
+
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    cmd = mock_run.call_args[0][0]
+    assert cmd[cmd.index("--misses-charged") + 1] == "2"
+    assert cmd[cmd.index("--exclusions-suspended-no-replacement") + 1] == "1"
+    assert cmd[cmd.index("--effective-quorum-k") + 1] == "2"
+
+
+def test_merging_omits_effective_quorum_k_when_none(tmp_path):
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
+
+    run_config = _run_config()  # quorum_k not configured for this run
+    state = WatcherState()
+    state.run("RUN1").status = "MERGING"
+
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    assert "--effective-quorum-k" not in mock_run.call_args[0][0]
 
 
 def test_merging_omits_timeout_forced_on_the_normal_full_arrival_path(tmp_path):
@@ -993,6 +1158,30 @@ def test_syncing_reaches_done_at_final_round(tmp_path):
     assert flag_path.exists()
     assert state.run("RUN1").round == 3
     assert state.run("RUN1").status == "DONE"
+
+
+def test_syncing_done_warns_when_any_round_relaxed_quorum(tmp_path):
+    """Task 12 (design §5.2): a run that merged under a relaxed quorum even
+    once must not read as a clean DONE."""
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config(rounds=3)
+    state = WatcherState()
+    state.run("RUN1").status = "SYNCING"
+    state.run("RUN1").round = 2
+    state.run("RUN1").any_round_quorum_relaxed = True
+
+    action = advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=1000.0,
+    )
+
+    assert state.run("RUN1").status == "DONE"
+    assert "WARNING" in action
+    assert "relaxed quorum" in action
 
 
 def test_syncing_flushes_final_tb_rounds_on_done(tmp_path):
@@ -1390,6 +1579,46 @@ def test_submit_worker_job_extra_override_composes_against_real_experiment_confi
     assert cfg.train.accum_steps == 128
 
 
+def test_submit_worker_job_appends_call_site_extra_overrides(tmp_path):
+    """The extra_overrides kwarg (Task 8: a per-call override, e.g. a
+    halved-LR NaN retry) is separate from run_config.extra_overrides
+    (a per-run override set at submission time) -- both must be appended."""
+    run_config = _run_config()
+    registry_path = tmp_path / "jobs_registry.json"
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 42\n")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        job_id = _submit_worker_job(
+            run_config,
+            "node001",
+            tmp_path,
+            registry_path,
+            "2026-01-01T00:00:00Z",
+            extra_overrides=["train.lr_mult=0.5"],
+        )
+    assert job_id == "42"
+    assert "train.lr_mult=0.5" in mock_run.call_args[0][0]
+
+
+def test_resubmit_with_override_delegates_to_submit_worker_job(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "video_encoding.watcher.mesh_tick._submit_worker_job",
+        lambda *a, **kw: "99",
+    )
+    run_config = _run_config()
+    result = resubmit_with_override(
+        run_config,
+        "node001",
+        tmp_path,
+        tmp_path / "registry.json",
+        "2026-01-01T00:00:00Z",
+        start_round=3,
+        override="train.lr_mult=0.5",
+    )
+    assert result == "99"
+
+
 def test_replenish_pool_noop_when_deficit_zero(tmp_path):
     run_config = _run_config()  # 3 nodes
     state = WatcherState()
@@ -1519,6 +1748,160 @@ def test_replenish_pool_appends_idle_node_and_reassigns_shards(tmp_path):
         (tmp_path / "runs" / "state" / "jobs_registry.json").read_text()
     )
     assert any(r["nodelist"] == "node004" for r in registry)
+
+
+def test_awaiting_checkpoints_merges_below_quorum_k_when_relaxed(tmp_path):
+    """Task 12 (design §5.2): a genuinely unreplaceable missing node relaxes
+    the quorum floor below quorum_k rather than halting the run DEGRADED --
+    clamped no lower than 60% of target_pool_size."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    old_mtime = 1000.0
+    for node in ("node001", "node002", "node004"):
+        path = pending_dir / f"RUN1_0_{node}.pt"
+        path.write_text("x")
+        os.utime(path, (old_mtime, old_mtime))
+
+    nodes = ["node001", "node002", "node003", "node004", "node005"]
+    run_config = _run_config(nodes=nodes, n_shards=len(nodes), quorum_k=4, grace_s=0.0)
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": run_config.experiment,
+                    "nodes": list(nodes),
+                    "n_shards": run_config.n_shards,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                    "quorum_k": 4,
+                    "grace_s": 0.0,
+                }
+            ]
+        )
+    )
+
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.status = "AWAITING_CHECKPOINTS"
+    run.round_started_at = 1000.0
+    run.target_pool_size = 5
+    exclude_node(state, "node005", "crash-loop: missed 2 consecutive rounds of RUN1")
+    run.missed_rounds["node003"] = 1  # this tick's miss is the 2nd
+
+    no_idle_sinfo = MagicMock(returncode=0, stdout="")  # nothing idle anywhere
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=no_idle_sinfo
+    ):
+        action = advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1010.0,
+            run_configs_path=run_configs_path,
+        )
+
+    assert state.run("RUN1").status == "MERGING"
+    assert run.quorum_relaxed is True
+    assert run.any_round_quorum_relaxed is True
+    assert "node003" not in state.excluded_nodes  # suspended, not excluded
+    assert action is not None
+
+    on_disk = json.loads(run_configs_path.read_text())
+    assert on_disk[0]["quorum_k"] == 4  # never persisted (design §5.2)
+
+
+def test_redistribute_shards_runs_even_with_no_replacement(tmp_path):
+    """Task 10: shard redistribution is unconditional -- a suspended
+    exclusion (no idle replacement) must not leave a dead node's shards
+    orphaned in shard_assignments."""
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config()
+    _seed_placement(
+        mesh_shared,
+        {"node001": ["s1"], "node002": ["s2", "s3"], "node003": ["s3"]},
+    )
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
+    assignments_path.write_text(
+        json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]})
+    )
+
+    note = redistribute_shards(run_config, mesh_shared, "node003", picked=[])
+
+    assert note is not None and "reassigned" in note
+    assignments = json.loads(assignments_path.read_text())
+    assert "node003" not in assignments or not assignments["node003"]
+
+
+def test_exclusion_suspended_when_no_idle_replacement(tmp_path):
+    """Task 10 (design §5.1): a tier with zero slack must not exclude a
+    node that missed its round -- there is nowhere to send its shards, so
+    exclusion is suspended (the miss still counts, so a later miss excludes
+    it once a replacement exists).
+
+    Slack is already exhausted here (node004 was excluded earlier and
+    target_pool_size=4 with 3 nodes left eligible, deficit=1) -- a fresh
+    exclusion of node003 on top of that would need a replacement, and
+    sinfo reports nothing idle anywhere.
+    """
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    old_mtime = 1000.0
+    for node in ("node001", "node002"):
+        path = pending_dir / f"RUN1_0_{node}.pt"
+        path.write_text("x")
+        os.utime(path, (old_mtime, old_mtime))
+
+    nodes = [*_NODES, "node004"]
+    run_config = _run_config(nodes=nodes, n_shards=len(nodes))
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": run_config.experiment,
+                    "nodes": list(nodes),
+                    "n_shards": run_config.n_shards,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.status = "AWAITING_CHECKPOINTS"
+    run.target_pool_size = 4
+    exclude_node(state, "node004", "crash-loop: missed 2 consecutive rounds of RUN1")
+    run.missed_rounds["node003"] = 1  # this tick's miss is the 2nd
+
+    no_idle_sinfo = MagicMock(returncode=0, stdout="")  # nothing idle anywhere
+    now = old_mtime + 4000.0  # past ROUND_TIMEOUT_S
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=no_idle_sinfo
+    ):
+        action = _do_awaiting_checkpoints(
+            run_config, run, state, mesh_shared, now, tmp_path, run_configs_path
+        )
+
+    assert "node003" not in state.excluded_nodes  # suspended, not excluded
+    assert run.missed_rounds["node003"] == 2  # counter still bumped
+    assert "MERGING" in action
 
 
 def test_replenish_pool_does_not_submit_a_replacement_with_no_shards_to_inherit(
