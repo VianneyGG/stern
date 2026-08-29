@@ -76,6 +76,16 @@ class RunState:
     # transitions to MERGING -- read once by _do_merging for this round's
     # metrics record, same lifecycle as timeout_forced/quorum_relaxed
     # (design §8).
+    # Last terminal note _relaunch_chunk_if_finished returned for this run.
+    # That function runs before advance_one_run dispatches, and a non-None
+    # return short-circuits the whole state machine for the tick -- so a
+    # condition that cannot clear itself (no node has a shard assignment)
+    # would otherwise re-report the identical note every 60s forever, pin
+    # the backoff at FAST_INTERVAL_S, and block the merge/timeout handlers
+    # that are the only things left that could make progress. Repeating the
+    # same note means nothing changed: report it once, then fall through.
+    # Defaulted, so a state file written before this field existed loads.
+    last_stall_note: str = ""
     round_misses_charged: int = 0
     round_exclusions_suspended: int = 0
     round_effective_quorum_k: int | None = None

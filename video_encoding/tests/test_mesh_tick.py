@@ -16,6 +16,7 @@ from video_encoding.watcher.mesh_tick import (
     _clean_stale_run_artifacts,
     _do_awaiting_checkpoints,
     _recover_pool,
+    _relaunch_chunk_if_finished,
     _replenish_pool,
     _submit_worker_job,
     advance_all_runs,
@@ -3781,3 +3782,197 @@ def test_merge_timeout_leaves_headroom_over_the_measured_durable_phase(tmp_path)
         )
 
     assert m.call_args.kwargs["timeout"] == MERGE_TIMEOUT_S
+
+
+def _shard_assignments_fixture(
+    tmp_path, assignments: dict, holdings: dict | None = None
+):
+    """mesh_shared with a live assignments file, optionally verified holdings."""
+    mesh_shared = tmp_path / "mesh_shared"
+    metadata = mesh_shared / "metadata"
+    metadata.mkdir(parents=True)
+    (metadata / "shard_assignments_RUN1.json").write_text(json.dumps(assignments))
+    if holdings is not None:
+        (metadata / "verified_holdings.json").write_text(json.dumps({"fish": holdings}))
+    return mesh_shared
+
+
+def _relaunch(run_config, run, state, tmp_path, mesh_shared):
+    """Drive _relaunch_chunk_if_finished with sbatch stubbed out."""
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 999\n")
+    with (
+        patch(
+            "video_encoding.watcher.mesh_tick.needs_worker_relaunch",
+            return_value=True,
+        ),
+        patch(
+            "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+        ) as mock_run,
+    ):
+        note = _relaunch_chunk_if_finished(
+            run_config, run, state, tmp_path, mesh_shared, now=1000.0
+        )
+    submitted = {
+        arg.removeprefix("--nodelist=")
+        for call in mock_run.call_args_list
+        for arg in call.args[0]
+        if arg.startswith("--nodelist=")
+    }
+    return note, submitted, mock_run
+
+
+def test_relaunch_chunk_repairs_node_missing_from_shard_assignments(tmp_path):
+    """Regression for the shard_assignments race (2026-08-29 birds handoff):
+    a node can still be in run_config.nodes (only excluded_nodes is checked)
+    while redistribute_shards has already deleted its entry. Submitting it
+    anyway crashes it on read_my_shards; skipping it silently leaves it in
+    eligible_nodes, stalling every round on a checkpoint no job will make.
+    It still physically holds its shards, so hand back the untrained ones."""
+    mesh_shared = _shard_assignments_fixture(
+        tmp_path,
+        # "node003" deleted by a concurrent redistribute_shards
+        {"node001": ["s0", "s1"], "node002": ["s2", "s3"]},
+        holdings={"node003": ["s4", "s5"], "node001": ["s0"]},
+    )
+    run_config = _run_config(chunk_rounds=5)
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.round = 5
+
+    note, submitted, _ = _relaunch(run_config, run, state, tmp_path, mesh_shared)
+
+    assert submitted == {"node001", "node002", "node003"}
+    assert "re-assigned shards to node003" in note
+    assert "node003" not in state.excluded_nodes
+    written = json.loads(
+        (mesh_shared / "metadata" / "shard_assignments_RUN1.json").read_text()
+    )
+    assert written["node003"] == ["s4", "s5"]
+
+
+def test_relaunch_chunk_never_reassigns_a_shard_someone_else_trains(tmp_path):
+    """Repair must not double-assign: node003 holds s0, but node001 is
+    already training it, so only its untrained holdings come back."""
+    mesh_shared = _shard_assignments_fixture(
+        tmp_path,
+        {"node001": ["s0", "s1"], "node002": ["s2"]},
+        holdings={"node003": ["s0", "s5"]},
+    )
+    run_config = _run_config(chunk_rounds=5)
+    state = WatcherState()
+    run = state.run("RUN1")
+
+    _relaunch(run_config, run, state, tmp_path, mesh_shared)
+
+    written = json.loads(
+        (mesh_shared / "metadata" / "shard_assignments_RUN1.json").read_text()
+    )
+    assert written["node003"] == ["s5"]
+    assert written["node001"] == ["s0", "s1"]
+
+
+def test_relaunch_chunk_excludes_a_node_with_no_shards_to_give(tmp_path):
+    """A node that holds nothing untrained cannot be repaired. Leaving it
+    unexcluded keeps it in eligible_nodes, so every round waits out the
+    grace period for a checkpoint no job exists to produce -- exclude it
+    instead, with the "of {run_id}" suffix clear_run_state/_recover_pool
+    both key off."""
+    mesh_shared = _shard_assignments_fixture(
+        tmp_path,
+        {"node001": ["s0"], "node002": ["s1"]},
+        holdings={"node003": ["s0"]},  # already trained by node001
+    )
+    run_config = _run_config(chunk_rounds=5)
+    state = WatcherState()
+    run = state.run("RUN1")
+
+    note, submitted, _ = _relaunch(run_config, run, state, tmp_path, mesh_shared)
+
+    assert submitted == {"node001", "node002"}
+    assert state.excluded_nodes["node003"].endswith("of RUN1")
+    assert "excluded node003" in note
+
+
+def test_relaunch_chunk_stalls_once_when_no_node_has_shards(tmp_path):
+    """The all-unassigned case cannot clear itself, and a non-None return
+    short-circuits the whole state machine. Report it once, then fall
+    through so the merge/timeout handlers still get their tick (and the
+    backoff is not pinned at FAST_INTERVAL_S forever)."""
+    mesh_shared = _shard_assignments_fixture(tmp_path, {}, holdings={})
+    run_config = _run_config(chunk_rounds=5)
+    state = WatcherState()
+    run = state.run("RUN1")
+
+    first, submitted, _ = _relaunch(run_config, run, state, tmp_path, mesh_shared)
+    # Every node was excluded by the first pass, so the second reports the
+    # *other* terminal condition once; from the third on it is silent.
+    second, _, _ = _relaunch(run_config, run, state, tmp_path, mesh_shared)
+    third, _, _ = _relaunch(run_config, run, state, tmp_path, mesh_shared)
+
+    assert submitted == set()
+    assert first is not None and "no node has shards to train" in first
+    assert second is not None and "every node is excluded" in second
+    assert third is None
+
+
+def test_relaunch_chunk_without_assignments_file_submits_every_node(tmp_path):
+    """No shard-tracking started for this run yet: a missing file gates
+    nothing, matching _recover_pool's own missing-file semantics."""
+    mesh_shared = tmp_path / "mesh_shared"
+    (mesh_shared / "metadata").mkdir(parents=True)
+    run_config = _run_config(chunk_rounds=5)
+    state = WatcherState()
+    run = state.run("RUN1")
+
+    note, submitted, _ = _relaunch(run_config, run, state, tmp_path, mesh_shared)
+
+    assert submitted == set(_NODES)
+    assert "relaunched 3/3" in note
+
+
+def test_relaunch_chunk_skips_unassigned_when_holdings_unknown(tmp_path):
+    """verified_holdings.json missing: we can neither hand these nodes
+    shards nor honestly call them unusable, and excluding a whole roster
+    on a missing file needs a human to undo. Skip and say why."""
+    mesh_shared = _shard_assignments_fixture(
+        tmp_path, {"node001": ["s0"], "node002": ["s1"]}
+    )
+    run_config = _run_config(chunk_rounds=5)
+    state = WatcherState()
+    run = state.run("RUN1")
+
+    note, submitted, _ = _relaunch(run_config, run, state, tmp_path, mesh_shared)
+
+    assert submitted == {"node001", "node002"}
+    assert state.excluded_nodes == {}
+    assert "verified_holdings.json missing" in note
+
+
+def test_relaunch_chunk_freezes_each_job_shard_list_at_submission(tmp_path):
+    """The live assignments file is rewritten on every exclusion, but a
+    worker reads it once, at process start -- minutes to hours after
+    sbatch, since the job sits PENDING. Point each job at an immutable
+    per-node snapshot so a later redistribute_shards cannot invalidate a
+    submission already in flight (job 2708, `node045`, 2026-08-29)."""
+    mesh_shared = _shard_assignments_fixture(
+        tmp_path, {"node001": ["s0"], "node002": ["s1"], "node003": ["s2"]}
+    )
+    run_config = _run_config(chunk_rounds=5)
+    state = WatcherState()
+    run = state.run("RUN1")
+
+    _, _, mock_run = _relaunch(run_config, run, state, tmp_path, mesh_shared)
+
+    snapshot = mesh_shared / "metadata" / "shard_assignments_RUN1__node001.json"
+    assert json.loads(snapshot.read_text()) == {"node001": ["s0"]}
+    exports = [
+        arg
+        for call in mock_run.call_args_list
+        for arg in call.args[0]
+        if arg.startswith("--export=")
+    ]
+    assert f"--export=ALL,MESH_ASSIGNMENTS={snapshot}" in exports
+    # The live file is what the snapshot was taken from; mutating it now
+    # must not change what an already-submitted job will read.
+    (mesh_shared / "metadata" / "shard_assignments_RUN1.json").write_text("{}")
+    assert json.loads(snapshot.read_text()) == {"node001": ["s0"]}

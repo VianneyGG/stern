@@ -216,11 +216,32 @@ def advance_all_runs(
     return actions
 
 
+def _stall(run: RunState, note: str) -> str | None:
+    """Report a terminal chunk-relaunch condition once, not every tick.
+
+    _relaunch_chunk_if_finished runs before advance_one_run dispatches and
+    a non-None return short-circuits the state machine, so a condition
+    that cannot clear itself would re-report forever: one log line per
+    cron tick, backoff pinned at FAST_INTERVAL_S (tick.py sets
+    action_taken from the note count), and the merge/timeout handlers --
+    the only things that could still make progress -- never reached. This
+    is the shape of the 2026-08-21 runaway that grew the watcher to 61 GB.
+
+    An identical note means nothing changed since last tick, so return
+    None and let the run's normal handlers have the tick.
+    """
+    if run.last_stall_note == note:
+        return None
+    run.last_stall_note = note
+    return note
+
+
 def _relaunch_chunk_if_finished(
     run_config: MeshRunConfig,
     run: RunState,
     state: WatcherState,
     repo_root: Path,
+    mesh_shared: Path,
     now: float,
 ) -> str | None:
     """Submit the next chunk once every worker job for this run has exited.
@@ -253,7 +274,80 @@ def _relaunch_chunk_if_finished(
 
     nodes = [n for n in run_config.nodes if n not in state.excluded_nodes]
     if not nodes:
-        return f"{run_config.run_id}: chunk finished but every node is excluded"
+        return _stall(
+            run, f"{run_config.run_id}: chunk finished but every node is excluded"
+        )
+
+    # A node can still be in run_config.nodes (only excluded_nodes is
+    # checked above) while its shard_assignments entry has been deleted by
+    # a concurrent redistribute_shards. Submitting it anyway crashes it on
+    # read_my_shards; skipping it silently is no better, because nothing
+    # else ever restores the entry (redistribute_shards fires only on
+    # exclusion, _recover_pool only on an already-excluded node) and
+    # eligible_nodes still counts it, so every round waits out the full
+    # grace period for a checkpoint no job exists to produce.
+    #
+    # So repair rather than skip, exactly as _recover_pool does: a node
+    # that dropped out of assignments still physically holds its shards,
+    # and any of them nobody else is training can simply be handed back.
+    # Only a node that genuinely cannot be given work is excluded -- with
+    # the "of {run_id}" reason suffix, so clear_run_state cleans it at
+    # DONE and _recover_pool can readmit it later.
+    assignments_path = (
+        mesh_shared / "metadata" / f"shard_assignments_{run_config.run_id}.json"
+    )
+    assignments = (
+        json.loads(assignments_path.read_text()) if assignments_path.exists() else None
+    )
+    repaired: list[str] = []
+    starved: list[str] = []
+    unrepairable: list[str] = []
+    if assignments is not None:
+        unassigned = [n for n in nodes if not assignments.get(n)]
+        if unassigned:
+            try:
+                placement = _verified_holdings(mesh_shared)
+            except FileNotFoundError:
+                # The pool has never been validated (or the file vanished).
+                # We cannot tell what these nodes hold, so we can neither
+                # hand them shards nor honestly call them unusable --
+                # excluding a whole roster on a missing file is not
+                # recoverable without a human. Leave them and say so.
+                placement = None
+            if placement is None:
+                unrepairable = unassigned
+                nodes = [n for n in nodes if n not in unassigned]
+                if not nodes:
+                    return _stall(
+                        run,
+                        f"{run_config.run_id}: chunk finished but no node has a "
+                        f"shard_assignments entry and verified_holdings.json is "
+                        f"missing -- cannot repair ({', '.join(unassigned)})",
+                    )
+            else:
+                trained = {s for shards in assignments.values() for s in shards}
+                for node in unassigned:
+                    own = [s for s in placement.get(node, []) if s not in trained]
+                    if own:
+                        assignments[node] = own
+                        trained.update(own)
+                        repaired.append(node)
+                    else:
+                        starved.append(node)
+                        exclude_node(
+                            state,
+                            node,
+                            f"no shards left to assign, of {run_config.run_id}",
+                        )
+                if repaired:
+                    _write_json_atomic(assignments_path, assignments)
+                nodes = [n for n in nodes if n not in starved]
+                if not nodes:
+                    return _stall(
+                        run,
+                        f"{run_config.run_id}: chunk finished but no node has "
+                        f"shards to train -- excluded {', '.join(starved)}",
+                    )
 
     submitted_at = datetime.now(timezone.utc).isoformat()
     submitted = [
@@ -266,6 +360,8 @@ def _relaunch_chunk_if_finished(
             registry_path,
             submitted_at,
             start_round=run.round,
+            mesh_shared=mesh_shared,
+            shards=None if assignments is None else assignments.get(node),
         )
         is not None
     ]
@@ -276,6 +372,16 @@ def _relaunch_chunk_if_finished(
     )
     if failed:
         note += f"; sbatch FAILED for {', '.join(failed)}"
+    if repaired:
+        note += f"; re-assigned shards to {', '.join(repaired)}"
+    if starved:
+        note += f"; excluded {', '.join(starved)} (no shards left to assign)"
+    if unrepairable:
+        note += (
+            f"; skipped unassigned node(s) {', '.join(unrepairable)} "
+            "-- verified_holdings.json missing, cannot repair"
+        )
+    run.last_stall_note = ""
     return note
 
 
@@ -306,7 +412,9 @@ def advance_one_run(
     # Before dispatching: a chunked run whose workers have all exited needs
     # its next chunk submitted, and that is true in RUNNING and in
     # AWAITING_CHECKPOINTS alike, so it does not belong in either handler.
-    chunk_note = _relaunch_chunk_if_finished(run_config, run, state, repo_root, now)
+    chunk_note = _relaunch_chunk_if_finished(
+        run_config, run, state, repo_root, mesh_shared, now
+    )
     if chunk_note is not None:
         return chunk_note
     if run.status == "ASSIGNING":
@@ -359,16 +467,55 @@ def _submit_worker_job(
     *,
     start_round: int = 0,
     extra_overrides: list[str] = (),
+    mesh_shared: Path | None = None,
+    shards: list[str] | None = None,
 ) -> str | None:
     """Submits one sbatch job for `node`, appends its record to
     registry_path on success. Returns the parsed job id, or None if
     sbatch failed to run or its stdout didn't contain a job id --
     mirrors the existing per-node loop's own best-effort handling
-    (continue past a single node's submission failure)."""
+    (continue past a single node's submission failure).
+
+    `mesh_shared` + `shards` freeze this job's shard list at submission
+    time. shard_assignments_<run_id>.json is a live file that
+    redistribute_shards rewrites on every exclusion, but the worker only
+    reads it once, at process start (training/diloco/mesh_round.py) --
+    which on this cluster is minutes to hours after sbatch, since the job
+    sits PENDING until SLURM schedules it. Any exclusion cascade in that
+    window can delete this node's key and the job then dies on
+    read_my_shards (job 2708, `node045`, 2026-08-29). Reading the file
+    before submitting only narrows that window; it cannot close it. So
+    every caller that already knows the node's shard list writes it to a
+    per-node snapshot and points this job's MESH_ASSIGNMENTS at it,
+    making the submission immune to later mutation of the live file.
+
+    Callers that do NOT know the list yet pass neither argument and keep
+    the live-file behaviour -- _replenish_pool deliberately relies on it,
+    since it submits a replacement *before* redistribute_shards hands it
+    any shards.
+
+    The snapshot is per (run, node) rather than per job: a node only ever
+    has one worker in flight for a run (every submit path checks first),
+    so overwriting is safe and the file count stays bounded by the roster.
+    """
+    export = "ALL"
+    if mesh_shared is not None and shards is not None:
+        snapshot_path = (
+            mesh_shared
+            / "metadata"
+            / f"shard_assignments_{run_config.run_id}__{node}.json"
+        )
+        _write_json_atomic(snapshot_path, {node: list(shards)})
+        # ALL is sbatch's default; naming it keeps the rest of the
+        # submitter environment (PATH, MESH_ROOT, ...) propagating exactly
+        # as before while overriding this one variable. run_mesh_worker.sh
+        # defaults MESH_ASSIGNMENTS with `:-`, so an inherited value wins.
+        export = f"ALL,MESH_ASSIGNMENTS={snapshot_path}"
     cmd = [
         "sbatch",
         "--nodes=1",
         "--ntasks=1",
+        f"--export={export}",
         f"--nodelist={node}",
         "video_encoding/slurm/mesh_train.sbatch",
         run_config.experiment,
@@ -551,7 +698,15 @@ def _do_assigning(
     failed_submit = [
         node
         for node in eligible
-        if _submit_worker_job(run_config, node, repo_root, registry_path, submitted_at)
+        if _submit_worker_job(
+            run_config,
+            node,
+            repo_root,
+            registry_path,
+            submitted_at,
+            mesh_shared=mesh_shared,
+            shards=assignments[node],
+        )
         is None
     ]
 
@@ -982,6 +1137,8 @@ def _recover_pool(
             registry_path,
             submitted_at,
             start_round=run.round + 1,
+            mesh_shared=mesh_shared,
+            shards=own,
         )
         restored.append(node)
         regained += len(own)

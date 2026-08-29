@@ -28,7 +28,7 @@ def _job(job_id: str, run_id: str = "run-a", *, submitted_at: str = OLD) -> JobR
 
 
 def _live(*job_ids: str) -> dict[str, dict[str, str]]:
-    return {j: {"state": "RUNNING", "nodelist": "n"} for j in job_ids}
+    return {j: {"state": "RUNNING", "nodelist": f"node{j}"} for j in job_ids}
 
 
 def _call(**kw):
@@ -108,10 +108,23 @@ def test_an_unparseable_submitted_at_falls_back_to_the_snapshot():
 
 
 def test_a_job_caught_in_a_terminal_state_does_not_count_as_alive():
-    snapshot = {"1": {"state": "COMPLETING"}, "2": {"state": "CANCELLED"}}
+    snapshot = {
+        "1": {"state": "COMPLETING", "nodelist": "node1"},
+        "2": {"state": "CANCELLED", "nodelist": "node2"},
+    }
     # COMPLETING is still alive; CANCELLED is not -- one live job is enough.
     assert _call(snapshot=snapshot) is False
     assert _call(snapshot={"1": {"state": "FAILED"}, "2": {"state": "TIMEOUT"}}) is True
+
+
+def test_a_recycled_job_id_on_a_different_node_does_not_block_relaunch():
+    """The 2026-08-22 rebuild reset the job counter, so a registry record for
+    a job that already finished can collide with a live id that now belongs
+    to someone else's job on a different node -- that must not be mistaken
+    for this run's worker still being up."""
+    registry = [_job("42")]
+    snapshot = {"42": {"state": "RUNNING", "nodelist": "someone-elses-node"}}
+    assert _call(registry=registry, snapshot=snapshot) is True
 
 
 def _rec(job_id: str, node: str, run_tag: str = "run-a") -> JobRecord:

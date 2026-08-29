@@ -94,7 +94,17 @@ def needs_worker_relaunch(
         if submitted is not None and now - submitted < visibility_s:
             return False
         entry = snapshot.get(record.slurm_job_id)
-        if entry is not None and entry.get("state") not in _TERMINAL:
+        # Job ids are NOT unique over time here -- the 2026-08-22 cluster
+        # rebuild reset the counter to 1, so a registry record can collide
+        # with a live id that now belongs to someone else's job. The
+        # nodelist is what tells a genuine still-running worker apart from
+        # a stranger's job wearing a recycled id (same guard as
+        # `cancellable_job_ids` below).
+        if (
+            entry is not None
+            and entry.get("state") not in _TERMINAL
+            and entry.get("nodelist") == record.nodelist
+        ):
             return False
     return True
 
