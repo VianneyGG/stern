@@ -43,11 +43,14 @@ from torch.utils.data import DataLoader
 from video_encoding.data.mesh_shard_dataset import MeshShardIterableDataset
 from video_encoding.mesh.assignment import read_my_shards
 from video_encoding.mesh.shard_map import load_shard_map
+from video_encoding.models.levjepa.encoder import LeVJEPAEncoder
+from video_encoding.models.levjepa.projector import Projector
 from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
 from video_encoding.models.videomaev2.masking import build_masker
 from video_encoding.mesh.topology import NODE_SUBNETS
 from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.compile_utils import maybe_compile
+from video_encoding.training.loop_utils import WeightEMA
 from video_encoding.mesh.outer_step import pseudo_gradient, to_fp32_state_dict
 from video_encoding.mesh.pacing import steps_for_budget, update_rate_ema
 from video_encoding.mesh.pending_files import pending_filename
@@ -113,6 +116,7 @@ def _append_round_metrics(
     n_steps: int,
     abandoned: bool = False,
     consecutive_abandons: int = 0,
+    val_loss_ema: float | None = None,
 ) -> None:
     """Append one JSONL record to mesh_shared/metrics/<run_id>/<node>.jsonl.
 
@@ -144,6 +148,7 @@ def _append_round_metrics(
         # what keeps the quiet one countable.
         "abandoned": abandoned,
         "consecutive_abandons": consecutive_abandons,
+        "val_loss_ema": val_loss_ema,
         "ts": time.time(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
     }
@@ -287,6 +292,36 @@ def chunk_stop_round(rounds: int, start_round: int, chunk_rounds: int | None) ->
     return max(start_round, min(rounds, start_round + int(chunk_rounds)))
 
 
+class _LeVJEPAPretrainModule(torch.nn.Module):
+    """Wraps `LeVJEPAEncoder` + `Projector` as a single `nn.Module` so
+    `train_one_round`'s `model.parameters()`/`state_dict()`/DiLoCo-outer-step
+    calls keep working unmodified -- those all operate on whatever `model`
+    is, without caring that it's a VideoMAEForPreTraining instance."""
+
+    def __init__(self, model_cfg: DictConfig):
+        super().__init__()
+        self.encoder = LeVJEPAEncoder(model_cfg)
+        self.projector = Projector(
+            embed_dim=int(model_cfg.embed_dim),
+            hidden_dim=int(model_cfg.get("projector_hidden", 2048)),
+            output_dim=int(model_cfg.get("embed_dim_k", 256)),
+        )
+
+
+def _build_pretrain_model(cfg: DictConfig, *, device: torch.device) -> torch.nn.Module:
+    """Dispatch model construction on `cfg.model.encoder`.
+
+    A missing or `"videomae"` value builds `VideoMAEForPreTraining` exactly
+    as before this dispatch existed -- no config migration needed for
+    existing mesh runs. `"levjepa"` builds a `LeVJEPAEncoder` + `Projector`
+    pair instead.
+    """
+    encoder_kind = str(cfg.model.get("encoder", "videomae"))
+    if encoder_kind == "levjepa":
+        return _LeVJEPAPretrainModule(cfg.model).to(device)
+    return VideoMAEForPreTraining(cfg.model).to(device)
+
+
 def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     """Entry point called from pretrain.py's main() when MESH_RUN_ID is set.
 
@@ -393,7 +428,7 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     # other. Reseed from cfg.train.seed here, right before the first RNG
     # consumer, so two cold starts with the same cfg are reproducible.
     torch.manual_seed(int(cfg.train.get("seed", 42)))
-    model = VideoMAEForPreTraining(cfg.model).to(device)
+    model = _build_pretrain_model(cfg, device=device)
     # No DDP on this path (single-GPU worker, see module docstring), so
     # compile happens directly on the raw model -- no wrap_ddp ordering to
     # worry about. Compiled once here; surviving every later master.pt
@@ -421,6 +456,13 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         weight_decay=float(cfg.train.get("weight_decay", 0.0)),
     )
     masker = build_masker(cfg.model)
+
+    # Eval/checkpoint-only Polyak average of the weights (see WeightEMA
+    # docstring) -- never fed into the trained model or the pushed
+    # checkpoint DiLoCo's outer step merges. 0/absent disables it, matching
+    # every arm that doesn't set train.ema_decay.
+    ema_decay = float(cfg.train.get("ema_decay", 0.0) or 0.0)
+    ema = WeightEMA(ckpt_io.unwrap(model), decay=ema_decay) if ema_decay > 0 else None
 
     master_path = mesh_shared / "checkpoints" / run_id / "master.pt"
 
@@ -552,6 +594,7 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
                 if merge
                 else None
             ),
+            ema=ema,
         )
         if train_stats.get("abandoned"):
             # The pool merged this round without us. Drop the partial round
@@ -617,6 +660,18 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
 
         val_loss = evaluate_val_loss(model, val_dataset, device, masker, amp)
 
+        val_loss_ema: float | None = None
+        if ema is not None:
+            # Evaluate the EMA shadow by swapping it into the live model just
+            # for this pass, then restoring -- keeps a single model instance
+            # rather than a second full copy, and next round's training (and
+            # the checkpoint saved below) sees only the real trained weights.
+            core = ckpt_io.unwrap(model)
+            live_sd = {k: v.detach().clone() for k, v in core.state_dict().items()}
+            core.load_state_dict(ema.state_dict(), strict=False)
+            val_loss_ema = evaluate_val_loss(model, val_dataset, device, masker, amp)
+            core.load_state_dict(live_sd, strict=False)
+
         if train_stats["samples"] == 0:
             # A worker with no shards for this round produced an untrained
             # model -- pushing it would count toward merge quorum with
@@ -644,6 +699,7 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             # that took few steps from one that was assigned less data.
             payload["n_steps"] = train_stats["steps"]
             payload["val_loss"] = val_loss
+            payload["val_loss_ema"] = val_loss_ema
             payload["round"] = round_num
             payload["samples_per_s"] = train_stats["samples_per_s_per_gpu"]
             payload["outer_lr"] = outer_lr
@@ -709,6 +765,7 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             lr,
             n_samples=train_stats["samples"],
             n_steps=train_stats["steps"],
+            val_loss_ema=val_loss_ema,
         )
 
     return {
@@ -732,6 +789,7 @@ def train_one_round(
     round_num: int,
     micro_batch_size: int = _MESH_BATCH_SIZE,
     abandon_check: Callable[[], bool] | None = None,
+    ema: WeightEMA | None = None,
 ) -> dict:
     """Thin wrapper around _train_epoch_ssl for one mesh round.
 
@@ -754,6 +812,7 @@ def train_one_round(
         amp=amp,
         progress_desc=f"round {round_num}",
         abandon_check=abandon_check,
+        ema=ema,
     )
 
 

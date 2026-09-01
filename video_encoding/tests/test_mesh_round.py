@@ -447,6 +447,74 @@ def test_run_mesh_pretrain_stage_cold_start_has_no_master_checkpoint(
     assert math.isfinite(result["recon_loss"])
 
 
+def test_run_mesh_pretrain_stage_with_ema_decay_writes_val_loss_ema(
+    tmp_path, monkeypatch
+):
+    """train.ema_decay > 0 must not disturb the round loop, and the local
+    checkpoint payload's val_loss_ema must be a finite, real second eval --
+    not just a copy of val_loss."""
+    torch.manual_seed(0)
+    hostname = socket.gethostname().split(".", 1)[0]
+
+    mesh_root = tmp_path / "mesh_root"
+    shard_name = _write_shard(mesh_root, "clip0", n_frames=4)
+    # evaluate_val_loss reads mesh_root/val/*.tar directly (empty -> nan);
+    # seed one so val_loss/val_loss_ema are real numbers to compare.
+    _write_shard(mesh_root / "val", "clip0_val", n_frames=4)
+
+    mesh_shared = tmp_path / "mesh_shared"
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
+    assignments_path.parent.mkdir(parents=True)
+    assignments_path.write_text(json.dumps({hostname: [shard_name]}))
+
+    shard_map_path = mesh_shared / "metadata" / "shard_map.json"
+    shard_map_path.write_text(json.dumps({}))
+
+    checkpoint_root = tmp_path / "stern_checkpoints"
+
+    monkeypatch.setenv("MESH_RUN_ID", "run1")
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
+    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+
+    cfg = DictConfig(
+        {
+            "model": _tiny_cfg(),
+            "train": {
+                "amp": "off",
+                "accum_steps": 1,
+                "grad_clip": 0.0,
+                "weight_decay": 0.0,
+                "learning_rate": 1e-3,
+                "ema_decay": 0.9,
+            },
+            "preprocess": {"window": {"overlap": 0.0}},
+            "mesh": {
+                "rounds": 1,
+                "steps_per_round": 1,
+                "merge": False,
+                "outer_lr": 0.7,
+                "outer_momentum": 0.9,
+                "sync_timeout_s": 5.0,
+            },
+        }
+    )
+
+    result = run_mesh_pretrain_stage(cfg, device=torch.device("cpu"))
+    assert result["final_round"] == 0
+
+    payload = torch.load(
+        checkpoint_root / "run1.pt", map_location="cpu", weights_only=False
+    )
+    assert math.isfinite(payload["val_loss_ema"])
+    # A freshly-initialized shadow (decay=0.9) after exactly 1 optimizer step
+    # has moved only 10% of the way -- it should differ from the raw val_loss
+    # rather than accidentally aliasing it.
+    assert payload["val_loss_ema"] != payload["val_loss"]
+
+
 def test_round_loop_stops_at_boundary_when_stop_file_present(tmp_path, monkeypatch):
     hostname = socket.gethostname().split(".", 1)[0]
 
@@ -1877,3 +1945,40 @@ class TestMeshRoundLR:
     def test_single_round_run_still_warms_up_to_peak(self):
         """round(0.05 * 1) == 0; the max(1, ...) floor must keep it usable."""
         assert mesh_round_lr(3e-4, round_num=0, total_rounds=1) == pytest.approx(3e-4)
+
+
+def _minimal_mesh_cfg(encoder: str) -> DictConfig:
+    return _mask_cfg(encoder=encoder)
+
+
+def test_run_mesh_pretrain_stage_dispatches_on_model_encoder_field(monkeypatch):
+    """cfg.model.encoder == 'levjepa' must route model construction to
+    LeVJEPAEncoder/Projector, not VideoMAEForPreTraining -- verified by
+    spying on both constructors."""
+    import video_encoding.training.diloco.mesh_round as mod
+
+    calls = {"levjepa": 0, "videomae": 0}
+
+    class _StubLeVJEPAEncoder(torch.nn.Module):
+        def __init__(self, cfg):
+            super().__init__()
+            calls["levjepa"] += 1
+            self.dummy = torch.nn.Linear(1, 1)
+
+    class _StubVideoMAE(torch.nn.Module):
+        def __init__(self, cfg):
+            super().__init__()
+            calls["videomae"] += 1
+            self.dummy = torch.nn.Linear(1, 1)
+
+    monkeypatch.setattr(mod, "LeVJEPAEncoder", _StubLeVJEPAEncoder)
+    monkeypatch.setattr(mod, "VideoMAEForPreTraining", _StubVideoMAE)
+
+    cfg_levjepa = _minimal_mesh_cfg(encoder="levjepa")
+    mod._build_pretrain_model(cfg_levjepa, device=torch.device("cpu"))
+    assert calls == {"levjepa": 1, "videomae": 0}
+
+    calls["levjepa"] = calls["videomae"] = 0
+    cfg_videomae = _minimal_mesh_cfg(encoder="videomae")
+    mod._build_pretrain_model(cfg_videomae, device=torch.device("cpu"))
+    assert calls == {"levjepa": 0, "videomae": 1}

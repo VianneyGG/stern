@@ -12,7 +12,7 @@ import torch
 from omegaconf import OmegaConf
 from torch import nn
 
-from video_encoding.models import VideoMAEVARegressor
+from video_encoding.models import LinearVAHead, VideoMAEVARegressor
 
 
 class _StubBackbone(nn.Module):
@@ -31,7 +31,7 @@ def _cfg(embed_dim: int):
 
 
 def test_forward_returns_bounded_va_pairs():
-    model = VideoMAEVARegressor(_cfg(8), backbone=_StubBackbone(8))
+    model = VideoMAEVARegressor(_cfg(12), backbone=_StubBackbone(12))
     out = model(torch.randn(5, 3, 4, 8, 8))
 
     assert out.shape == (5, 2)
@@ -39,7 +39,59 @@ def test_forward_returns_bounded_va_pairs():
 
 
 def test_forward_raises_on_embed_dim_mismatch():
-    # backbone emits 16-d features but config claims 8 -> fail closed.
-    model = VideoMAEVARegressor(_cfg(8), backbone=_StubBackbone(16))
+    # backbone emits 16-d features but config claims 12 -> fail closed.
+    model = VideoMAEVARegressor(_cfg(12), backbone=_StubBackbone(16))
     with pytest.raises(ValueError, match="feature dim"):
         model(torch.randn(2, 3, 4, 8, 8))
+
+
+def test_linear_va_head_uses_multihead_cross_attention_and_learnable_query():
+    head = LinearVAHead(embed_dim=12, num_heads=12)
+    x = torch.randn(4, 6, 12)
+
+    out = head(x)
+
+    assert out.shape == (4, 2)
+    assert head.num_heads == 12
+    assert head.query.shape == (1, 12)
+
+
+def test_regressor_can_freeze_backbone_after_pretraining():
+    backbone = nn.Sequential(nn.Linear(3, 12))
+    model = VideoMAEVARegressor(_cfg(12), backbone=backbone)
+
+    model.freeze_backbone()
+
+    assert all(not p.requires_grad for p in model.backbone.parameters())
+
+
+def test_videomae_va_regressor_accepts_levjepa_encoder_as_backbone():
+    """Proves the design's drop-in claim: VideoMAEVARegressor needs zero code
+    changes to run on a LeVJEPAEncoder backbone, via the existing injectable
+    `backbone=` seam and _backbone_tokens's hasattr fallback."""
+    from omegaconf import OmegaConf
+
+    from video_encoding.models.levjepa.encoder import LeVJEPAEncoder
+
+    model_cfg = OmegaConf.create(
+        dict(
+            num_frames=4,
+            image_size=32,
+            in_channels=3,
+            patch_size=16,
+            embed_dim=12,
+            depth=2,
+            num_heads=2,
+            mlp_ratio=2.0,
+            dropout=0.0,
+            drop_path_rate=0.0,
+            drop_ratio=0.0,
+        )
+    )
+    backbone = LeVJEPAEncoder(model_cfg)
+    regressor = VideoMAEVARegressor(model_cfg, backbone=backbone)
+    regressor.freeze_backbone()
+    x = torch.randn(2, 3, 4, 32, 32)
+    out = regressor(x)
+    assert out.shape == (2, 2)
+    assert torch.all(out >= -1.0) and torch.all(out <= 1.0)

@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from video_encoding.models.ViT.rope import apply_rotary
+
 
 class SelfAttention(nn.Module):
     """Multi-head self-attention with an optional QK-norm (L2-normalising
@@ -49,12 +51,20 @@ class SelfAttention(nn.Module):
             )
 
     def forward(
-        self, x: torch.Tensor, need_weights: bool = False
+        self,
+        x: torch.Tensor,
+        need_weights: bool = False,
+        attn_mask: torch.Tensor | None = None,
+        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, N, D = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, N, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
+
+        if rotary is not None:
+            cos, sin = rotary
+            q, k = apply_rotary(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
 
         if self.qk_norm:
             # Fold the per-head scale into q: SDPA's `scale=` takes a float,
@@ -68,12 +78,22 @@ class SelfAttention(nn.Module):
         attn_weights = None
         if need_weights:
             logits = (q @ k.transpose(-2, -1)) * scale
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    logits = logits.masked_fill(~attn_mask, float("-inf"))
+                else:
+                    logits = logits + attn_mask
             attn_weights = logits.softmax(dim=-1)
             attn_drop = F.dropout(attn_weights, p=self.dropout, training=self.training)
             out = attn_drop @ v
         else:
             out = F.scaled_dot_product_attention(
-                q, k, v, dropout_p=self.dropout if self.training else 0.0, scale=scale
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                scale=scale,
             )
 
         out = out.transpose(1, 2).reshape(B, N, D)

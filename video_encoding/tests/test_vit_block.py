@@ -217,3 +217,35 @@ def test_layer_scale_changes_block_output():
         scaled_out = scaled_block(x)
 
     assert not torch.allclose(off_out, scaled_out)
+
+
+def test_vit_block_default_args_unchanged_by_new_parameters():
+    torch.manual_seed(0)
+    cfg = BlockConfig(embed_dim=16, num_heads=4)
+    block = ViTBlock(cfg)
+    block.eval()
+    x = torch.randn(2, 5, 16)
+    with torch.no_grad():
+        out_old = block(x)
+        out_new = block(x, attn_mask=None, rotary=None)
+    assert torch.equal(out_old, out_new)
+
+
+def test_vit_block_forwards_attn_mask_to_attention(monkeypatch):
+    """ViTBlock must pass attn_mask through unchanged rather than silently
+    dropping it -- verified by spying on SelfAttention.forward's call args."""
+    cfg = BlockConfig(embed_dim=16, num_heads=4)
+    block = ViTBlock(cfg)
+    seen = {}
+    original_forward = block.attn.forward
+
+    def spy(x, need_weights=False, attn_mask=None, rotary=None):
+        seen["attn_mask"] = attn_mask
+        return original_forward(
+            x, need_weights=need_weights, attn_mask=attn_mask, rotary=rotary
+        )
+
+    monkeypatch.setattr(block.attn, "forward", spy)
+    mask = torch.ones(1, 5, 5, dtype=torch.bool)
+    block(torch.randn(1, 5, 16), attn_mask=mask)
+    assert seen["attn_mask"] is mask

@@ -52,9 +52,16 @@ class ViTBlock(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         h = self.norm1(x)
-        attn_out, _ = self.attn(h, need_weights=False)
+        attn_out, _ = self.attn(
+            h, need_weights=False, attn_mask=attn_mask, rotary=rotary
+        )
         x = x + self.drop_path(self.layer_scale1(attn_out))
         x = x + self.drop_path(self.layer_scale2(self.mlp(self.norm2(x))))
         return x

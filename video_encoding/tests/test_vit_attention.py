@@ -115,3 +115,53 @@ def test_qk_norm_off_has_no_logit_scale_parameter():
 def test_rejects_embed_dim_not_divisible_by_num_heads():
     with pytest.raises(ValueError, match="not divisible"):
         SelfAttention(embed_dim=15, num_heads=4)
+
+
+def test_self_attention_default_args_unchanged_by_new_parameters():
+    """attn_mask=None, rotary=None (the new defaults) must reproduce exactly
+    today's output -- the regression guard for VideoMAEv2, which never
+    passes these arguments."""
+    torch.manual_seed(0)
+    attn = SelfAttention(embed_dim=16, num_heads=4)
+    x = torch.randn(2, 5, 16)
+    attn.eval()
+    with torch.no_grad():
+        out_old, _ = attn(x, need_weights=False)
+        out_new, _ = attn(x, need_weights=False, attn_mask=None, rotary=None)
+    assert torch.equal(out_old, out_new)
+
+
+def test_self_attention_attn_mask_blocks_masked_positions():
+    """A boolean mask that forbids token 0 from attending to token 1 must
+    zero out token 1's contribution to token 0's output -- verified by
+    comparing against a 2-token sequence where token 1 is replaced with
+    noise: token 0's output must be unaffected by that noise once masked."""
+    torch.manual_seed(0)
+    attn = SelfAttention(embed_dim=8, num_heads=2)
+    attn.eval()
+    x = torch.randn(1, 2, 8)
+    mask = torch.tensor([[[True, False], [True, True]]])  # token0 sees only itself
+    with torch.no_grad():
+        out_a, _ = attn(x, attn_mask=mask)
+        x_perturbed = x.clone()
+        x_perturbed[0, 1] = torch.randn(8)
+        out_b, _ = attn(x_perturbed, attn_mask=mask)
+    assert torch.allclose(out_a[0, 0], out_b[0, 0], atol=1e-5)
+
+
+def test_self_attention_rotary_changes_output_vs_no_rotary():
+    from video_encoding.models.ViT.rope import Rotary3D
+
+    torch.manual_seed(0)
+    embed_dim, num_heads = 24, 4
+    head_dim = embed_dim // num_heads
+    attn = SelfAttention(embed_dim=embed_dim, num_heads=num_heads)
+    attn.eval()
+    x = torch.randn(1, 3, embed_dim)
+    rope = Rotary3D(head_dim=head_dim)
+    coords = torch.tensor([[[0, 0, 0], [0, 0, 1], [1, 0, 0]]], dtype=torch.long)
+    cos, sin = rope(coords)
+    with torch.no_grad():
+        out_plain, _ = attn(x)
+        out_rotary, _ = attn(x, rotary=(cos, sin))
+    assert not torch.allclose(out_plain, out_rotary)
