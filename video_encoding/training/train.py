@@ -77,6 +77,7 @@ def run_train_stage(
         seed=int(cfg.train.seed),
         rank=rank,
         world_size=world_size,
+        num_workers=int(cfg.train.get("num_workers", 0)),
     )
 
     model = VideoMAEVARegressor(cfg.model).to(device)
@@ -303,6 +304,7 @@ def _split_loaders(
     seed: int,
     rank: int,
     world_size: int,
+    num_workers: int = 0,
 ) -> tuple[DataLoader, DataLoader | None]:
     """Deterministic 90/10 split; DistributedSampler on the train side when
     multi-node. `drop_last=True` on train because `ccc_loss` needs >1 sample
@@ -328,9 +330,17 @@ def _split_loaders(
         shuffle=(sampler is None),
         sampler=sampler,
         drop_last=True,
+        num_workers=num_workers,
+        pin_memory=True,
     )
     val_loader = (
-        DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
         if val_ds is not None
         else None
     )

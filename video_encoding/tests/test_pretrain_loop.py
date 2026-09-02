@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from video_encoding.models.videomaev2.masking import RandomTubeMasking
 from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
+from video_encoding.training.loop_utils import WeightEMA
 from video_encoding.training.pretrain import _train_epoch_ssl
 
 
@@ -225,3 +226,35 @@ def test_abandon_is_not_polled_mid_accumulation():
     )
     # Polled only on accumulation boundaries: steps 4, 8, ...
     assert seen_at == [4, 8]
+
+
+def test_ema_left_none_is_unchanged_behaviour():
+    stats = _run(_loader(n_samples=8, batch_size=2))
+    assert stats["steps"] == 4
+
+
+def test_ema_is_updated_at_each_optimizer_step_boundary():
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    model = VideoMAEForPreTraining(_tiny_cfg()).to(device)
+    ema = WeightEMA(model, decay=0.9)
+    initial_shadow = ema.state_dict()
+
+    _train_epoch_ssl(
+        model,
+        _loader(n_samples=8, batch_size=2),
+        torch.optim.AdamW(model.parameters(), lr=1e-2),
+        device,
+        RandomTubeMasking(mask_ratio=0.5),
+        accum_steps=2,
+        max_steps=4,
+        timing_warmup_steps=0,
+        amp="off",
+        ema=ema,
+    )
+
+    updated_shadow = ema.state_dict()
+    moved = any(
+        not torch.allclose(initial_shadow[k], updated_shadow[k]) for k in initial_shadow
+    )
+    assert moved

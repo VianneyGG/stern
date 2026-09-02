@@ -160,6 +160,151 @@ def save_state(path: Path, state: WatcherState) -> None:
     tmp.replace(path)
 
 
+_ROUND_DURATION_WINDOW = 5  # rolling-average window, in completed rounds
+_CHUNK_HISTORY_WINDOW = 5  # how many past chunks to report
+# A chunk relaunch submits every worker in the pool (16+ nodes) within one
+# tick, so their submitted_at timestamps land in a tight burst; a genuinely
+# new chunk (the *next* relaunch, once the old workers have died and the
+# watcher noticed) is tens of minutes to hours later. This only has to sit
+# between those two scales.
+_CHUNK_WAVE_GAP_S = 300.0
+
+
+def _chunk_wave_starts(registry, run_id: str) -> list[float]:
+    """Epoch start time of each submission wave (chunk) seen for `run_id`.
+
+    A chunk is one pool-wide relaunch, not one slurm job -- the registry has
+    one JobRecord per node, so this clusters those by submission burst
+    rather than reporting per-job-id data (a pool's chunk identity is the
+    run_id/wave, e.g. "e2b-a", not any individual node's slurm job id).
+    """
+    timestamps = sorted(
+        ts
+        for ts in (_submitted_at_epoch(r) for r in registry if r.run_tag == run_id)
+        if ts is not None
+    )
+    starts: list[float] = []
+    for ts in timestamps:
+        if not starts or ts - starts[-1] > _CHUNK_WAVE_GAP_S:
+            starts.append(ts)
+    return starts
+
+
+def _chunk_durations(registry, run_id: str) -> list[float]:
+    """Past chunks' durations: gap between one wave's start and the next's.
+
+    The final (still-running or most-recently-finished) wave has no next
+    start yet, so it contributes no entry -- only *completed* chunks have a
+    known duration.
+    """
+    starts = _chunk_wave_starts(registry, run_id)
+    durations = [b - a for a, b in zip(starts, starts[1:])]
+    return durations[-_CHUNK_HISTORY_WINDOW:]
+
+
+def _hours(seconds: float | None) -> float | None:
+    return round(seconds / 3600.0, 3) if seconds is not None else None
+
+
+def _round_pace(
+    results_dir: Path, run_id: str, now: float
+) -> tuple[float | None, list[float]]:
+    """(avg_round_duration_s, recent per-round durations) from `<run_id>_rounds.jsonl`.
+
+    Durations are gaps between consecutive merge timestamps (`ts`), so a
+    round skipped by a crashed merge just widens that one gap rather than
+    producing a bogus zero. None/[] when fewer than two rounds have merged
+    yet -- there is no duration to report.
+    """
+    path = results_dir / f"{run_id}_rounds.jsonl"
+    if not path.exists():
+        return None, []
+    timestamps: list[float] = []
+    with path.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            timestamps.append(json.loads(line)["ts"])
+    if len(timestamps) < 2:
+        return None, []
+    durations = [b - a for a, b in zip(timestamps, timestamps[1:])]
+    recent = durations[-_ROUND_DURATION_WINDOW:]
+    return sum(recent) / len(recent), recent
+
+
+def write_status_summary(
+    path: Path,
+    state: WatcherState,
+    run_configs: list,
+    *,
+    state_dir: Path,
+) -> None:
+    """Human-readable X/N round + status snapshot, one section per pool (run).
+
+    Written only by callers that already know something changed this tick
+    (a mesh_tick action fired) -- this is not a second poller, just a cheap
+    projection of state.runs taken at the same moment save_state is. Omits
+    per-node identity (slurm job id -> node -> health) on purpose: with
+    16-32 workers/run and dozens of runs ever tracked, that list was most of
+    this file's size, and it's the wrong granularity anyway -- a pool's
+    "job" is the run_id/chunk wave, not any one node's slurm job id;
+    squeue.json/jobs_registry.json already carry the per-node detail.
+    """
+    import time as _time
+
+    from video_encoding.watcher.registry import load_registry
+
+    registry = load_registry(state_dir / "jobs_registry.json")
+    results_dir = state_dir.parent / "results" / "mesh"
+    now = _time.time()
+
+    def _run_entry(rc) -> dict:
+        run = state.run(rc.run_id)
+        avg_round_s, recent_round_s = _round_pace(results_dir, rc.run_id, now)
+        rounds_remaining = max(rc.rounds - run.round, 0)
+        eta_s = avg_round_s * rounds_remaining if avg_round_s is not None else None
+        return {
+            "status": run.status,
+            "round": run.round,
+            "rounds": rc.rounds,
+            "quorum_relaxed": run.any_round_quorum_relaxed,
+            "missed_rounds": run.missed_rounds,
+            "readmitted": run.readmitted,
+            "round_misses_charged": run.round_misses_charged,
+            "round_exclusions_suspended": run.round_exclusions_suspended,
+            "round_effective_quorum_k": run.round_effective_quorum_k,
+            "avg_round_duration_h": _hours(avg_round_s),
+            "recent_round_durations_h": [_hours(d) for d in recent_round_s],
+            "eta_h": _hours(eta_s),
+            "eta_ts": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(now + eta_s))
+            if eta_s is not None
+            else None,
+            "past_chunk_durations_h": [
+                _hours(d) for d in _chunk_durations(registry, rc.run_id)
+            ],
+        }
+
+    payload = {
+        "updated_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(now)),
+        "excluded_nodes": state.excluded_nodes,
+        "runs": {rc.run_id: _run_entry(rc) for rc in run_configs},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(path)
+
+
+def _submitted_at_epoch(record) -> float | None:
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(record.submitted_at).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
 def clear_run_state(state: WatcherState, run_id: str) -> None:
     """Wipe run_id's crash-loop exclusions when it reaches DONE.
 

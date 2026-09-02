@@ -28,6 +28,7 @@ from omegaconf import DictConfig
 from torch import nn
 
 from video_encoding.models.ViT.block import BlockConfig, ViTBlock
+from video_encoding.models.ViT.init import apply_weight_init
 from video_encoding.models.ViT.patch_embed import TubeletEmbed
 from video_encoding.models.ViT.registers import RegisterTokens
 
@@ -41,6 +42,7 @@ class VideoMAEEncoder(nn.Module):
 
     def __init__(self, model_cfg: DictConfig):
         super().__init__()
+        self.model_cfg = model_cfg
         self.num_frames = int(model_cfg.num_frames)
         self.image_size = int(model_cfg.image_size)
         self.embed_dim = int(model_cfg.embed_dim)
@@ -102,20 +104,30 @@ class VideoMAEEncoder(nn.Module):
         # nn.MultiheadAttention's own default init (xavier_uniform_ on the raw
         # in_proj_weight Parameter, which self.apply() never reached since it
         # wasn't wrapped in an nn.Linear). SelfAttention's qkv/proj ARE plain
-        # nn.Linear, so they now get trunc_normal_(std=0.02) below like every
-        # other Linear -- a real, one-time shift in the fresh-init weight
-        # distribution. Harmless for checkpoint-resumed runs (checkpoint.py
-        # warns on any key mismatch); a fresh cold-start run's early loss
-        # curve will differ from a pre-rewrite baseline for this reason, not
-        # because of the block-internals ablation axes.
+        # nn.Linear, so they now get the configured init below. This keeps the
+        # default as trunc_normal(std=0.02) while enabling the paper's
+        # Cutting-the-Skip diagonal-dominant init as an explicit ablation axis.
         self.apply(self._init_weights)
 
-    @staticmethod
-    def _init_weights(module: nn.Module) -> None:
+    def _init_weights(self, module: nn.Module) -> None:
+        method = str(self.model_cfg.get("weight_init", "trunc_normal"))
+        alpha = float(self.model_cfg.get("weight_init_alpha", 0.1))
+        beta = float(self.model_cfg.get("weight_init_beta", 5.0))
+        c = float(self.model_cfg.get("weight_init_c", 0.5))
+        std = float(self.model_cfg.get("weight_init_std", 0.02))
+
         if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
+            if method == "cutting_skip":
+                apply_weight_init(
+                    module,
+                    method=method,
+                    alpha=alpha,
+                    beta=beta,
+                    c=c,
+                    std=std,
+                )
+            else:
+                apply_weight_init(module, method=method, std=std)
         elif isinstance(module, nn.LayerNorm):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)

@@ -61,7 +61,9 @@ def test_preprocess_window_shape_and_normalisation():
 
 
 def test_regressor_on_real_encoder_returns_bounded_va():
-    model = VideoMAEVARegressor(_tiny_cfg())
+    # embed_dim=48: divisible by both the encoder's num_heads=4 and the VA
+    # head's fixed num_heads=12.
+    model = VideoMAEVARegressor(_tiny_cfg(embed_dim=48))
     out = model(torch.randn(3, 3, 4, 16, 16))
 
     assert out.shape == (3, 2)

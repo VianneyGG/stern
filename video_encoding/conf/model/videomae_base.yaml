@@ -15,6 +15,11 @@ mlp_ratio: 4.0
 dropout: 0.0
 drop_path_rate: 0.0   # stochastic depth, linearly scaled across blocks; 0.0 = off
 # --- block-internals ablation axes (all optional; defaults reproduce today's architecture) ---
+weight_init: trunc_normal    # trunc_normal | normal | xavier_uniform | kaiming_uniform | cutting_skip
+weight_init_std: 0.02        # for Gaussian-like initialisations
+weight_init_alpha: 0.1       # Cutting-the-Skip mimetic logits: alpha * Z + beta * I
+weight_init_beta: 5.0        # paper recommended diagonal-dominant setting
+weight_init_c: 0.5           # V/O scaling constant used in the SVD-based value/output init
 norm_type: layernorm       # layernorm | rmsnorm | centerednorm
 mlp_type: gelu              # gelu | swiglu
 qk_norm: false               # L2-normalise Q/K before the attention softmax

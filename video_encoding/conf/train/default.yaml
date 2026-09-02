@@ -10,6 +10,7 @@ grad_clip: 1.0          # clip_grad_norm_ max-norm; 0.0 disables. Guards against
 resume: true            # resume from checkpoint_root/<experiment>/latest.pt (or best.pt) if present
 save_latest: true       # write a per-epoch snapshot for crash/preemption recovery
 accum_steps: 1          # micro-steps per optimizer step (drives DDP static_graph choice in wrap_ddp AND gated by _train_epoch's no_sync loop)
+num_workers: 8           # DataLoader workers; default 0 (serial decode) made a single VEATIC epoch exceed the 2h partition ceiling
 ddp:
   bucket_cap_mb: 25     # tuned for 1GbE fabric (T3: NCCL busBW saturates at ~0.115 GB/s)
   grad_compress: ""     # "" | "fp16" -- halves NCCL bytes at negligible convergence cost

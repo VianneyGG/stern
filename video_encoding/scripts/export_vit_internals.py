@@ -105,6 +105,25 @@ def load_sample_windows(
     return windows
 
 
+def model_cfg_for_run(base_cfg, run_id: str):
+    """`base_cfg` assumes one target_mode/decoder shape for every run_id, but
+    recipe2x2-style comparisons mix per_frame (predict_head width 1536) vs
+    time_avg (768) checkpoints, and legacy (decoder 256/8) vs paper (384/6)
+    recipes, in the same `--run-ids` list. Clone + override per-run from the
+    run_id string so `load_encoder`'s strict state_dict load matches shape,
+    same convention `diagnose_conditioning.py` uses."""
+    cfg = base_cfg.copy()
+    if "per_frame" in run_id:
+        cfg.target_mode = "per_frame"
+    # e2b-* arms all launched from videomae_mesh_paper_a_stride1_timeavg.yaml
+    # (EXPERIMENTS.md) -- the paper decoder shape, but the id doesn't say
+    # "paper" since it names the pool (fish/birds/cars/countries), not the recipe.
+    if "paper" in run_id or run_id.startswith("e2b-"):
+        cfg.decoder_embed_dim = 384
+        cfg.decoder_num_heads = 6
+    return cfg
+
+
 def load_encoder(run_id: str, mesh_shared: Path, model_cfg) -> VideoMAEEncoder:
     """Loads `run_id`'s merged checkpoint into a full `VideoMAEForPreTraining`
     and returns its `.encoder`. `run_id == "random_init"` skips loading
@@ -114,6 +133,7 @@ def load_encoder(run_id: str, mesh_shared: Path, model_cfg) -> VideoMAEEncoder:
     would mean plotting a random encoder's internals under a trained run's
     label.
     """
+    model_cfg = model_cfg_for_run(model_cfg, run_id)
     model = VideoMAEForPreTraining(model_cfg)
     if run_id == "random_init":
         return model.encoder.eval()

@@ -35,7 +35,7 @@ from video_encoding.watcher.mesh_tick import (
     sweep_orphaned_pending,
 )
 from video_encoding.watcher.squeue import refresh_squeue_snapshot
-from video_encoding.watcher.state import load_state, save_state
+from video_encoding.watcher.state import load_state, save_state, write_status_summary
 from video_encoding.watcher.tick import run_full_check
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -131,6 +131,13 @@ def main() -> int:
             _log(f"mesh advancement FAILED: {exc}")
             mesh_actions = []
         save_state(state_path, state)  # advance_all_runs may have mutated state
+        if mesh_actions:  # only rewrite the summary on a real transition/event
+            write_status_summary(
+                STATE_DIR / "mesh_status.json",
+                state,
+                run_configs,
+                state_dir=STATE_DIR,
+            )
         for action in mesh_actions:
             _log(f"mesh: {action}")
 

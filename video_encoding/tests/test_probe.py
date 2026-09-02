@@ -7,8 +7,8 @@ from video_encoding.training.train import _temporal_transform
 
 
 def test_linear_va_head_output_shape():
-    head = LinearVAHead(embed_dim=4)
-    x = torch.randn(5, 4)
+    head = LinearVAHead(embed_dim=12)
+    x = torch.randn(5, 12)
 
     out = head(x)
 
@@ -16,8 +16,8 @@ def test_linear_va_head_output_shape():
 
 
 def test_linear_va_head_output_bounded_by_tanh():
-    head = LinearVAHead(embed_dim=4)
-    x = torch.randn(20, 4) * 1000  # large magnitude to stress the bound
+    head = LinearVAHead(embed_dim=12)
+    x = torch.randn(20, 12) * 1000  # large magnitude to stress the bound
 
     out = head(x)
 
@@ -36,7 +36,7 @@ def test_ccc_loss_near_minimum_for_perfect_prediction():
 
 def test_ccc_loss_decreases_with_gradient_descent():
     torch.manual_seed(0)
-    embed_dim = 4
+    embed_dim = 12
     head = LinearVAHead(embed_dim=embed_dim)
     x = torch.randn(30, embed_dim)
     target = torch.tanh(torch.randn(30, 2))

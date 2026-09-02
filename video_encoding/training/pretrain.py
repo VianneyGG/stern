@@ -40,7 +40,7 @@ from video_encoding.training.ddp.ddp import (
     teardown_ddp,
     wrap_ddp,
 )
-from video_encoding.training.loop_utils import set_sampler_epoch
+from video_encoding.training.loop_utils import WeightEMA, set_sampler_epoch
 from video_encoding.training.tb_logger import make_writer, write_result_json
 
 
@@ -268,6 +268,7 @@ def _train_epoch_ssl(
     progress_desc: str | None = None,
     abandon_check: "Callable[[], bool] | None" = None,
     abandon_check_every: int = 50,
+    ema: "WeightEMA | None" = None,
 ) -> dict:
     """Train one epoch (or `max_steps` micro-steps) of SSL pretraining.
 
@@ -300,6 +301,9 @@ def _train_epoch_ssl(
     every numeric field in the returned dict is identical with or without it.
     Default `None` preserves the exact existing behavior/output for every
     call site that doesn't pass it.
+
+    `ema`: when set, `.update(model)` is called after every optimizer step
+    boundary. Never affects `model`'s own weights or the returned dict.
     """
     model.train()
     # Unwrap once. `model` may be bare (world_size=1 / mesh), DDP-wrapped, or
@@ -406,6 +410,8 @@ def _train_epoch_ssl(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            if ema is not None:
+                ema.update(model)
 
         # After the optimizer step, never mid-accumulation: breaking between
         # a backward and its boundary step would leave the accumulated grads
