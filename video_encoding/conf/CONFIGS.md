@@ -112,41 +112,57 @@ registry rewrite.
 | `videomae_va_finetune_afewva` | `va_finetune` | `afewva` | End-to-end from-scratch fine-tune, no freezing |
 | `videomae_va_finetune_veatic` | `va_finetune` | `veatic` | End-to-end from-scratch fine-tune, no freezing |
 
-## Training watcher (cron)
+## Training watcher (systemd --user timer)
 
 `scripts/cron/poll_squeue.sh` / `scripts/cron/aggregate_results.sh` were never
-installed and are superseded by a single script:
+installed. The watcher itself is a single script,
 `video_encoding/scripts/watch_training.py`
-(docs/superpowers/specs/2026-07-15-slurm-training-watcher-design.md). Install
-on login-node via `crontab -e`:
+(docs/superpowers/specs/2026-07-15-slurm-training-watcher-design.md), but as
+of 2026-08-12 it is no longer installed via cron — the cron spool was found
+wiped 5 separate times with no confirmed root cause. It now runs as a
+systemd `--user` timer, converged onto exactly one designated host via
+`video_encoding/scripts/install_watcher.sh`:
 
-    * * * * *  cd ~/stern && ~/.local/bin/uv run --no-sync python -m video_encoding.scripts.watch_training
+    video_encoding/scripts/install_watcher.sh <host>   # designate <host>, converge this machine
+    video_encoding/scripts/install_watcher.sh          # converge this machine against the existing designation
 
-Three gotchas this line must keep, all already learned the hard way elsewhere
-in this codebase (`mesh_tick.py`'s `_do_merging`, `run_mesh_worker.sh`,
-`launch_mesh_pool.sh`, `submit_login-node.sh`, and `watch_training.py`'s own
-module docstring) but previously missing from -- or wrong in -- this doc,
-causing the same class of failure to recur across three separate incidents
-(2026-07-27, 2026-07-29 x2):
-- cron's minimal PATH does not include `~/.local/bin`, so a bare `uv` here
-  resolves fine when installed interactively but fails with `uv: command not
-  found` on every cron tick (silently, into `.claude/state/cron_stderr.log`).
-  Always use the absolute/`~` path to the `uv` binary itself.
-- `-m video_encoding.scripts.watch_training` is required, NOT a direct file
-  path (`python video_encoding/scripts/watch_training.py`). Python sets
-  `sys.path[0]` to the *script's own directory* when given a file path, but
-  to the current directory (repo root) when given `-m` -- and this project
-  has no editable install of `video_encoding` to compensate. The file-path
-  form fails with `ModuleNotFoundError: No module named 'video_encoding'`
-  every single tick, identically whether run from cron or an interactive
-  shell -- this is a Python invocation bug, not a `uv`/cron/NFS issue, and
-  no amount of PATH or `--no-sync` fiddling touches it.
-- Separately, without `--no-sync`, every tick re-resolves/reinstalls the
-  9.4GB NFS-hosted venv from the lockfile -- wasted work against a venv
-  shared with concurrent worker/merge processes, though not itself the
-  source of the `ModuleNotFoundError` above (that persists even with
-  `--no-sync` if the file-path form is used).
+Designation lives in `runs/state/watcher_host` (shared NFS home) and is read
+by `watch_training.py` on every tick, so a host whose timer survives a
+decommission still refuses to touch shared state. `submit_login-node.sh` calls
+the no-arg form on every job submission, but only against `login-node` itself
+(its ssh heredoc runs there) — it converges login-node to `stop` when login-node
+isn't the designated host, and does **not** reach out to re-converge the
+designated host if that host's timer dies. There is currently no automated
+self-healing for the designated host's own timer going down (confirmed gap,
+2026-09-03) — if `systemctl --user status stern-watcher.timer` on the
+designated host shows anything other than `enabled`/`active (waiting)`,
+re-run `install_watcher.sh` there manually.
 
-State lives in `.claude/state/` (`jobs_registry.json`, `watcher_state.json`,
-`squeue.json`, `watcher.log`, `escalations/*.md`) — gitignored, inspect with
-`cat`/`jq` on login-node directly.
+Do not reinstall the old cron line from pre-2026-08-12 history — it will
+work briefly but gets no ongoing supervision and nothing will notice if it
+silently stops ticking again.
+
+State lives in `runs/state/` (`jobs_registry.json`, `watcher_state.json`,
+`squeue.json`, `watcher.log`, `watcher_systemd.log`, `watcher_host`,
+`escalations/*.md`) — gitignored, inspect with `cat`/`jq` directly.
+
+## Watcher self-check (cron)
+
+The watcher now runs as a systemd `--user` timer on one designated host
+(`runs/state/watcher_host`), converged via
+`video_encoding/scripts/install_watcher.sh`. Nothing re-converges that host's
+own timer if it goes down — a dead/restarted user manager is invisible to
+anything that itself depends on that same manager. `video_encoding/scripts/
+check_watcher_health.sh` closes that gap: it checks `systemctl --user is-active
+stern-watcher.timer` on the designated host and re-runs `install_watcher.sh` if
+it isn't active. It must run from system cron, not another systemd `--user`
+unit, to be an independent failure domain from the thing it's checking.
+Install on the designated host only (currently node089) via `crontab -e`:
+
+    */15 * * * * XDG_RUNTIME_DIR=/run/user/$(id -u) $HOME/stern/video_encoding/scripts/check_watcher_health.sh >> $HOME/stern/runs/state/watcher_health_cron.log 2>&1
+
+Requires `loginctl enable-linger $USER` (already on) so `XDG_RUNTIME_DIR`
+exists outside a login session. This is a mitigation, not a full fix — it
+narrows outage windows to ≤15 minutes instead of indefinite, and it does not
+itself have a supervisor; deliberately not adding one, since chaining another
+watched process just relocates the same single point of failure.

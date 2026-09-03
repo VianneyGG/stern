@@ -6,9 +6,21 @@ import torch
 from video_encoding.models.ViT.rope import Rotary3D, apply_rotary
 
 
-def test_rotary_rejects_head_dim_not_divisible_by_six():
+def test_rotary_rejects_odd_head_dim():
     with pytest.raises(ValueError):
-        Rotary3D(head_dim=10)
+        Rotary3D(head_dim=11)
+
+
+def test_rotary_accepts_head_dim_not_divisible_by_six():
+    """ViT-B geometry (embed_dim=768, num_heads=12) gives head_dim=64, which
+    is not divisible by 6 -- the axis split must tolerate uneven (but each
+    still even, for rotate-half pairing) group sizes."""
+    head_dim = 64
+    rope = Rotary3D(head_dim=head_dim)
+    coords = torch.randint(0, 8, (1, 3, 3), dtype=torch.long)
+    cos, sin = rope(coords)
+    assert cos.shape == (1, 3, head_dim)
+    assert sin.shape == (1, 3, head_dim)
 
 
 def test_rotary_zero_coords_is_identity_rotation():

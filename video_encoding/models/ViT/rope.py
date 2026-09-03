@@ -14,26 +14,33 @@ class Rotary3D(nn.Module):
 
     def __init__(self, head_dim: int, base: float = 10000.0):
         super().__init__()
-        if head_dim % 6 != 0:
+        if head_dim % 2 != 0 or head_dim < 6:
             raise ValueError(
-                f"head_dim {head_dim} must be divisible by 6 "
-                "(3 axes x 2D rotation each)"
+                f"head_dim {head_dim} must be even and >= 6 (3 axes x 2D rotation each)"
             )
         self.head_dim = head_dim
-        group_dim = head_dim // 3
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, group_dim, 2, dtype=torch.float32) / group_dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.group_dims = _balanced_even_split(head_dim, 3)
+        inv_freqs = [
+            1.0 / (base ** (torch.arange(0, gd, 2, dtype=torch.float32) / gd))
+            for gd in self.group_dims
+        ]
+        # Padded to a common length and stacked so a single buffer survives
+        # .to(device)/state_dict round-trips; sliced back per-axis in forward.
+        max_len = max(f.numel() for f in inv_freqs)
+        padded = torch.zeros(3, max_len)
+        for i, f in enumerate(inv_freqs):
+            padded[i, : f.numel()] = f
+        self.register_buffer("inv_freq", padded, persistent=False)
 
     def forward(self, coords: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # coords: (B, N, 3) long, columns (t, h, w)
         coords = coords.to(self.inv_freq.dtype)
         cos_parts = []
         sin_parts = []
-        for axis in range(3):
+        for axis, group_dim in enumerate(self.group_dims):
             pos = coords[..., axis]  # (B, N)
-            freqs = pos.unsqueeze(-1) * self.inv_freq  # (B, N, group_dim/2)
+            inv_freq = self.inv_freq[axis, : group_dim // 2]
+            freqs = pos.unsqueeze(-1) * inv_freq  # (B, N, group_dim/2)
             freqs = torch.cat([freqs, freqs], dim=-1)  # (B, N, group_dim)
             cos_parts.append(freqs.cos())
             sin_parts.append(freqs.sin())
@@ -42,16 +49,38 @@ class Rotary3D(nn.Module):
         return cos, sin
 
 
-def _rotate_half(x: torch.Tensor, num_groups: int = 3) -> torch.Tensor:
-    # x's last dim is 3 concatenated (t, h, w) groups; rotate-half must pair
-    # elements within each group, not across the whole head_dim.
+def _balanced_even_split(total: int, num_groups: int) -> list[int]:
+    """Split `total` into `num_groups` sizes as equal as possible, each even
+    (rotate-half pairs elements within a group, so odd groups would break).
+
+    e.g. (12, 3) -> [4, 4, 4]; (64, 3) -> [22, 22, 20].
+    """
+    base = (total // num_groups // 2) * 2
+    sizes = [base] * num_groups
+    remainder = total - base * num_groups
+    i = 0
+    while remainder > 0:
+        sizes[i] += 2
+        remainder -= 2
+        i += 1
+    return sizes
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    # x's last dim is 3 concatenated (t, h, w) groups, possibly uneven sizes
+    # (see _balanced_even_split); rotate-half must pair elements within each
+    # group, not across the whole head_dim.
     *lead, dim = x.shape
-    group_dim = dim // num_groups
-    x = x.reshape(*lead, num_groups, group_dim)
-    half = group_dim // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    rotated = torch.cat([-x2, x1], dim=-1)
-    return rotated.reshape(*lead, dim)
+    group_dims = _balanced_even_split(dim, 3)
+    parts = []
+    offset = 0
+    for group_dim in group_dims:
+        chunk = x[..., offset : offset + group_dim]
+        half = group_dim // 2
+        x1, x2 = chunk[..., :half], chunk[..., half:]
+        parts.append(torch.cat([-x2, x1], dim=-1))
+        offset += group_dim
+    return torch.cat(parts, dim=-1)
 
 
 def apply_rotary(

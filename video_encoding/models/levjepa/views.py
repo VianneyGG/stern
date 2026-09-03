@@ -28,15 +28,24 @@ def build_views(
     num_local: int = 4,
     global_size: int = 224,
     local_size: int = 96,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns `(global_view, local_views, crop_boxes)`.
+
+    `crop_boxes`: `(num_local, 4)`, fractional `(top, left, height, width)`
+    of the original frame each local view was cropped from -- consumed by
+    `LeVJEPAEncoder.forward(..., crop_box=...)` to place a local view's RoPE
+    coordinates correctly within the global view's grid frame.
+    """
     frames = _to_tchw_float(clip)  # (T, 3, H, W)
+    orig_h, orig_w = frames.shape[-2], frames.shape[-1]
 
     global_resized = TF.resize(frames, [global_size, global_size], antialias=True)
     global_view = _normalize(global_resized).permute(1, 0, 2, 3)  # (3, T, H, W)
 
     local_views = []
+    crop_boxes = []
     for _ in range(num_local):
-        top, left, height, width = _random_crop_box(frames.shape[-2], frames.shape[-1])
+        top, left, height, width = _random_crop_box(orig_h, orig_w)
         cropped = TF.resized_crop(
             frames, top, left, height, width, [local_size, local_size], antialias=True
         )
@@ -47,8 +56,15 @@ def build_views(
         cropped = TF.adjust_contrast(cropped, contrast)
         cropped = TF.adjust_saturation(cropped, saturation)
         local_views.append(_normalize(cropped).permute(1, 0, 2, 3))  # (3, T, H, W)
+        crop_boxes.append(
+            [top / orig_h, left / orig_w, height / orig_h, width / orig_w]
+        )
 
-    return global_view, torch.stack(local_views, dim=0)
+    return (
+        global_view,
+        torch.stack(local_views, dim=0),
+        torch.tensor(crop_boxes, dtype=torch.float32),
+    )
 
 
 def _random_crop_box(height: int, width: int) -> tuple[int, int, int, int]:

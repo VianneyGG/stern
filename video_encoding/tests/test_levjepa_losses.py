@@ -5,6 +5,7 @@ import torch
 from video_encoding.models.levjepa.losses import (
     invariance_loss,
     levjepa_loss,
+    sigreg_empirical_floor,
     sigreg_loss,
 )
 
@@ -22,6 +23,19 @@ def test_invariance_loss_positive_when_views_differ():
     z_locals = torch.randn(4, 3, 8)
     loss = invariance_loss(z_global, z_locals)
     assert loss.item() > 0
+
+
+def test_invariance_loss_excludes_global_self_comparison():
+    """The global view compared against itself is a guaranteed-zero term --
+    including it in the mean silently rescales the loss (and the effective
+    lam) by V/(V+1) instead of computing the intended per-local-view mean
+    squared distance to the global anchor."""
+    torch.manual_seed(0)
+    z_global = torch.randn(4, 8)
+    z_locals = torch.randn(4, 3, 8)
+    loss = invariance_loss(z_global, z_locals)
+    manual = (z_locals - z_global.unsqueeze(1)).pow(2).sum(dim=-1).mean()
+    assert torch.allclose(loss, manual, atol=1e-6)
 
 
 def test_sigreg_loss_low_for_true_gaussian_samples():
@@ -45,6 +59,28 @@ def test_sigreg_loss_high_for_collapsed_batch():
 def test_sigreg_loss_is_nonnegative():
     z = torch.randn(64, 8)
     assert sigreg_loss(z, num_directions=32).item() >= 0.0
+
+
+def test_sigreg_empirical_floor_is_nonnegative():
+    torch.manual_seed(0)
+    floor = sigreg_empirical_floor(
+        batch_size=64, dim=8, num_directions=32, num_trials=2
+    )
+    assert floor >= 0.0
+
+
+def test_sigreg_empirical_floor_shrinks_with_larger_batch():
+    """The floor is a finite-sample estimator bias -- it must trend toward
+    zero as the batch grows, confirming it is a sample-size artifact and not
+    a fixed offset baked into the metric."""
+    torch.manual_seed(0)
+    small = sigreg_empirical_floor(
+        batch_size=16, dim=8, num_directions=64, num_trials=4
+    )
+    large = sigreg_empirical_floor(
+        batch_size=1024, dim=8, num_directions=64, num_trials=4
+    )
+    assert large < small
 
 
 def test_levjepa_loss_combines_terms_with_fixed_lambda():

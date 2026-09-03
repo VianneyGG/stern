@@ -18,6 +18,7 @@ from unittest import mock
 
 import numpy as np
 import pytest
+import torch
 from omegaconf import OmegaConf
 from PIL import Image
 
@@ -72,6 +73,26 @@ def test_cache_dir_matches_cache_voxmini_frames_layout(tmp_path, monkeypatch):
     assert len(ds) == 1
     pixel_values = ds[0]
     assert pixel_values.shape == (3, 16, 224, 224)
+
+
+def test_raw_frames_mode_skips_normalisation(tmp_path, monkeypatch):
+    """LeVJEPA's build_views does its own uint8 normalisation/augmentation --
+    raw_frames=True must hand it back untouched (T, H, W, 3) uint8 instead
+    of the ImageNet-normalised (C, T, H, W) float preprocess_window emits."""
+    frames_root = tmp_path / "frames"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_frames(frames_root / "id00012/vid1/001", n=16)
+
+    monkeypatch.setenv("VOXMINI_FRAMES_ROOT", str(frames_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(
+        dataset, num_frames=16, image_size=224, overlap=0.0, raw_frames=True
+    )
+
+    frames = ds[0]
+    assert frames.shape == (16, 224, 224, 3)
+    assert frames.dtype == torch.uint8
 
 
 def test_multiple_windows_read_distinct_frame_ranges(tmp_path, monkeypatch):

@@ -34,6 +34,11 @@ class LeVJEPAEncoder(nn.Module):
 
         self.patch_size = model_cfg.patch_size
         self.drop_ratio = model_cfg.get("drop_ratio", 0.95)
+        # Reference grid granularity for RoPE coordinates: local-view crops
+        # are rescaled into this frame (see _patch_coords_for_crop) so a
+        # crop's positional encoding reflects where it came from in the full
+        # frame, not its own 0..grid-1 indices.
+        self.global_grid = model_cfg.image_size // self.patch_size
 
         self.tubelet_embed = TubeletEmbed(
             in_channels=in_channels,
@@ -88,18 +93,47 @@ class LeVJEPAEncoder(nn.Module):
             self._coord_cache[key] = coords
         return self._coord_cache[key]
 
+    def _patch_coords_for_crop(
+        self, T: int, H: int, W: int, crop_box: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
+        """Per-sample patch coordinates for a local-view crop, expressed in
+        the *global* view's patch-grid units.
+
+        `crop_box`: (B, 4) fractional (top, left, height, width) of the
+        original frame the crop was taken from. Each local patch's (h, w)
+        index is converted to a fractional position within the crop, then
+        mapped into `self.global_grid` units via the crop's offset/extent --
+        so a bottom-right crop reports coordinates near `global_grid - 1`,
+        not near 0.
+        """
+        base = self._patch_coords(T, H, W, device).float()  # (N, 3): t, h, w
+        grid_h = H // self.patch_size
+        grid_w = W // self.patch_size
+        t = base[:, 0].unsqueeze(0)  # (1, N)
+        h_frac = ((base[:, 1] + 0.5) / grid_h).unsqueeze(0)  # (1, N)
+        w_frac = ((base[:, 2] + 0.5) / grid_w).unsqueeze(0)  # (1, N)
+
+        top, left, height, width = crop_box.unbind(dim=-1)  # each (B,)
+        global_h = (top.unsqueeze(1) + h_frac * height.unsqueeze(1)) * self.global_grid
+        global_w = (left.unsqueeze(1) + w_frac * width.unsqueeze(1)) * self.global_grid
+        t = t.expand(crop_box.shape[0], -1)
+        return torch.stack([t, global_h, global_w], dim=-1)  # (B, N, 3)
+
     def _drop_tokens(
         self, tokens: torch.Tensor, coords: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # tokens: (B, N, D); coords: (N, 3), shared across the batch.
-        B, N, _ = tokens.shape
+        # tokens: (B, N, D); coords: (B, N, 3), per-sample.
+        B, N, D = tokens.shape
         if not self.training or self.drop_ratio <= 0:
-            return tokens, coords.unsqueeze(0).expand(B, N, 3)
+            return tokens, coords
         num_keep = max(1, int(round(N * (1 - self.drop_ratio))))
-        perm = torch.randperm(N, device=tokens.device)[:num_keep]
-        perm, _ = perm.sort()
-        kept_tokens = tokens[:, perm, :]
-        kept_coords = coords[perm].unsqueeze(0).expand(B, num_keep, 3)
+        # Independent random ranking per batch element -> each sample keeps
+        # its own subset, rather than one mask shared across the batch.
+        scores = torch.rand(B, N, device=tokens.device)
+        perm = scores.argsort(dim=1)[:, :num_keep]
+        perm, _ = perm.sort(dim=1)
+        kept_tokens = torch.gather(tokens, 1, perm.unsqueeze(-1).expand(-1, -1, D))
+        kept_coords = torch.gather(coords, 1, perm.unsqueeze(-1).expand(-1, -1, 3))
         return kept_tokens, kept_coords
 
     def _block_causal_mask(self, patch_t: torch.Tensor) -> torch.Tensor:
@@ -114,10 +148,23 @@ class LeVJEPAEncoder(nn.Module):
         mask[:, 1:, 0] = False  # no patch token attends to [cls]
         return mask.unsqueeze(1)  # (B, 1, total, total), broadcasts over heads
 
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pixel_values: torch.Tensor, crop_box: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """`crop_box`: (B, 4) fractional (top, left, height, width) of the
+        original frame this view was cropped from -- pass it when
+        `pixel_values` is a local view, so its RoPE coordinates land in the
+        global view's grid frame instead of the local view's own 0..grid-1
+        indices. Omit for the global view (identity crop)."""
         B, _, T, H, W = pixel_values.shape
         tokens = self.tubelet_embed(pixel_values)  # (B, N, D)
-        coords = self._patch_coords(T, H, W, pixel_values.device)
+        if crop_box is None:
+            coords = self._patch_coords(T, H, W, pixel_values.device)
+            coords = coords.unsqueeze(0).expand(B, -1, 3)
+        else:
+            coords = self._patch_coords_for_crop(
+                T, H, W, crop_box.to(pixel_values.device), pixel_values.device
+            )
         tokens, kept_coords = self._drop_tokens(tokens, coords)
 
         cls = self.cls_token.expand(B, -1, -1)
@@ -135,5 +182,7 @@ class LeVJEPAEncoder(nn.Module):
             x = block(x, attn_mask=attn_mask, rotary=(cos, sin))
         return self.final_norm(x)
 
-    def forward_cls(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        return self.forward(pixel_values)[:, 0]
+    def forward_cls(
+        self, pixel_values: torch.Tensor, crop_box: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return self.forward(pixel_values, crop_box=crop_box)[:, 0]

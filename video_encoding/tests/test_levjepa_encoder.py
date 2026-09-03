@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -74,6 +75,71 @@ def test_levjepa_encoder_forward_cls_matches_first_token():
     torch.manual_seed(0)
     cls_only = enc.forward_cls(x)
     assert torch.allclose(full[:, 0], cls_only, atol=1e-6)
+
+
+def test_levjepa_encoder_builds_with_vit_base_geometry():
+    """ViT-B (embed_dim=768, num_heads=12) gives head_dim=64, which broke the
+    old Rotary3D(head_dim % 6 == 0) requirement -- the config every real
+    training run uses must actually build."""
+    cfg = OmegaConf.create(
+        dict(
+            num_frames=2,
+            image_size=32,
+            in_channels=3,
+            patch_size=16,
+            embed_dim=768,
+            depth=1,
+            num_heads=12,
+            mlp_ratio=4.0,
+            dropout=0.0,
+            drop_path_rate=0.0,
+            drop_ratio=0.0,
+        )
+    )
+    enc = LeVJEPAEncoder(cfg)
+    out = enc(torch.randn(1, 3, 2, 32, 32))
+    assert out.shape[-1] == 768
+
+
+def test_levjepa_encoder_per_sample_token_dropping():
+    """Each batch element must keep a different random subset of tokens --
+    a shared drop mask across the batch would correlate every sample's
+    augmentation, weakening SIGReg's cross-sample independence assumption."""
+    torch.manual_seed(0)
+    cfg = _tiny_cfg(drop_ratio=0.5)
+    enc = LeVJEPAEncoder(cfg)
+    enc.train()
+    x = torch.randn(8, 3, 4, 32, 32)
+    coords = enc._patch_coords(4, 32, 32, x.device)
+    coords = coords.unsqueeze(0).expand(8, -1, 3)
+    tokens = torch.arange(8 * coords.shape[1]).float().view(8, coords.shape[1], 1)
+    _, kept_coords = enc._drop_tokens(tokens, coords)
+    # If every sample kept the same positions, all rows of kept h/w coords
+    # would be identical across the batch.
+    assert not torch.equal(kept_coords[0], kept_coords[1])
+
+
+def test_levjepa_encoder_local_crop_coords_map_into_global_grid_frame():
+    """A local crop's RoPE coordinates must be expressed in the *global*
+    view's patch-grid units (scaled+offset by the crop box), not the local
+    view's own 0..grid-1 indices -- otherwise every crop looks like it was
+    taken from the top-left corner at the wrong scale."""
+    cfg = _tiny_cfg(image_size=32, patch_size=16)  # global_grid=2
+    enc = LeVJEPAEncoder(cfg)
+    T, H, W = 1, 16, 16  # local view: 1x1 patch grid, single patch coord
+    device = torch.device("cpu")
+
+    top_left_box = torch.tensor([[0.0, 0.0, 0.5, 0.5]])
+    bottom_right_box = torch.tensor([[0.5, 0.5, 0.5, 0.5]])
+    coords_tl = enc._patch_coords_for_crop(T, H, W, top_left_box, device)
+    coords_br = enc._patch_coords_for_crop(T, H, W, bottom_right_box, device)
+
+    # global_grid=2, so a half-size crop's single patch center should land
+    # near grid coordinate 0.5 (top-left) vs 1.5 (bottom-right).
+    assert coords_tl[0, 0, 1].item() == pytest.approx(0.5)
+    assert coords_tl[0, 0, 2].item() == pytest.approx(0.5)
+    assert coords_br[0, 0, 1].item() == pytest.approx(1.5)
+    assert coords_br[0, 0, 2].item() == pytest.approx(1.5)
 
 
 def test_levjepa_encoder_block_causal_mask_blocks_future_frames():

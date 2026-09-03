@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -48,9 +49,11 @@ class SSLWindowDataset(Dataset):
         image_size: int,
         overlap: float,
         frame_stride: int = 1,
+        raw_frames: bool = False,
     ):
         self._num_frames = num_frames
         self._image_size = image_size
+        self._raw_frames = raw_frames
         self._ssl_dataset = ssl_dataset
         self._items: list[tuple[object, list[int] | str]] = []
 
@@ -124,6 +127,14 @@ class SSLWindowDataset(Dataset):
                 frames = decode_frames(clip_file, self._num_frames)
         except (ValueError, OSError) as exc:
             raise RuntimeError(f"Failed to load frames for item {i}") from exc
+
+        if self._raw_frames:
+            # LeVJEPA's build_views does its own uint8 normalisation and
+            # photometric augmentation -- handing it preprocess_window's
+            # already-ImageNet-normalised float tensor would double up
+            # (and its (C, T, H, W) layout doesn't match build_views's
+            # expected (T, H, W, 3) input either).
+            return torch.from_numpy(np.stack(frames))
 
         pixel_values = preprocess_window(frames, self._num_frames, self._image_size)
         return pixel_values.squeeze(0)

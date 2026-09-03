@@ -5,9 +5,10 @@ import torch
 
 
 def invariance_loss(z_global: torch.Tensor, z_locals: torch.Tensor) -> torch.Tensor:
-    # z_global: (B, K); z_locals: (B, V, K)
-    views = torch.cat([z_global.unsqueeze(1), z_locals], dim=1)  # (B, V+1, K)
-    diff = views - z_global.unsqueeze(1)
+    # z_global: (B, K); z_locals: (B, V, K). Compares each local view only
+    # against the global anchor -- the global-vs-itself term is a guaranteed
+    # zero and would otherwise dilute the mean by a V/(V+1) factor.
+    diff = z_locals - z_global.unsqueeze(1)
     return diff.pow(2).sum(dim=-1).mean()
 
 
@@ -38,6 +39,26 @@ def sigreg_loss(
 
     per_direction = torch.trapezoid(sq_error, t, dim=-1)  # (num_directions,)
     return per_direction.mean()
+
+
+def sigreg_empirical_floor(
+    batch_size: int,
+    dim: int,
+    num_directions: int = 1024,
+    num_trials: int = 8,
+) -> float:
+    """Mean `sigreg_loss` on true `N(0, I)` samples at a given batch size.
+
+    `sigreg_loss`'s real/imag characteristic-function terms are batch means,
+    so the loss has a finite-sample bias floor of order 1/batch_size even at
+    the true optimum -- this measures that floor so it can be compared
+    against the loss actually observed during training (a training loss near
+    this floor means the regularizer has converged, not stalled)."""
+    values = [
+        sigreg_loss(torch.randn(batch_size, dim), num_directions=num_directions).item()
+        for _ in range(num_trials)
+    ]
+    return sum(values) / len(values)
 
 
 def levjepa_loss(
