@@ -23,7 +23,7 @@ import hydra
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, IterableDataset
 
 from video_encoding.data.loaders import build_ssl_loader
 from video_encoding.data.ssl_windows import SSLWindowDataset
@@ -60,6 +60,7 @@ def run_pretrain_stage(
     world_size: int,
     local_rank: int,
     device: torch.device,
+    dataset: torch.utils.data.Dataset | None = None,
 ) -> dict:
     """Main pretraining loop (mirrors training/train.py structure).
 
@@ -69,6 +70,11 @@ def run_pretrain_stage(
         world_size: total ranks
         local_rank: rank on this node
         device: torch device
+        dataset: pre-built dataset to train on. When None (default), built
+            internally from cfg.dataset via build_ssl_loader/SSLWindowDataset,
+            unchanged from prior behavior. When supplied (e.g. a molab
+            notebook's StreamingShardDataset), that internal construction --
+            including the local manifest read -- is skipped entirely.
     """
     # Isolate each sweep cell under its run_tag: every cell shares the same
     # experiment.name, so without this they would clobber / cross-resume from
@@ -80,14 +86,15 @@ def run_pretrain_stage(
         checkpoint_root.mkdir(parents=True, exist_ok=True)
 
     # Build SSL loader (unlabelled, grouped by identity)
-    ssl_dataset_cfg = build_ssl_loader(cfg.dataset, cfg.preprocess.window)
-    dataset = SSLWindowDataset(
-        ssl_dataset_cfg,
-        num_frames=int(cfg.model.num_frames),
-        image_size=int(cfg.model.image_size),
-        overlap=float(cfg.preprocess.window.overlap),
-        frame_stride=int(cfg.preprocess.window.get("frame_stride", 1)),
-    )
+    if dataset is None:
+        ssl_dataset_cfg = build_ssl_loader(cfg.dataset, cfg.preprocess.window)
+        dataset = SSLWindowDataset(
+            ssl_dataset_cfg,
+            num_frames=int(cfg.model.num_frames),
+            image_size=int(cfg.model.image_size),
+            overlap=float(cfg.preprocess.window.overlap),
+            frame_stride=int(cfg.preprocess.window.get("frame_stride", 1)),
+        )
     train_loader = _make_ssl_loader(
         dataset,
         batch_size=int(cfg.train.batch_size),
@@ -583,7 +590,20 @@ def _make_ssl_loader(
     world_size: int,
     num_workers: int = 4,
 ) -> DataLoader:
-    """Create a distributed SSL data loader."""
+    """Create a distributed SSL data loader.
+
+    IterableDataset (e.g. a molab StreamingShardDataset) has no __len__, so
+    DistributedSampler can't wrap it; that path is single-node only (see
+    design doc non-goals), so no sampler is needed for it either.
+    """
+    if isinstance(dataset, IterableDataset):
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
     sampler = DistributedSampler(
         dataset,
         num_replicas=world_size,
