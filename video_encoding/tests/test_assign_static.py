@@ -69,9 +69,8 @@ def test_an_expected_shard_no_node_holds_raises_naming_it():
     """This is the 2026-08-20 incident as a unit test: node055 was assigned 19
     shards it did not hold. That must now be impossible to express."""
     holdings = {"node001": ["shard-a"]}
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(ValueError, match="shard-b"):
         assign_static(holdings, {"shard-a", "shard-b"})
-    assert "shard-b" in str(exc.value)
 
 
 def test_shards_held_but_not_expected_are_left_unassigned():

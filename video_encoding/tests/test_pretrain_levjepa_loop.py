@@ -9,6 +9,8 @@ from video_encoding.training.pretrain_levjepa import (
     run_levjepa_pretrain_stage,
 )
 
+pytestmark = pytest.mark.integration
+
 
 class _FakeRawDataset(torch.utils.data.Dataset):
     """Mimics SSLWindowDataset(raw_frames=True): (T, H, W, 3) uint8 per item."""

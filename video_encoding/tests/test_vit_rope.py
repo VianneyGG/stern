@@ -7,7 +7,7 @@ from video_encoding.models.ViT.rope import Rotary3D, apply_rotary
 
 
 def test_rotary_rejects_odd_head_dim():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="even"):
         Rotary3D(head_dim=11)
 
 

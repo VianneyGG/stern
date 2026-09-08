@@ -47,8 +47,52 @@ explicit = true
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.167.1",
+    "mutmut>=3.7.0",
     "pytest>=9.1.1",
+]
+
+[tool.mutmut]
+# Scoped to the pure, stateless modules (no I/O, no torch/GPU) so a full
+# mutation run stays cheap -- their existing test subset runs in ~13s.
+source_paths = [
+    "data/harmonise.py",
+    "eval/ccc.py",
+    "video_encoding/mesh/quorum.py",
+    "video_encoding/mesh/outer_step.py",
+]
+pytest_add_cli_args_test_selection = [
+    "data/tests/test_harmonise.py",
+    "data/tests/test_harmonise_properties.py",
+    "eval/tests/test_ccc.py",
+    "eval/tests/test_ccc_properties.py",
+    "video_encoding/tests/test_mesh_quorum.py",
+    "video_encoding/tests/test_mesh_quorum_properties.py",
+    "video_encoding/tests/test_mesh_outer_step.py",
+]
+also_copy = [
+    "data/__init__.py",
+    "data/tests",
+    "eval/__init__.py",
+    "eval/tests",
+    "video_encoding/__init__.py",
+    "video_encoding/mesh/__init__.py",
+    "video_encoding/tests",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# mutmut copies source/test files under mutants/ to mutate them in isolation;
+# without this, pytest collects both copies and errors on the duplicate
+# module path. Setting norecursedirs replaces pytest's default list (which
+# excludes hidden dirs via ".*"), so keep ".*" or nested .claude/worktrees/*
+# checkouts get collected and error on duplicate module basenames.
+norecursedirs = ["mutants", ".venv", ".*"]
+# Tiering: unit tests are the unmarked default (no marker registered for them
+# -- `-m unit` would select nothing, since pytest -m only matches an applied
+# marker). Fast loop: `pytest -m "not integration and not system"`. Before a
+# cluster deploy: `pytest -m system`.
+markers = [
+    "integration: exercises multiple real components together, external calls (subprocess/SLURM/ssh) typically mocked",
+    "system: spawns a real subprocess (CLI script, bash launcher) with no mocking of the external call itself",
+]

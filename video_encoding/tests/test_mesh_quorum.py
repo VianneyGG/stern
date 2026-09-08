@@ -50,14 +50,29 @@ def test_token_weights_sum_to_one():
 def test_token_weights_matches_the_quantity_times_quality_formula():
     """Pins the actual w_i = c_tokens * (c_tokens / c_steps) formula, not
     just the normalization invariant -- a bug that dropped the quality term
-    entirely (raw = c_tokens) would still sum to 1.0 and pass the test above."""
+    entirely (raw = c_tokens) would still sum to 1.0 and pass the test above.
+    Uses different c_steps for a and b (not just different c_tokens): with
+    a shared c_steps, w_i's ratio is coincidentally identical whether the
+    formula divides or multiplies by c_steps, so a swapped operator would
+    silently pass."""
     stats = {
-        "a": NodeStats(c_tokens=1000, c_steps=200),  # raw = 1000*5    = 5000
-        "b": NodeStats(c_tokens=500, c_steps=200),  # raw = 500*2.5   = 1250
+        "a": NodeStats(c_tokens=1000, c_steps=200),  # raw = 1000*5   = 5000
+        "b": NodeStats(c_tokens=500, c_steps=125),  # raw = 500*4     = 2000
     }
     weights = token_weights(stats)
-    assert math.isclose(weights["a"], 0.8)
-    assert math.isclose(weights["b"], 0.2)
+    assert math.isclose(weights["a"], 5000 / 7000)
+    assert math.isclose(weights["b"], 2000 / 7000)
+
+
+def test_token_weights_zero_c_tokens_exactly_is_still_weighted_out():
+    """c_tokens == 0 (the boundary, not just negative) must not slip through
+    the <= 0 guard and reach the c_tokens / c_steps division."""
+    stats = {
+        "a": NodeStats(c_tokens=1000, c_steps=200),
+        "b": NodeStats(c_tokens=0, c_steps=50),
+    }
+    weights = token_weights(stats)
+    assert weights["b"] == 0.0
 
 
 def test_token_weights_all_zero_raises():
@@ -65,5 +80,5 @@ def test_token_weights_all_zero_raises():
         "a": NodeStats(c_tokens=0, c_steps=0),
         "b": NodeStats(c_tokens=0, c_steps=0),
     }
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="zero"):
         token_weights(stats)

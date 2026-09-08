@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from video_encoding.watcher.shard_transfer import copy_shards
+
+pytestmark = pytest.mark.integration
 
 
 def _ok() -> MagicMock:

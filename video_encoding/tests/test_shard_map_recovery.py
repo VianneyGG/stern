@@ -5,6 +5,8 @@ import pytest
 from video_encoding.mesh.shard_map import Holder
 from video_encoding.mesh.shard_map_recovery import build_shard_map_from_holdings
 
+pytestmark = pytest.mark.integration
+
 
 def test_inverts_holdings_into_shard_map():
     holdings = {

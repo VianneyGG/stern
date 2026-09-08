@@ -63,7 +63,7 @@ def test_member_offsets_raises_keyerror_for_missing_clip(tmp_path):
         tmp_path, {"present": [np.zeros((2, 2, 3), dtype=np.uint8)]}
     )
 
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError, match="absent"):
         read_shard_frames_indexed(shard_path, "absent", [0], size=2)
 
 

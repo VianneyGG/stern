@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import zipfile
 
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -17,6 +18,8 @@ from video_encoding.training.checkpoint import (
     save,
     try_save,
 )
+
+pytestmark = pytest.mark.integration
 
 
 def _tiny_cfg(in_channels: int):
@@ -230,6 +233,47 @@ def test_load_does_not_warn_when_state_dicts_match(tmp_path, caplog):
         )
 
     assert len(caplog.records) == 0
+
+
+def test_load_with_completely_disjoint_state_dict_warns_and_leaves_model_untouched(
+    tmp_path, caplog
+):
+    """Pins current behavior for the extreme end of the key-mismatch guard:
+    a checkpoint sharing zero keys with the target (e.g. `expected_model_name`
+    collided across two unrelated architectures). `load_state_dict(strict=False)`
+    treats every key as missing/unexpected -- it warns but does not raise, and
+    the target model's own random-init params are left exactly as constructed.
+    If this ever changes to raise instead, update this test deliberately."""
+    target = VideoMAEEncoder(_tiny_cfg(in_channels=3))
+    before = {k: v.clone() for k, v in target.state_dict().items()}
+
+    path = tmp_path / "ckpt.pt"
+    save(
+        path,
+        {
+            "model_name": "videomae_encoder",
+            "model_state_dict": {"totally_unrelated_param": torch.zeros(3)},
+            "epoch": 0,
+        },
+    )
+
+    with caplog.at_level("WARNING"):
+        load(
+            path,
+            model=target,
+            optimizer=None,
+            scheduler=None,
+            device="cpu",
+            expected_model_name="videomae_encoder",
+            expected_optimizer_name=None,
+        )
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "totally_unrelated_param" in message
+    after = target.state_dict()
+    for key, value in before.items():
+        assert torch.equal(after[key], value), key
 
 
 class TestRemapLegacyAttentionKeys:

@@ -48,7 +48,7 @@ def test_build_ssl_loader_rejects_wrong_role():
 
 def test_build_ssl_loader_rejects_not_acquired():
     dataset_cfg = OmegaConf.create({"name": "voxmini", "role": "ssl", "present": False})
-    with pytest.raises(DatasetNotAcquiredError):
+    with pytest.raises(DatasetNotAcquiredError, match="present"):
         build_ssl_loader(dataset_cfg, _window_cfg())
 
 

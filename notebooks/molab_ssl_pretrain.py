@@ -263,13 +263,28 @@ def _(
 
                 def _pull_dir(remote_dir: str, local_dir) -> None:
                     for entry in _sftp.listdir_attr(remote_dir):
+                        if entry.filename.endswith(".tmp"):
+                            # A concurrent push writes here then
+                            # posix_renames it away almost immediately -- skip
+                            # it the same way push_checkpoints_periodically
+                            # does, instead of racing sftp.get() against that
+                            # rename.
+                            continue
                         remote_path = f"{remote_dir}/{entry.filename}"
                         local_path = local_dir / entry.filename
                         if _stat.S_ISDIR(entry.st_mode):
                             local_path.mkdir(parents=True, exist_ok=True)
                             _pull_dir(remote_path, local_path)
                         else:
-                            _sftp.get(remote_path, str(local_path))
+                            try:
+                                _sftp.get(remote_path, str(local_path))
+                            except FileNotFoundError:
+                                # Same race for non-.tmp names: renamed/removed
+                                # by a concurrent push between listdir_attr and
+                                # get(). Safe to skip -- push's atomic rename
+                                # means the real file exists under its real
+                                # name for the next pull attempt.
+                                continue
 
                 _pull_dir(_remote_root, _local_root)
             finally:
@@ -317,6 +332,28 @@ def _(
         system `rsync`/`ssh` binaries -- neither is guaranteed present in the
         molab sandbox image (design doc open question #1; confirmed missing
         rsync in practice)."""
+        # Re-running the training cell (e.g. after a resume, or after editing
+        # ssh_host to fix a bad hostname) redefines and re-invokes this
+        # function. globals() here is the actual module namespace (persists
+        # across cell re-execution within one kernel), so a live thread and
+        # the config it was started with are stashed there. If the config is
+        # unchanged, reuse the running thread. If it changed, the old thread
+        # is retired via a stop event rather than left as an unkillable
+        # zombie -- a bare `while True: sleep; push_once()` daemon thread has
+        # no way to be told to stop, so an earlier version of this guard
+        # (which only checked "is *a* thread alive") let a corrected hostname
+        # spawn a second thread while the first kept looping forever on the
+        # stale one, both printing "push failed" in parallel.
+        new_cfg = (host, username, remote_dir)
+        _existing = globals().get("_molab_push_thread")
+        _existing_cfg = globals().get("_molab_push_cfg")
+        _existing_stop = globals().get("_molab_push_stop")
+        if _existing is not None and _existing.is_alive():
+            if _existing_cfg == new_cfg:
+                return _existing
+            _existing_stop.set()
+            _existing.join(timeout=5.0)
+
         import paramiko
 
         # Per-line strip + blank-line drop, not just an overall .strip(): a
@@ -369,9 +406,10 @@ def _(
             finally:
                 client.close()
 
+        stop_event = threading.Event()
+
         def run_loop() -> None:
-            while True:
-                time.sleep(interval_s)
+            while not stop_event.wait(interval_s):
                 try:
                     push_once()
                 except Exception as exc:  # noqa: BLE001 -- must not crash training
@@ -379,6 +417,9 @@ def _(
 
         thread = threading.Thread(target=run_loop, daemon=True)
         thread.start()
+        globals()["_molab_push_thread"] = thread
+        globals()["_molab_push_cfg"] = new_cfg
+        globals()["_molab_push_stop"] = stop_event
         return thread
 
     return (push_checkpoints_periodically,)

@@ -69,13 +69,13 @@ def test_make_windows_drops_trailing_partial_window():
 
 def test_make_windows_rejects_overlap_out_of_bounds():
     frames = np.arange(50)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="overlap"):
         make_windows(frames, fps=50.0, len_s=1.0, overlap=1.0)
 
 
 def test_make_windows_rejects_negative_overlap():
     frames = np.arange(50)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="overlap"):
         make_windows(frames, fps=50.0, len_s=1.0, overlap=-0.1)
 
 
@@ -87,17 +87,17 @@ def test_make_windows_empty_frames_returns_empty_list():
 
 def test_make_windows_rejects_nonpositive_fps():
     frames = np.arange(50)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="fps"):
         make_windows(frames, fps=0.0, len_s=1.0, overlap=0.0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="fps"):
         make_windows(frames, fps=-10.0, len_s=1.0, overlap=0.0)
 
 
 def test_make_windows_rejects_nonpositive_len_s():
     frames = np.arange(50)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="len_s"):
         make_windows(frames, fps=50.0, len_s=0.0, overlap=0.0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="len_s"):
         make_windows(frames, fps=50.0, len_s=-1.0, overlap=0.0)
 
 

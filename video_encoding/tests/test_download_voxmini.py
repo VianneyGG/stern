@@ -10,12 +10,14 @@ from video_encoding.scripts.download_voxmini import (
     require_credentials,
 )
 
+pytestmark = pytest.mark.integration
+
 
 def test_require_credentials_raises_when_unset(monkeypatch):
     monkeypatch.delenv("VOXCELEB_USER", raising=False)
     monkeypatch.delenv("VOXCELEB_PASS", raising=False)
 
-    with pytest.raises(MissingCredentialsError):
+    with pytest.raises(MissingCredentialsError, match="must both be set"):
         require_credentials()
 
 
@@ -23,7 +25,7 @@ def test_require_credentials_raises_when_only_one_set(monkeypatch):
     monkeypatch.setenv("VOXCELEB_USER", "alice")
     monkeypatch.delenv("VOXCELEB_PASS", raising=False)
 
-    with pytest.raises(MissingCredentialsError):
+    with pytest.raises(MissingCredentialsError, match="must both be set"):
         require_credentials()
 
 

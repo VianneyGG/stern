@@ -99,14 +99,14 @@ def test_discretization_never_exceeds_floored_physical_capacity():
         NodeInfo(hostname="n1", group="fish", subnet="/254", free_gb=147.5),
     ]
 
-    with pytest.raises(InsufficientCapacityError):
+    with pytest.raises(InsufficientCapacityError, match="capacity"):
         plan_placement(nodes, SHARDS, dataset_gb=100.0, replication=2, min_free_gb=50.0)
 
 
 def test_fewer_nodes_than_replication_factor_raises():
     nodes = [NodeInfo(hostname="n0", group="fish", subnet="/254", free_gb=400.0)]
 
-    with pytest.raises(InsufficientCapacityError):
+    with pytest.raises(InsufficientCapacityError, match="replication"):
         plan_placement(nodes, SHARDS, dataset_gb=100.0, replication=2)
 
 

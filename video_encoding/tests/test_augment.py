@@ -56,7 +56,7 @@ def test_augmentation_actually_changes_pixels():
     params = GroupAugmentParams(crop_box=(3, 7, 27, 31), flip=True)
     frame = _gradient_frame(0)
     (out,) = apply_group_augment([frame], params, image_size=32)
-    assert not np.array_equal(out, frame)
+    np.testing.assert_array_equal(out, _reference(frame, params, 32))
 
 
 def test_flip_is_applied_when_set():

@@ -20,6 +20,8 @@ from PIL import Image
 
 from video_encoding.data.shard_stream import StreamingShardDataset, fetch_shard
 
+pytestmark = pytest.mark.integration
+
 
 def _make_shard(shard_path: Path, clips: dict[str, list[np.ndarray]]) -> None:
     with tarfile.open(shard_path, "w") as tar:
@@ -115,9 +117,73 @@ def test_fetch_shard_raises_on_truncated_transfer(tmp_path, monkeypatch):
             lambda *a, **k: _TruncatedResponse(),
         )
 
-        with pytest.raises(IOError):
+        with pytest.raises(IOError, match="truncated"):
             fetch_shard(
                 "shard-000000.tar", base_url=_base_url(server), cache_dir=cache_dir
+            )
+
+        assert not (cache_dir / "shard-000000.tar").exists()
+        assert list(cache_dir.glob(".*")) == []
+    finally:
+        server.shutdown()
+
+
+def test_fetch_shard_retries_transient_failure_then_succeeds(tmp_path, monkeypatch):
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _build_corpus(origin, num_shards=1)
+    server = _serve(origin)
+    try:
+        cache_dir = tmp_path / "cache"
+        real_get = __import__("requests").get
+        calls = {"n": 0}
+
+        def flaky_get(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionError("simulated tunnel reset")
+            return real_get(*a, **k)
+
+        monkeypatch.setattr("video_encoding.data.shard_stream.requests.get", flaky_get)
+        monkeypatch.setattr(
+            "video_encoding.data.shard_stream.time.sleep", lambda _s: None
+        )
+
+        dest = fetch_shard(
+            "shard-000000.tar", base_url=_base_url(server), cache_dir=cache_dir
+        )
+
+        assert calls["n"] == 2
+        assert dest.exists()
+        assert list(cache_dir.glob(".*")) == []
+    finally:
+        server.shutdown()
+
+
+def test_fetch_shard_raises_after_exhausting_retries(tmp_path, monkeypatch):
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _build_corpus(origin, num_shards=1)
+    server = _serve(origin)
+    try:
+        cache_dir = tmp_path / "cache"
+
+        def always_fails(*a, **k):
+            raise ConnectionError("simulated tunnel reset")
+
+        monkeypatch.setattr(
+            "video_encoding.data.shard_stream.requests.get", always_fails
+        )
+        monkeypatch.setattr(
+            "video_encoding.data.shard_stream.time.sleep", lambda _s: None
+        )
+
+        with pytest.raises(ConnectionError):
+            fetch_shard(
+                "shard-000000.tar",
+                base_url=_base_url(server),
+                cache_dir=cache_dir,
+                max_retries=3,
             )
 
         assert not (cache_dir / "shard-000000.tar").exists()

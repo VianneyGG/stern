@@ -16,6 +16,7 @@ from video_encoding.scripts.export_vit_internals import (
     load_encoder,
     load_sample_windows,
     make_log_bin_edges,
+    model_cfg_for_run,
     pca_rgb,
     received_attention_map,
     run_encoder_with_internals,
@@ -188,8 +189,20 @@ def test_load_encoder_raises_on_unprefixed_state_dict(tmp_path):
 
 def test_load_encoder_missing_checkpoint_raises_file_not_found(tmp_path):
     cfg = _tiny_model_cfg()
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(FileNotFoundError, match="master.pt"):
         load_encoder("no_such_run", tmp_path, cfg)
+
+
+@pytest.mark.integration
+def test_model_cfg_for_run_e2b2_prefix_sets_paper_decoder_and_registers():
+    """e2b2-* arms (EXPERIMENTS.md) launch from the same paper recipe as
+    e2b-* but additionally use RegisterTokens (num_registers=4); the prefix
+    check previously only matched "e2b-", silently leaving e2b2- runs on the
+    legacy decoder shape and zero registers."""
+    cfg = model_cfg_for_run(_tiny_model_cfg(), "e2b2-g-cars")
+    assert cfg.decoder_embed_dim == 384
+    assert cfg.decoder_num_heads == 6
+    assert cfg.num_registers == 4
 
 
 # --- instrumented forward: must match the real encoder exactly ----------

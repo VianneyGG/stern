@@ -18,7 +18,13 @@ def test_harmonise_va_rescales_zero_one_to_pm1():
 
 def test_harmonise_va_rejects_out_of_range_input():
     va = np.array([0.0, 1.5])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="fall outside"):
+        harmonise_va(va, source_range=(0.0, 1.0))
+
+
+def test_harmonise_va_rejects_input_below_the_source_range():
+    va = np.array([-0.5, 0.5])
+    with pytest.raises(ValueError, match="fall outside"):
         harmonise_va(va, source_range=(0.0, 1.0))
 
 
@@ -61,23 +67,49 @@ def test_harmonise_rate_handles_non_integer_ratio():
 
 def test_harmonise_rate_rejects_empty_signal():
     signal = np.array([])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="non-empty"):
         harmonise_rate(signal, source_hz=25.0, target_hz=10.0)
 
 
 def test_harmonise_va_rejects_invalid_source_range():
     va = np.array([0.0, 0.5])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="hi > lo"):
         harmonise_va(va, source_range=(1.0, 0.0))
+
+
+def test_harmonise_va_rejects_equal_hi_and_lo():
+    va = np.array([0.5])
+    with pytest.raises(ValueError, match="hi > lo"):
+        harmonise_va(va, source_range=(0.5, 0.5))
 
 
 def test_harmonise_va_rejects_nan():
     va = np.array([0.0, np.nan])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="finite"):
         harmonise_va(va, source_range=(0.0, 1.0))
 
 
 def test_harmonise_rate_rejects_zero_target_samples():
     signal = np.array([1.0, 2.0])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="zero target samples"):
         harmonise_rate(signal, source_hz=100.0, target_hz=1.0)
+
+
+def test_harmonise_rate_rejects_nonpositive_source_hz():
+    signal = np.array([1.0, 2.0])
+    with pytest.raises(ValueError, match="rates must be positive"):
+        harmonise_rate(signal, source_hz=0.0, target_hz=10.0)
+
+
+def test_harmonise_rate_accepts_a_sub_one_hz_rate():
+    # source_hz=0.5 is positive but < 1 -- must not be rejected as if it
+    # were <= 0.
+    signal = np.array([1.0, 2.0, 3.0, 4.0])
+    out = harmonise_rate(signal, source_hz=0.5, target_hz=0.5)
+    np.testing.assert_allclose(out, signal)
+
+
+def test_harmonise_rate_rejects_nonpositive_target_hz():
+    signal = np.array([1.0, 2.0])
+    with pytest.raises(ValueError, match="rates must be positive"):
+        harmonise_rate(signal, source_hz=10.0, target_hz=0.0)

@@ -59,6 +59,7 @@ from video_encoding.watcher.epoch_advance import (
 from video_encoding.watcher.chunk_relaunch import (
     cancellable_job_ids,
     needs_worker_relaunch,
+    stale_jobs_for_nodes,
 )
 from video_encoding.watcher.registry import (
     JobRecord,
@@ -349,6 +350,41 @@ def _relaunch_chunk_if_finished(
                         f"shards to train -- excluded {', '.join(starved)}",
                     )
 
+    # A worker that hit its 2h walltime instead of exiting at the chunk
+    # boundary self-requeues (mesh_train.sbatch's --requeue) under the same
+    # job id, still holding a claim on this same --exclusive node -- clear
+    # it before resubmitting or the new job loses the race and sits PD.
+    # Best-effort: a failed scancel must not block the relaunch itself.
+    stale_note = ""
+    stale_ids = stale_jobs_for_nodes(
+        run_id=run_config.run_id,
+        nodes=nodes,
+        registry=load_registry(registry_path),
+        snapshot=load_squeue_snapshot(snapshot_path),
+    )
+    if stale_ids:
+        try:
+            result = subprocess.run(
+                ["scancel", *stale_ids],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            stale_note = f"; cancel of {len(stale_ids)} self-requeued job(s) failed to run ({exc})"
+        else:
+            if result.returncode != 0:
+                stale_note = (
+                    f"; scancel of {len(stale_ids)} self-requeued job(s) exited "
+                    f"{result.returncode}: {result.stderr.strip()}"
+                )
+            else:
+                stale_note = (
+                    f"; cancelled {len(stale_ids)} self-requeued job(s): "
+                    f"{', '.join(stale_ids)}"
+                )
+
     submitted_at = datetime.now(timezone.utc).isoformat()
     submitted = [
         node
@@ -370,6 +406,7 @@ def _relaunch_chunk_if_finished(
         f"{run_config.run_id}: chunk done -- relaunched {len(submitted)}/"
         f"{len(nodes)} worker(s) from round {run.round}"
     )
+    note += stale_note
     if failed:
         note += f"; sbatch FAILED for {', '.join(failed)}"
     if repaired:
@@ -498,7 +535,10 @@ def _submit_worker_job(
     has one worker in flight for a run (every submit path checks first),
     so overwriting is safe and the file count stays bounded by the roster.
     """
-    export = "ALL"
+    # ALL is sbatch's default; naming it keeps the rest of the submitter
+    # environment (PATH, MESH_ROOT, ...) propagating exactly as before while
+    # overriding only the variables listed below.
+    exports: list[str] = []
     if mesh_shared is not None and shards is not None:
         snapshot_path = (
             mesh_shared
@@ -506,11 +546,24 @@ def _submit_worker_job(
             / f"shard_assignments_{run_config.run_id}__{node}.json"
         )
         _write_json_atomic(snapshot_path, {node: list(shards)})
-        # ALL is sbatch's default; naming it keeps the rest of the
-        # submitter environment (PATH, MESH_ROOT, ...) propagating exactly
-        # as before while overriding this one variable. run_mesh_worker.sh
-        # defaults MESH_ASSIGNMENTS with `:-`, so an inherited value wins.
-        export = f"ALL,MESH_ASSIGNMENTS={snapshot_path}"
+        # run_mesh_worker.sh defaults MESH_ASSIGNMENTS with `:-`, so an
+        # inherited value wins.
+        exports.append(f"MESH_ASSIGNMENTS={snapshot_path}")
+    if run_config.chunk_rounds is not None:
+        # Bounds run_mesh_worker.sh's own `scontrol requeue` self-chaining
+        # (mesh_continue_allowed.sh Layer 2) to this job's chunk. Without
+        # it that guard's env var is never set, so the worker keeps
+        # requeuing the SAME job id past the chunk boundary while this
+        # function's caller (_relaunch_chunk_if_finished) independently
+        # submits a NEW job id for the same --exclusive node once it
+        # decides the chunk is done -- two live chains racing for one
+        # node, the loser stuck PENDING and self-requeuing forever
+        # (observed 2026-09-07, lev-fix16c). SLURM_RESTART_COUNT is 0 on
+        # the initial (non-requeued) submission and increments once per
+        # requeue, so the check after training round `chunk_rounds` sees
+        # `chunk_rounds - 1`: that's the value that must trip the stop.
+        exports.append(f"MESH_MAX_REQUEUES={max(run_config.chunk_rounds - 1, 0)}")
+    export = "ALL," + ",".join(exports) if exports else "ALL"
     cmd = [
         "sbatch",
         "--nodes=1",
@@ -704,6 +757,7 @@ def _do_assigning(
             repo_root,
             registry_path,
             submitted_at,
+            start_round=run.round,
             mesh_shared=mesh_shared,
             shards=assignments[node],
         )

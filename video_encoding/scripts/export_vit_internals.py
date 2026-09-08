@@ -118,9 +118,13 @@ def model_cfg_for_run(base_cfg, run_id: str):
     # e2b-* arms all launched from videomae_mesh_paper_a_stride1_timeavg.yaml
     # (EXPERIMENTS.md) -- the paper decoder shape, but the id doesn't say
     # "paper" since it names the pool (fish/birds/cars/countries), not the recipe.
-    if "paper" in run_id or run_id.startswith("e2b-"):
+    if "paper" in run_id or run_id.startswith("e2b-") or run_id.startswith("e2b2-"):
         cfg.decoder_embed_dim = 384
         cfg.decoder_num_heads = 6
+    # e2b2-* arms additionally add RegisterTokens (Darcet et al. 2023) on top
+    # of the e2b-* paper recipe.
+    if run_id.startswith("e2b2-"):
+        cfg.num_registers = 4
     return cfg
 
 

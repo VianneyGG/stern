@@ -1,6 +1,9 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+.hypothesis/
+mutants/
+.mutmut-cache
 build/
 dist/
 wheels/

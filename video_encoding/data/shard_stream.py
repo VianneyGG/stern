@@ -19,6 +19,7 @@ import os
 import queue
 import random
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Iterator
@@ -40,6 +41,8 @@ def fetch_shard(
     base_url: str,
     cache_dir: Path,
     timeout: float = 30.0,
+    max_retries: int = 3,
+    retry_backoff_s: float = 1.0,
 ) -> Path:
     """Download `shard_name` from `base_url` into `cache_dir` if not
     already cached, verifying the transfer size against Content-Length
@@ -47,7 +50,13 @@ def fetch_shard(
     name before an atomic rename, so this is safe to call concurrently
     for *different* shard names (StreamingShardDataset never calls this
     for the same shard from two workers at once, since worker shard
-    assignment is disjoint)."""
+    assignment is disjoint).
+
+    Retries transient failures (connection resets, truncated transfers)
+    with linear backoff -- a free `trycloudflare.com` quick tunnel drops
+    connections under sustained large-file transfer load (observed: ~15%
+    of shards failing with 530s / IncompleteRead on a single-attempt
+    fetch), which was silently starving training of most of its data."""
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     dest = cache_dir / shard_name
@@ -59,20 +68,29 @@ def fetch_shard(
         / f".{shard_name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
     )
     try:
-        with requests.get(
-            f"{base_url.rstrip('/')}/{shard_name}", stream=True, timeout=timeout
-        ) as resp:
-            resp.raise_for_status()
-            expected = resp.headers.get("Content-Length")
-            written = 0
-            with open(tmp, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=1 << 20):
-                    fh.write(chunk)
-                    written += len(chunk)
-        if expected is not None and written != int(expected):
-            raise IOError(
-                f"fetch_shard: {shard_name} truncated: got {written} bytes, expected {expected}"
-            )
+        for attempt in range(1, max_retries + 1):
+            try:
+                with requests.get(
+                    f"{base_url.rstrip('/')}/{shard_name}",
+                    stream=True,
+                    timeout=timeout,
+                ) as resp:
+                    resp.raise_for_status()
+                    expected = resp.headers.get("Content-Length")
+                    written = 0
+                    with open(tmp, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=1 << 20):
+                            fh.write(chunk)
+                            written += len(chunk)
+                if expected is not None and written != int(expected):
+                    raise IOError(
+                        f"fetch_shard: {shard_name} truncated: got {written} bytes, expected {expected}"
+                    )
+                break
+            except (requests.exceptions.RequestException, IOError):
+                if attempt == max_retries:
+                    raise
+                time.sleep(retry_backoff_s * attempt)
         tmp.replace(dest)
     finally:
         tmp.unlink(missing_ok=True)

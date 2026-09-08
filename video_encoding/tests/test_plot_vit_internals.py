@@ -1,6 +1,7 @@
 import sys
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from video_encoding.scripts.plot_vit_internals import (
@@ -8,6 +9,8 @@ from video_encoding.scripts.plot_vit_internals import (
     plot_contact_sheet,
     plot_layer_diagnostics,
 )
+
+pytestmark = pytest.mark.integration
 
 
 def _fake_data(n_runs=2, n_windows=2, grid=4, img_size=8, depth=3, n_bins=5):
@@ -62,5 +65,5 @@ def test_main_reads_npz_and_writes_both_pngs(tmp_path, monkeypatch):
     )
     main()
 
-    assert (out_dir / "contact_sheet.png").exists()
-    assert (out_dir / "layer_diagnostics.png").exists()
+    assert (out_dir / "contact_sheet.png").exists() is True
+    assert (out_dir / "layer_diagnostics.png").exists() is True

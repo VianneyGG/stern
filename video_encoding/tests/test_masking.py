@@ -77,7 +77,7 @@ class TestRandomTubeMasking:
 
         # A spatial position is exclusively kept or exclusively masked.
         overlap = set(kept_spatial.tolist()) & set(masked_spatial.tolist())
-        assert not overlap, f"spatial positions in both kept and masked: {overlap}"
+        assert overlap == set(), f"spatial positions in both kept and masked: {overlap}"
 
         # Every kept spatial position must appear in all T' frames.
         for s in kept_spatial.tolist():
@@ -178,9 +178,9 @@ class TestRandomFrameMasking:
         TestFrameMaskingLeavesEnoughTemporalContext.
         """
         t, h, w = BASE_GRID
-        keep, _ = RandomFrameMasking(mask_ratio=0.9, min_visible_timesteps=2)._sample_one(
-            None, BASE_GRID, torch.device("cpu")
-        )
+        keep, _ = RandomFrameMasking(
+            mask_ratio=0.9, min_visible_timesteps=2
+        )._sample_one(None, BASE_GRID, torch.device("cpu"))
         visible_per_t = torch.zeros(t, dtype=torch.long)
         for i in keep.tolist():
             visible_per_t[i // (h * w)] += 1
@@ -206,7 +206,7 @@ class TestMixedTubeFrameMasking:
                 seen_tube = True
             else:
                 seen_frame = True
-        assert seen_tube and seen_frame
+        assert (seen_tube, seen_frame) == (True, True)
 
     def test_tube_draws_keep_tube_structure(self):
         """A mixed draw must be a *valid* draw of whichever regime it picked."""
@@ -240,9 +240,9 @@ class TestFrameMaskingLeavesEnoughTemporalContext:
         assert _visible_timesteps(keep, BASE_GRID) == 2
 
     def test_the_floor_is_configurable(self):
-        keep, _ = RandomFrameMasking(mask_ratio=0.9, min_visible_timesteps=3)._sample_one(
-            None, BASE_GRID, torch.device("cpu")
-        )
+        keep, _ = RandomFrameMasking(
+            mask_ratio=0.9, min_visible_timesteps=3
+        )._sample_one(None, BASE_GRID, torch.device("cpu"))
         assert _visible_timesteps(keep, BASE_GRID) == 3
 
     def test_the_floor_holds_at_mask_ratio_one(self):
@@ -254,9 +254,9 @@ class TestFrameMaskingLeavesEnoughTemporalContext:
         assert len(keep) > 0
 
     def test_a_floor_wider_than_the_grid_cannot_hide_everything(self):
-        keep, _ = RandomFrameMasking(mask_ratio=0.9, min_visible_timesteps=99)._sample_one(
-            None, BASE_GRID, torch.device("cpu")
-        )
+        keep, _ = RandomFrameMasking(
+            mask_ratio=0.9, min_visible_timesteps=99
+        )._sample_one(None, BASE_GRID, torch.device("cpu"))
         assert _visible_timesteps(keep, BASE_GRID) == BASE_GRID[0]
 
     def test_mixed_forwards_the_floor_to_its_frame_draws(self):
@@ -325,6 +325,7 @@ class TestPerSampleBatching:
         )
 
         n_sp = grid[1] * grid[2]
+
         # Spatial columns 0-1 of each 4-wide row are the left half.
         def _cols(row):
             return {int(i) % n_sp % grid[2] for i in mask[row]}

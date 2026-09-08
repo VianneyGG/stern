@@ -10,11 +10,15 @@ cluster smoke testing instead.
 
 from __future__ import annotations
 
+import pytest
+
 from video_encoding.data.mesh_shard_dataset import (
     MeshShardIterableDataset,
     evict_if_fetched,
     resolve_shard,
 )
+
+pytestmark = pytest.mark.integration
 
 SUBNET = "/254"
 
@@ -55,7 +59,7 @@ def test_evict_deletes_a_fetched_shard(tmp_path):
 
     evict_if_fetched(fetched, mesh_root)
 
-    assert not fetched.exists()
+    assert fetched.exists() is False
 
 
 def test_evict_never_deletes_a_seeded_shard(tmp_path):
@@ -66,7 +70,7 @@ def test_evict_never_deletes_a_seeded_shard(tmp_path):
 
     evict_if_fetched(seeded, mesh_root)
 
-    assert seeded.exists()
+    assert seeded.exists() is True
 
 
 def test_evict_is_idempotent_on_a_missing_file(tmp_path):

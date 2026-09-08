@@ -153,3 +153,41 @@ def cancellable_job_ids(
             continue
         ids.append(record.slurm_job_id)
     return ids
+
+
+def stale_jobs_for_nodes(
+    *,
+    run_id: str,
+    nodes: Sequence[str],
+    registry: Sequence[JobRecord],
+    snapshot: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """Job ids for `run_id` still occupying a node this chunk is about to resubmit.
+
+    mesh_train.sbatch carries `--requeue`: a worker that hits its 2h SLURM
+    walltime instead of exiting cleanly at the chunk boundary goes back to
+    PENDING under the *same* job id, still requesting the *same*
+    `--exclusive` node. squeue reports no `nodes` for a pending job, so
+    `cancellable_job_ids`'s live-nodelist match can't see it -- SLURM's own
+    requeue and this module's chunk relaunch then both try to claim the
+    node, and the requeued job loses and sits PD forever (observed
+    2026-09-07, lev-fix16c).
+
+    The record's OWN nodelist -- fixed at submission by `_submit_worker_job`,
+    unlike the live snapshot -- is what disambiguates here: a self-requeued
+    job is still filed under the node it was ever submitted for, so match on
+    that instead of squeue's current (possibly blank) nodes field. Only jobs
+    for nodes this call is about to resubmit are candidates, and only those
+    still present in the snapshot in a non-terminal state -- a record absent
+    from squeue has already exited and needs no scancel.
+    """
+    node_set = set(nodes)
+    ids: list[str] = []
+    for record in registry:
+        if record.run_tag != run_id or record.nodelist not in node_set:
+            continue
+        entry = snapshot.get(record.slurm_job_id)
+        if entry is None or entry.get("state") in _TERMINAL:
+            continue
+        ids.append(record.slurm_job_id)
+    return ids

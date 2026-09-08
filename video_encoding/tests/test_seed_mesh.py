@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from video_encoding.mesh.scoring import NodeInfo
 from video_encoding.mesh.shard_map import Holder
 from video_encoding.scripts.seed_mesh import (
@@ -15,6 +17,8 @@ from video_encoding.scripts.seed_mesh import (
     main,
     probe_nodes,
 )
+
+pytestmark = pytest.mark.integration
 
 
 def test_node_groups_cover_the_real_roster():
@@ -156,7 +160,7 @@ def test_remote_file_exists_returns_false_when_test_dash_f_fails():
         raise OSError("remote command failed")
 
     with patch("video_encoding.scripts.seed_mesh._run_ssh", fake_run_ssh):
-        assert not _remote_file_exists("node001", "/nonexistent/manifest.json")
+        assert _remote_file_exists("node001", "/nonexistent/manifest.json") is False
 
 
 def test_main_rejects_more_reachable_nodes_than_the_seeded_quota_allows(

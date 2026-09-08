@@ -1188,25 +1188,45 @@ def test_syncing_done_warns_when_any_round_relaxed_quorum(tmp_path):
 def test_syncing_flushes_final_tb_rounds_on_done(tmp_path):
     """No merge cycle follows DONE, so the round(s) write_mesh_round_scalars's
     straggler holdback left pending on the live run must be flushed here --
-    otherwise a finished run's TB curve is permanently short its last round(s)."""
+    otherwise a finished run's TB curve is permanently short its last round(s).
+
+    Runs flush_final_tb_rounds for real (no mock) and checks its actual
+    on-disk side effect -- tb_last_round.txt advancing to the newest round
+    -- rather than asserting on how it was called."""
     mesh_shared = tmp_path / "mesh_shared"
     run_config = _run_config(rounds=3)
     state = WatcherState()
     state.run("RUN1").status = "SYNCING"
     state.run("RUN1").round = 2  # entering the final round's sync
 
-    with patch("video_encoding.watcher.mesh_tick.flush_final_tb_rounds") as mock_flush:
-        advance_one_run(
-            run_config,
-            state=state,
-            repo_root=tmp_path,
-            mesh_shared=mesh_shared,
-            mesh_root=tmp_path,
-            now=1000.0,
-        )
+    metrics_path = mesh_shared / "metrics" / "RUN1" / "a.jsonl"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(metrics_path, "w") as f:
+        for round_num in (1, 2):
+            f.write(
+                json.dumps(
+                    {
+                        "round": round_num,
+                        "train_loss": 1.0,
+                        "val_loss": 1.0,
+                        "samp_s": 1.0,
+                    }
+                )
+                + "\n"
+            )
+
+    advance_one_run(
+        run_config,
+        state=state,
+        repo_root=tmp_path,
+        mesh_shared=mesh_shared,
+        mesh_root=tmp_path,
+        now=1000.0,
+    )
 
     expected_tb_dir = Path(os.environ["MESH_LOCAL_ROOT"]) / "RUN1" / "tb"
-    mock_flush.assert_called_once_with(expected_tb_dir, mesh_shared, "RUN1")
+    last_round_path = expected_tb_dir.parent / "tb_last_round.txt"
+    assert last_round_path.read_text().strip() == "2"
     assert state.run("RUN1").status == "DONE"
 
 
@@ -1837,9 +1857,9 @@ def test_redistribute_shards_runs_even_with_no_replacement(tmp_path):
 
     note = redistribute_shards(run_config, mesh_shared, "node003", picked=[])
 
-    assert note is not None and "reassigned" in note
+    assert "reassigned" in note
     assignments = json.loads(assignments_path.read_text())
-    assert "node003" not in assignments or not assignments["node003"]
+    assert assignments.get("node003", []) == []
 
 
 def test_exclusion_suspended_when_no_idle_replacement(tmp_path):
@@ -3010,6 +3030,11 @@ def test_replenish_pool_copies_orphaned_shards_to_the_replacement(tmp_path):
             "node003",
         )
 
+    # copy_shards is rsync over ssh -- a real external-I/O boundary that must
+    # stay mocked in a unit test, so checking its call args here is the same
+    # kind of boundary check as the subprocess.run() call-arg assertions
+    # elsewhere in this file, not a mock-only test: the assignments/result
+    # assertions below independently prove the return value was used right.
     mock_copy.assert_called_once_with("node003", "node004", ["s3"])
     assignments = json.loads(assignments_path.read_text())
     assert assignments["node004"] == ["s3"]
@@ -3362,6 +3387,85 @@ def test_recover_pool_is_throttled_between_probes(tmp_path):
     assert note is None
     assert mock_run.call_count == 0  # not even an sinfo probe
     assert "node003" in state.excluded_nodes
+
+
+@pytest.mark.integration
+def test_recover_pool_readmits_two_excluded_nodes_in_the_same_tick(tmp_path):
+    """_recover_pool's `for node in sorted(healthy)` loop calls
+    readmit_healthy_nodes once per node -- untested with more than one
+    recoverable node, so a shared-state bug between the loop's iterations
+    (e.g. one node's readmission consuming the other's assignment) would
+    not be caught by the single-node tests above."""
+    nodes = [*_NODES, "anisette"]
+    mesh_shared = tmp_path / "mesh_shared"
+    run_config = _run_config(nodes=nodes)
+    state = WatcherState()
+    run = state.run("RUN1")
+    run.target_pool_size = 4
+    run.round = 7
+    for node in ("node003", "anisette"):
+        run.missed_rounds[node] = 2
+        exclude_node(state, node, "crash-loop: missed 2 consecutive rounds of RUN1")
+    _seed_placement(
+        mesh_shared,
+        {
+            "node001": ["s1"],
+            "node002": ["s2"],
+            "node003": ["s3"],
+            "anisette": ["s4"],
+        },
+    )
+    assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
+    assignments_path.write_text(json.dumps({"node001": ["s1"], "node002": ["s2"]}))
+    run_configs_path = tmp_path / "mesh_run_configs.json"
+    run_configs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": nodes,
+                    "n_shards": 4,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+
+    responses = {
+        "sinfo": MagicMock(returncode=0, stdout="node003 idle\nanisette idle\n"),
+        "ssh": MagicMock(returncode=0, stdout="24423\n26\n"),
+        "sbatch": MagicMock(returncode=0, stdout="Submitted batch job 777\n"),
+    }
+
+    def _fake_run(cmd, *args, **kwargs):
+        return responses.get(cmd[0], responses["sbatch"])
+
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
+    ) as mock_run:
+        note = _recover_pool(
+            run_config,
+            run,
+            state,
+            mesh_shared,
+            tmp_path,
+            run_configs_path,
+            now=10_000.0,
+        )
+
+    assert "node003" not in state.excluded_nodes
+    assert "anisette" not in state.excluded_nodes
+    assignments = json.loads(assignments_path.read_text())
+    assert assignments["node003"] == ["s3"]
+    assert assignments["anisette"] == ["s4"]
+    submitted = [c for c in mock_run.call_args_list if c[0][0][0] == "sbatch"]
+    assert len(submitted) == 2
+    assert note is not None and "node003" in note and "anisette" in note
 
 
 def test_recover_pool_noop_when_the_pool_is_already_full(tmp_path):
@@ -3753,6 +3857,50 @@ def test_submit_worker_job_composes_with_chunk_rounds_for_every_mesh_experiment(
     assert cfg.mesh.chunk_rounds == 4
 
 
+def test_submit_worker_job_bounds_requeues_to_chunk_rounds_minus_one(tmp_path):
+    """mesh_continue_allowed.sh's Layer 2 guard only stops the worker's own
+    `scontrol requeue` self-chaining if MESH_MAX_REQUEUES is set -- without
+    it the worker keeps requeuing the SAME job id past the chunk boundary
+    while _relaunch_chunk_if_finished independently submits a NEW job id
+    for the same --exclusive node, producing two live chains racing for
+    one node (observed 2026-09-07, lev-fix16c). SLURM_RESTART_COUNT is 0
+    on the initial submission and increments once per requeue, so after
+    training round `chunk_rounds` it reads chunk_rounds - 1 -- that's the
+    value that must trip the worker's own stop condition."""
+    run_config = _run_config(chunk_rounds=6)
+    registry_path = tmp_path / "jobs_registry.json"
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 557\n")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        _submit_worker_job(
+            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+        )
+    submitted_cmd = mock_run.call_args[0][0]
+    export = next(a for a in submitted_cmd if a.startswith("--export="))
+    assert "MESH_MAX_REQUEUES=5" in export
+
+
+def test_submit_worker_job_omits_max_requeues_when_unchunked(tmp_path):
+    """A run with chunk_rounds=None spans the whole run in one job -- there
+    is no chunk boundary to bound requeues against, and the worker's own
+    None default (mesh_continue_allowed.sh skips Layer 2 when the env var
+    is unset) must apply, not an arbitrary cap."""
+    run_config = _run_config(chunk_rounds=None)
+    registry_path = tmp_path / "jobs_registry.json"
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 558\n")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake
+    ) as mock_run:
+        _submit_worker_job(
+            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+        )
+    submitted_cmd = mock_run.call_args[0][0]
+    export = next(a for a in submitted_cmd if a.startswith("--export="))
+    assert "MESH_MAX_REQUEUES" not in export
+    assert export == "--export=ALL"
+
+
 def test_merge_timeout_leaves_headroom_over_the_measured_durable_phase(tmp_path):
     """The merge's durable phase measured 210s on a 16-node round (2026-08-28,
     e2b-c-cars). A budget close to that is what let a finished merge get
@@ -3971,8 +4119,116 @@ def test_relaunch_chunk_freezes_each_job_shard_list_at_submission(tmp_path):
         for arg in call.args[0]
         if arg.startswith("--export=")
     ]
-    assert f"--export=ALL,MESH_ASSIGNMENTS={snapshot}" in exports
+    assert f"--export=ALL,MESH_ASSIGNMENTS={snapshot},MESH_MAX_REQUEUES=4" in exports
     # The live file is what the snapshot was taken from; mutating it now
     # must not change what an already-submitted job will read.
     (mesh_shared / "metadata" / "shard_assignments_RUN1.json").write_text("{}")
     assert json.loads(snapshot.read_text()) == {"node001": ["s0"]}
+
+
+def _write_requeued_job(tmp_path, *, job_id="4802", node="node001", state="PENDING"):
+    """A registry record plus a squeue snapshot for a self-requeued worker.
+
+    Mirrors mesh_train.sbatch's --requeue: the job is still in the queue
+    under its original id, but squeue reports no `nodes` for a PENDING job
+    -- unlike `_write_straggler_state`'s live RUNNING fixture, `nodes` here
+    is deliberately blank."""
+    state_dir = tmp_path / "runs" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "jobs_registry.json").write_text(
+        json.dumps(
+            [
+                {
+                    "slurm_job_id": job_id,
+                    "experiment": "videomae_mesh_ssl",
+                    "run_tag": "RUN1",
+                    "submitted_at": "2026-09-07T09:00:00+00:00",
+                    "nodelist": node,
+                }
+            ]
+        )
+    )
+    (state_dir / "squeue.json").write_text(
+        json.dumps(
+            {"jobs": [{"job_id": int(job_id), "job_state": [state], "nodes": ""}]}
+        )
+    )
+
+
+def test_relaunch_chunk_cancels_a_self_requeued_job_before_resubmitting(tmp_path):
+    """Regression for lev-fix16c (2026-09-07): a worker that hit its 2h
+    walltime instead of exiting at the chunk boundary self-requeues under
+    its original job id, still claiming the --exclusive node it trained on.
+    squeue shows no `nodes` for a PENDING job, so the live-nodelist guards
+    elsewhere can't see it -- the relaunch must scancel it by its own
+    submission-time nodelist before resubmitting, or the fresh job loses
+    the race for the node and sits PD forever."""
+    mesh_shared = _shard_assignments_fixture(
+        tmp_path, {"node001": ["s0"], "node002": ["s1"], "node003": ["s2"]}
+    )
+    _write_requeued_job(tmp_path, job_id="4802", node="node001")
+    run_config = _run_config(chunk_rounds=5)
+    state = WatcherState()
+    run = state.run("RUN1")
+
+    note, submitted, mock_run = _relaunch(run_config, run, state, tmp_path, mesh_shared)
+
+    scancels = [
+        c.args[0]
+        for c in mock_run.call_args_list
+        if c.args and c.args[0][0] == "scancel"
+    ]
+    assert scancels == [["scancel", "4802"]]
+    assert "cancelled 1 self-requeued job(s): 4802" in note
+    assert submitted == {"node001", "node002", "node003"}
+
+
+def test_relaunch_chunk_does_not_cancel_a_terminal_or_foreign_job(tmp_path):
+    """A job already COMPLETED needs no scancel, and a stale record for a
+    different run_id must never be touched by this run's relaunch."""
+    mesh_shared = _shard_assignments_fixture(
+        tmp_path, {"node001": ["s0"], "node002": ["s1"], "node003": ["s2"]}
+    )
+    state_dir = tmp_path / "runs" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "jobs_registry.json").write_text(
+        json.dumps(
+            [
+                {
+                    "slurm_job_id": "1",
+                    "experiment": "videomae_mesh_ssl",
+                    "run_tag": "RUN1",
+                    "submitted_at": "2026-09-07T09:00:00+00:00",
+                    "nodelist": "node001",
+                },
+                {
+                    "slurm_job_id": "2",
+                    "experiment": "videomae_mesh_ssl",
+                    "run_tag": "OTHER_RUN",
+                    "submitted_at": "2026-09-07T09:00:00+00:00",
+                    "nodelist": "node002",
+                },
+            ]
+        )
+    )
+    (state_dir / "squeue.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {"job_id": 1, "job_state": ["COMPLETED"], "nodes": ""},
+                    {"job_id": 2, "job_state": ["PENDING"], "nodes": ""},
+                ]
+            }
+        )
+    )
+    run_config = _run_config(chunk_rounds=5)
+    state = WatcherState()
+    run = state.run("RUN1")
+
+    note, submitted, mock_run = _relaunch(run_config, run, state, tmp_path, mesh_shared)
+
+    assert not [
+        c for c in mock_run.call_args_list if c.args and c.args[0][0] == "scancel"
+    ]
+    assert "self-requeued" not in note
+    assert submitted == {"node001", "node002", "node003"}

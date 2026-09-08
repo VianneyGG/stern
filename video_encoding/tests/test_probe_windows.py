@@ -34,6 +34,8 @@ from video_encoding.data.probe_windows import (
 )
 from video_encoding.models.videomaev2.encoder import preprocess_window
 
+pytestmark = pytest.mark.integration
+
 NUM_FRAMES = 4
 IMAGE_SIZE = 8
 

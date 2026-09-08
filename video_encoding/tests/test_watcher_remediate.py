@@ -3,8 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from video_encoding.watcher.registry import JobRecord
 from video_encoding.watcher.remediate import remediate_dead_job
+
+pytestmark = pytest.mark.integration
 
 
 def test_remediate_dead_job_parses_new_job_id_and_passes_nodelist_flag():

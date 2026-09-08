@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 from PIL import Image
@@ -19,6 +20,8 @@ from data.labels import write_label_csv
 from data.manifest import ManifestRecord, write_manifest
 from video_encoding.training import train as train_mod
 from video_encoding.scripts.build_afewva_manifest import build, parse_clip_annotations
+
+pytestmark = pytest.mark.integration
 
 
 class _FakeRegressor(nn.Module):

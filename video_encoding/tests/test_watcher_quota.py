@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from video_encoding.watcher.quota import (
     collect_disk_usage_pct,
     home_quota_pct,
@@ -19,6 +21,8 @@ _REAL_QUOTA_OUTPUT = (
     "storage-node.polytechnique.fr:/students/.snapshot/daily.2026-08-09_0010\n"
     "                19955708  31457280 31457280       0   87843  300000  300000       0\n"
 )
+
+pytestmark = pytest.mark.integration
 
 
 def test_parse_quota_output_returns_block_pct_when_it_dominates():

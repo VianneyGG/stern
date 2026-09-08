@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
+pytestmark = pytest.mark.integration
+
 
 def test_main_fast_path_refreshes_squeue_and_exits_without_full_check(
     tmp_path, monkeypatch

@@ -4,7 +4,11 @@ import json
 import subprocess
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from video_encoding.watcher.squeue import load_squeue_snapshot, refresh_squeue_snapshot
+
+pytestmark = pytest.mark.integration
 
 FIXTURE_PAYLOAD = {
     "jobs": [
@@ -97,9 +101,6 @@ def test_refresh_squeue_snapshot_propagates_subprocess_failure(tmp_path):
         "subprocess.run",
         side_effect=subprocess.CalledProcessError(1, ["squeue"]),
     ):
-        try:
+        with pytest.raises(subprocess.CalledProcessError, match="squeue"):
             refresh_squeue_snapshot(out_path, user="lev")
-            assert False, "expected CalledProcessError"
-        except subprocess.CalledProcessError:
-            pass
-    assert not out_path.exists()
+    assert out_path.exists() is False

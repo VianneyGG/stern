@@ -2,6 +2,10 @@ import os
 import subprocess
 import time
 
+import pytest
+
+pytestmark = pytest.mark.system
+
 GATE = "video_encoding/scripts/mesh_continue_allowed.sh"
 
 

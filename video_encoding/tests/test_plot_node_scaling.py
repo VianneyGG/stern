@@ -13,10 +13,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from video_encoding.scripts import plot_node_scaling as pns
+
+pytestmark = pytest.mark.system
 
 
 def _write_worker(metrics_dir: Path, node: str, records: list[dict]) -> None:

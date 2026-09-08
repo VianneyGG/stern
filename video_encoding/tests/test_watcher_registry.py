@@ -32,7 +32,8 @@ def test_append_and_load_round_trip(tmp_path):
 def test_append_job_record_creates_parent_dir(tmp_path):
     path = tmp_path / "nested" / "state" / "jobs_registry.json"
     append_job_record(path, JobRecord("1", "exp", None, "2026-07-15T09:00:00Z", ""))
-    assert path.exists()
+    payload = json.loads(path.read_text())
+    assert payload[0]["slurm_job_id"] == "1"
 
 
 def test_append_job_record_is_valid_json_list(tmp_path):

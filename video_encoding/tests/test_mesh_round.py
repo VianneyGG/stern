@@ -50,6 +50,8 @@ from video_encoding.training.pretrain import (
     run_pretrain_stage,
 )
 
+pytestmark = pytest.mark.integration
+
 
 def _tiny_cfg() -> DictConfig:
     # Same tiny model as test_pretrain_loop.py: image 32 / patch 16 -> 2x2
@@ -245,7 +247,7 @@ def test_push_checkpoint_and_wait_returns_immediately_when_merge_false(
 def test_push_checkpoint_and_wait_times_out_and_exits(tmp_path, monkeypatch):
     monkeypatch.setattr(mesh_round.time, "sleep", lambda s: None)
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit, match="1"):
         push_checkpoint_and_wait(
             {"model_state_dict": {}, "n_samples": 1},
             mesh_shared=tmp_path,
@@ -1415,7 +1417,8 @@ def test_append_round_metrics_swallows_unwritable_metrics_dir(tmp_path):
         n_steps=2,
     )  # must not raise
 
-    assert (mesh_shared / "metrics").is_file()  # untouched, still a plain file
+    # untouched, still the same plain file (not silently replaced by a dir)
+    assert (mesh_shared / "metrics").read_text() == "not a directory"
 
 
 def test_append_round_metrics_includes_slurm_job_id_from_environ(tmp_path, monkeypatch):
@@ -1757,7 +1760,7 @@ def test_append_round_metrics_records_exact_sample_and_step_counts(tmp_path):
 def test_append_round_metrics_rejects_a_missing_count(tmp_path):
     """No default: a missing count must be a call-site error rather than a
     zero that silently under-reports the compute axis."""
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="n_samples"):
         mesh_round._append_round_metrics(
             tmp_path / "mesh_shared", "run1", "node001", 1, 0.5, 0.4, 12.0, 3, 0.0015
         )

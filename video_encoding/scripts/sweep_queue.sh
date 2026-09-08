@@ -82,21 +82,94 @@ log() {
 
 active_nodes() { tr ',' '\n' < "${ACTIVE_FILE}" | awk 'NF'; }
 
+# Node -> "still busy" for nodes carrying one of our own SLURM jobs. A "mine"
+# job is only safe to overlap with (the previous queue item's own workers
+# tearing down, or any job this module doesn't track as a mesh run at all) --
+# a DIFFERENT TRACKED mesh run actively occupying the node (e.g. a
+# concurrently-launched run this sweep doesn't manage) must NOT be treated as
+# available just because the job happens to belong to this user. Matches on
+# job id (recycled after the 2026-08-22 cluster rebuild, so the MOST RECENT
+# jobs_registry.json record for that id is the one that's actually live --
+# same disambiguation as chunk_relaunch.py) then looks up that job's run_tag
+# in watcher_state.json: unless the run reads back DONE, the node is busy. A
+# job with no registry record, or a registry record with no run_tag, is left
+# available -- unrelated to the mesh entirely, same as before this fix.
+# Observed 2026-09-07: lev-window-200 register-launched straight onto
+# lev-fix16c's still-RUNNING nodes because the old check only asked
+# "is this my job", not "is this job's (tracked) run actually done".
+busy_nodes() {
+  local mine_raw="$1" tmp
+  tmp=$(mktemp)
+  printf '%s\n' "${mine_raw}" > "${tmp}"
+  python3 - "${tmp}" "${WATCHER_STATE}" "${STATE_DIR}/jobs_registry.json" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+mine_path, watcher_path, registry_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+try:
+    runs = json.loads(Path(watcher_path).read_text()).get("runs", {})
+except (OSError, ValueError):
+    runs = {}
+
+try:
+    payload = json.loads(Path(registry_path).read_text())
+except (OSError, ValueError):
+    payload = []
+records = payload if isinstance(payload, list) else payload.get("jobs", [])
+
+latest: dict[str, tuple[str, str]] = {}
+for rec in records:
+    job_id = rec.get("slurm_job_id")
+    if job_id is None:
+        continue
+    submitted = rec.get("submitted_at") or ""
+    prev = latest.get(job_id)
+    if prev is None or submitted > prev[0]:
+        latest[job_id] = (submitted, rec.get("run_tag") or "")
+
+busy = set()
+for line in Path(mine_path).read_text().splitlines():
+    line = line.strip()
+    if not line or "|" not in line:
+        continue
+    job_id, node = line.split("|", 1)
+    node = node.strip()
+    if not node:
+        continue
+    tag = latest.get(job_id, ("", ""))[1]
+    if not tag:
+        continue
+    status = runs.get(tag, {}).get("status")
+    if status != "DONE":
+        busy.add(node)
+
+for node in sorted(busy):
+    print(node)
+PYEOF
+  rm -f "${tmp}"
+}
+
 # Prints the available subset of the pool, one node per line. "Available"
-# spans idle nodes AND nodes still running our own jobs: the previous run's
-# workers may still be tearing down, and those nodes are ours. Returns 1 if a
-# probe failed, so an empty list from a broken sinfo/squeue is never logged as
-# a genuine availability finding.
+# spans idle nodes AND nodes running our own jobs from a run that has
+# actually finished (busy_nodes above) -- the previous queue item's workers
+# may still be tearing down, and those nodes are ours to reuse. Returns 1 if
+# a probe failed, so an empty list from a broken sinfo/squeue is never logged
+# as a genuine availability finding.
 available_nodes() {
-  local idle mine ours node
+  local idle mine ours busy node
   if ! idle=$("${SINFO}" -N -h -o "%N %T"); then return 1; fi
-  if ! mine=$("${SQUEUE}" --me -h -o "%N"); then return 1; fi
+  if ! mine=$("${SQUEUE}" --me -h -o "%i|%N"); then return 1; fi
+  busy=$(busy_nodes "${mine}")
   ours=$(
     { awk '$2 ~ /^idle/ {print $1}' <<< "${idle}"
-      tr ',' '\n' <<< "${mine}"; } | awk 'NF' | sort -u
+      awk -F'|' '{print $2}' <<< "${mine}" | tr ',' '\n'; } | awk 'NF' | sort -u
   )
   for node in $(active_nodes); do
-    if grep -qxF "${node}" <<< "${ours}"; then printf '%s\n' "${node}"; fi
+    if grep -qxF "${node}" <<< "${ours}" && ! grep -qxF "${node}" <<< "${busy}"; then
+      printf '%s\n' "${node}"
+    fi
   done
 }
 

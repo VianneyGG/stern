@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from video_encoding.watcher.node_health import (
     NodeHealth,
     foreign_gpu_pids,
     query_node_health,
     truly_idle,
 )
+
+pytestmark = pytest.mark.integration
 
 # The birds tier as measured on 2026-08-22, after factorial-tube-per_frame
 # excluded 12 nodes. sinfo called every one of them "idle" while 7 still had

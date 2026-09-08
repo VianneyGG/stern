@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 from unittest.mock import patch
 
+import pytest
 from omegaconf import OmegaConf
 
 from video_encoding.training.tb_logger import (
@@ -12,6 +13,8 @@ from video_encoding.training.tb_logger import (
     write_mesh_round_scalars,
     write_result_json,
 )
+
+pytestmark = pytest.mark.integration
 
 
 class _RecordingWriter:

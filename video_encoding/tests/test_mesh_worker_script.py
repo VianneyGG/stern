@@ -8,6 +8,8 @@ import pytest
 
 from video_encoding.mesh.assignment import read_my_shards
 
+pytestmark = pytest.mark.system
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SBATCH_PATH = REPO_ROOT / "video_encoding" / "slurm" / "mesh_train.sbatch"
 WORKER_SCRIPT_PATH = REPO_ROOT / "video_encoding" / "scripts" / "run_mesh_worker.sh"

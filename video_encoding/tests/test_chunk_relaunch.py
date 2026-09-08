@@ -10,6 +10,7 @@ from video_encoding.watcher.chunk_relaunch import (
     SUBMIT_VISIBILITY_S,
     cancellable_job_ids,
     needs_worker_relaunch,
+    stale_jobs_for_nodes,
 )
 from video_encoding.watcher.registry import JobRecord
 
@@ -174,3 +175,57 @@ def test_cancellable_returns_every_live_straggler():
     assert cancellable_job_ids(
         run_id="run-a", registry=registry, snapshot=snapshot
     ) == ["10", "11", "12"]
+
+
+def test_stale_finds_a_self_requeued_pending_job_by_its_own_nodelist():
+    """A job self-requeued past its walltime goes back to PENDING with no
+    `nodes` in squeue -- unlike cancellable_job_ids, this must match on the
+    record's own submission-time nodelist, not the live snapshot's."""
+    registry = [_rec("4802", "node055")]
+    snapshot = {"4802": {"state": "PENDING", "nodelist": ""}}
+    assert stale_jobs_for_nodes(
+        run_id="run-a", nodes=["node055"], registry=registry, snapshot=snapshot
+    ) == ["4802"]
+
+
+def test_stale_ignores_a_node_this_chunk_is_not_resubmitting():
+    registry = [_rec("4802", "node055")]
+    snapshot = {"4802": {"state": "PENDING", "nodelist": ""}}
+    assert (
+        stale_jobs_for_nodes(
+            run_id="run-a", nodes=["node032"], registry=registry, snapshot=snapshot
+        )
+        == []
+    )
+
+
+def test_stale_ignores_a_different_runs_job():
+    registry = [_rec("4802", "node055", "other-run")]
+    snapshot = {"4802": {"state": "PENDING", "nodelist": ""}}
+    assert (
+        stale_jobs_for_nodes(
+            run_id="run-a", nodes=["node055"], registry=registry, snapshot=snapshot
+        )
+        == []
+    )
+
+
+def test_stale_ignores_a_job_already_terminal():
+    registry = [_rec("4802", "node055")]
+    snapshot = {"4802": {"state": "COMPLETED", "nodelist": ""}}
+    assert (
+        stale_jobs_for_nodes(
+            run_id="run-a", nodes=["node055"], registry=registry, snapshot=snapshot
+        )
+        == []
+    )
+
+
+def test_stale_ignores_a_job_absent_from_the_snapshot():
+    registry = [_rec("4802", "node055")]
+    assert (
+        stale_jobs_for_nodes(
+            run_id="run-a", nodes=["node055"], registry=registry, snapshot={}
+        )
+        == []
+    )

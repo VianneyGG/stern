@@ -4,12 +4,16 @@ import os
 import subprocess
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from video_encoding.watcher.quota_cleanup import (
     orphaned_tmp_checkpoints,
     remediate_quota_pressure,
     safe_node_checkpoints,
     stale_outer_momentum_checkpoints,
 )
+
+pytestmark = pytest.mark.integration
 
 NOW = 10_000.0
 _REAL_SUBPROCESS_RUN = subprocess.run  # captured before any test patches subprocess.run

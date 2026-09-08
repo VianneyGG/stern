@@ -19,6 +19,7 @@ from video_encoding.scripts.run_outer_step import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.system
 def test_cli_invocation_as_module_actually_runs(tmp_path):
     """Real subprocess, no mocking: mesh_tick.py's _do_merging shells out to
     this script via `uv run python -m video_encoding.scripts.run_outer_step`
@@ -65,6 +66,58 @@ def test_cli_invocation_as_module_actually_runs(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.system
+def test_cli_invocation_forces_quorum_relaxed_and_timeout_forced_flags(tmp_path):
+    """Same rationale as test_cli_invocation_as_module_actually_runs, but for
+    the --quorum-relaxed/--timeout-forced dispatch path specifically: these
+    are the flags the watcher passes on a degraded merge, and only
+    test_metrics_out_records_*_flag exercise them, both via the in-process
+    `main()` -- a real argparse/dispatch bug on these two flags would pass
+    there and only surface under the real CLI."""
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    momentum_path = tmp_path / "momentum.pt"
+    metrics_out = tmp_path / "run1_rounds.jsonl"
+
+    _write_master(master_path, 1.0)
+    _write_worker(pending_dir / "run1_1_a.pt", 0.5, n_samples=100)
+
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "video_encoding.scripts.run_outer_step",
+            "--pending-dir",
+            str(pending_dir),
+            "--run-id",
+            "run1",
+            "--master",
+            str(master_path),
+            "--momentum",
+            str(momentum_path),
+            "--round",
+            "1",
+            "--allow-missing-momentum",
+            "--metrics-out",
+            str(metrics_out),
+            "--quorum-relaxed",
+            "--timeout-forced",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    record = json.loads(metrics_out.read_text().splitlines()[0])
+    assert record["quorum_relaxed"] is True
+    assert record["timeout_forced"] is True
 
 
 def _sd(v: float) -> dict[str, torch.Tensor]:
@@ -426,7 +479,9 @@ def test_inverse_loss_weighting_is_available_as_an_option(tmp_path):
         weighting="inverse_loss",
     )
 
-    assert result["alphas"]["a"] > result["alphas"]["b"]
+    # inv = 1/val_loss -> a=1.0, b=1/3; normalized: a=0.75, b=0.25.
+    assert result["alphas"]["a"] == pytest.approx(0.75)
+    assert result["alphas"]["b"] == pytest.approx(0.25)
 
 
 def test_inverse_loss_weighting_rejects_nan_val_loss(tmp_path):
@@ -487,7 +542,9 @@ def test_token_weighting_prefers_fewer_steps_per_sample_over_equal_data_weights(
         weighting="token",
     )
 
-    assert result["alphas"]["a"] > result["alphas"]["b"]
+    # w = c_tokens^2 / c_steps -> a=100^2/50=200, b=100^2/200=50; normalized: a=0.8, b=0.2.
+    assert result["alphas"]["a"] == pytest.approx(0.8)
+    assert result["alphas"]["b"] == pytest.approx(0.2)
 
 
 def test_token_weighting_rejects_missing_n_steps(tmp_path):
@@ -720,7 +777,10 @@ def test_error_feedback_removes_the_fp16_rounding_bias_over_rounds(tmp_path):
         total += bc["w"].float()
     feedback_err = (total / n_rounds - master_sd["w"]).abs().mean().item()
 
-    assert plain_err > 2e-4  # the bias a plain cast would lock in
+    # true_value sits 0.3 of an ulp above 1.0, so fp16 rounds it down to exactly
+    # 1.0 and a plain cast locks in the full 0.3-ulp bias, every round.
+    assert plain_err == pytest.approx(0.3 * (2**-10), rel=1e-3)
+    # Feedback dithers instead, so the 100-round mean lands within a tenth of it.
     assert feedback_err < plain_err / 10
 
 

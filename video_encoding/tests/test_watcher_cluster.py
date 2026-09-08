@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from video_encoding.watcher.cluster import query_idle_nodes
+
+pytestmark = pytest.mark.integration
 
 
 def test_query_idle_nodes_parses_idle_hosts():

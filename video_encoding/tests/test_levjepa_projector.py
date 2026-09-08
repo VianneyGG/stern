@@ -22,5 +22,5 @@ def test_projector_uses_batchnorm_and_gelu():
 
 def test_projector_rejects_wrong_input_dim():
     proj = Projector(embed_dim=32, hidden_dim=64, output_dim=8)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="mat1"):
         proj(torch.randn(4, 16))

@@ -40,7 +40,7 @@ def test_steps_for_budget_clamps_a_runaway_estimate_down_to_the_ceiling():
 def test_steps_for_budget_rejects_a_non_positive_rate():
     """rate<=0 means the throughput measurement failed, not that the node is
     slow. Silently returning floor_steps would bury that."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="positive"):
         steps_for_budget(
             rate_steps_per_s=0.0, budget_s=900.0, floor_steps=2400, ceil_steps=19200
         )

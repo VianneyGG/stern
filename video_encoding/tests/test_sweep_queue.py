@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.system
+
 SCRIPT = (
     Path(__file__).resolve().parents[2]
     / "video_encoding"
@@ -142,8 +144,18 @@ class Sweep:
         self._stub("hostname", f'#!/bin/sh\necho "{host}"\n')
 
     def set_cluster(self, idle: list[str], mine: list[str]) -> None:
+        """`mine` nodes get synthetic job ids with no jobs_registry.json
+        record -- untracked jobs, so busy_nodes() in sweep_queue.sh leaves
+        them available (matches the pre-fix "previous run tearing down"
+        assumption). Use set_registry()/set_watcher() together to simulate a
+        DIFFERENT tracked mesh run actively holding a node instead."""
         self.sinfo_out.write_text("".join(f"{n} idle\n" for n in idle))
-        self.squeue_out.write_text("".join(f"{n}\n" for n in mine))
+        self.squeue_out.write_text(
+            "".join(f"{9000 + i}|{n}\n" for i, n in enumerate(mine))
+        )
+
+    def set_registry(self, records: list[dict]) -> None:
+        (self.state / "jobs_registry.json").write_text(json.dumps(records, indent=2))
 
     def set_queue(self, items: list[str]) -> None:
         text = "# tier sweep\n\n" + "\n".join(items) + "\n"
@@ -525,6 +537,83 @@ def test_nodes_running_our_jobs_count_as_available(sweep):
     assert entry["nodes"] == NODES
     assert "16/16 pool nodes available" in sweep.log()
     assert "launch" not in sweep.call_log()
+
+
+def test_nodes_running_a_different_tracked_runs_jobs_are_not_available(sweep):
+    """Reproduces the 2026-09-07 incident: lev-window-200 register-launched
+    straight onto lev-fix16c's still-RUNNING nodes because the old
+    available_nodes() only asked "is this my job", not "is this job's run
+    actually done". A node running one of OUR jobs for a DIFFERENT run this
+    sweep doesn't manage -- whose watcher_state status is not DONE -- must be
+    excluded, forcing register-only to wait below quorum rather than launch
+    straight into the collision."""
+    sweep.set_cluster(idle=NODES[:10], mine=NODES[10:])
+    sweep.set_registry(
+        [
+            {"slurm_job_id": str(9000 + i), "run_tag": "other_run", "nodelist": n}
+            for i, n in enumerate(NODES[10:])
+        ]
+    )
+    sweep.set_queue(["run_a 25 0.7 0.9 8 token train.accum_steps=128"])
+    sweep.set_watcher(
+        {
+            "run_a": {"status": "RUNNING", "round": 1},
+            "other_run": {"status": "RUNNING", "round": 5},
+        }
+    )
+    with sweep.running() as proc:
+        wait_until(lambda: proc.poll() is not None, timeout=30)
+    assert proc.returncode != 0
+    assert "only 10/16 available" in sweep.log()
+    assert "cannot full-launch" in sweep.log()
+    assert "register" not in sweep.call_log()
+    assert not sweep.configs_path.exists()
+
+
+def test_nodes_running_a_now_done_tracked_runs_jobs_are_available(sweep):
+    """The teardown case the original comment was written for: the SAME
+    node's job now belongs to a run that has reached DONE -- must still
+    count as available, same as an untracked job would."""
+    sweep.set_cluster(idle=NODES[:12], mine=NODES[12:])
+    sweep.set_registry(
+        [
+            {"slurm_job_id": str(9000 + i), "run_tag": "prior_run", "nodelist": n}
+            for i, n in enumerate(NODES[12:])
+        ]
+    )
+    sweep.set_queue(["run_a 25 0.7 0.9"])
+    sweep.set_watcher(
+        {
+            "run_a": {"status": "RUNNING", "round": 1},
+            "prior_run": {"status": "DONE", "round": 25},
+        }
+    )
+    with sweep.running():
+        entry = wait_until(lambda: _registered(sweep, "run_a"))
+    assert entry["nodes"] == NODES
+    assert "16/16 pool nodes available" in sweep.log()
+
+
+def test_registry_record_missing_run_tag_leaves_node_available(sweep):
+    """busy_nodes()'s comment claims a registry record with no run_tag is
+    left available, same as no record at all -- only "no record" was ever
+    actually exercised (test_nodes_running_our_jobs_count_as_available).
+    Here the record exists (so `latest` gets an entry) but is malformed:
+    no `run_tag` key. `rec.get("run_tag") or ""` must fall through to the
+    untracked/available branch rather than raising or misreading the tag."""
+    sweep.set_cluster(idle=NODES[:12], mine=NODES[12:])
+    sweep.set_registry(
+        [
+            {"slurm_job_id": str(9000 + i), "nodelist": n}
+            for i, n in enumerate(NODES[12:])
+        ]
+    )
+    sweep.set_queue(["run_a 25 0.7 0.9"])
+    sweep.set_watcher({"run_a": {"status": "RUNNING", "round": 1}})
+    with sweep.running():
+        entry = wait_until(lambda: _registered(sweep, "run_a"))
+    assert entry["nodes"] == NODES
+    assert "16/16 pool nodes available" in sweep.log()
 
 
 def test_cars_is_a_valid_tier(tmp_path):

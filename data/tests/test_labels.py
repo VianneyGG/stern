@@ -42,7 +42,7 @@ def test_load_clip_va_label_rejects_out_of_range_values(tmp_path: Path):
     label_path = tmp_path / "clip.csv"
     _write_label_csv(label_path, [(2.0, 0.0)])  # outside declared va_range
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="fall outside"):
         load_clip_va_label(label_path, annotation_hz=30.0, va_range=(-1.0, 1.0))
 
 
@@ -50,5 +50,5 @@ def test_load_clip_va_label_rejects_empty_file(tmp_path: Path):
     label_path = tmp_path / "clip.csv"
     _write_label_csv(label_path, [])
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="no rows"):
         load_clip_va_label(label_path, annotation_hz=30.0, va_range=(-1.0, 1.0))

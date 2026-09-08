@@ -1,13 +1,17 @@
 from unittest.mock import patch
 
+import pytest
+
 from video_encoding.watcher.notify import notify
+
+pytestmark = pytest.mark.integration
 
 
 def test_notify_posts_to_webhook(monkeypatch):
     monkeypatch.setenv("MESH_NOTIFY_WEBHOOK_URL", "http://example.invalid/hook")
     with patch("video_encoding.watcher.notify.urllib.request.urlopen") as mock_open:
         notify("test_subject", "test detail")
-        assert mock_open.called
+        mock_open.assert_called_once()
 
 
 def test_notify_falls_back_to_log_file_on_no_url(tmp_path, monkeypatch):
@@ -28,4 +32,4 @@ def test_notify_falls_back_to_log_file_on_network_error(tmp_path, monkeypatch):
     ):
         notify("test_subject", "test detail")
     log = tmp_path / "NEEDS_HUMAN.log"
-    assert log.exists()
+    assert "test_subject" in log.read_text()

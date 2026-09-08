@@ -30,7 +30,8 @@ def test_levjepa_encoder_has_no_patch_embed_or_pos_embed_toplevel_attrs():
     ever gains a `pos_embed` attribute, _backbone_tokens's hasattr check
     would silently switch to the wrong code path."""
     enc = LeVJEPAEncoder(_tiny_cfg())
-    assert not (hasattr(enc, "patch_embed") and hasattr(enc, "pos_embed"))
+    assert hasattr(enc, "patch_embed") is False
+    assert hasattr(enc, "pos_embed") is False
 
 
 def test_levjepa_encoder_output_shape_eval_mode_keeps_all_tokens():

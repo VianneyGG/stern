@@ -38,7 +38,7 @@ def _parsed_lines() -> list[tuple]:
 
 
 def test_queue_file_exists():
-    assert QUEUE_PATH.exists()
+    assert QUEUE_PATH.exists() is True
 
 
 def test_queue_matches_the_design_doc_cells_in_priority_order():

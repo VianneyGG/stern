@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.system
+
 SCRIPT = Path("video_encoding/scripts/run_factorial.sh")
 ARMS = ["tube-time_avg", "tube-per_frame", "mixed-time_avg", "mixed-per_frame"]
 

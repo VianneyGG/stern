@@ -10,6 +10,8 @@ from video_encoding.scripts.validate_seeding import (
     scan_pool,
 )
 
+pytestmark = pytest.mark.integration
+
 # `ls -l`-ish output as the remote listing command emits it: "<size> <name>".
 GOLDEN_TRAIN = "100 shard-000000.tar\n100 shard-000001.tar\n"
 GOLDEN_VAL = "50 shard-000000.tar\n"

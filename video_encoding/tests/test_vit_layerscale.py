@@ -17,4 +17,4 @@ def test_layerscale_gamma_is_trainable():
     x = torch.randn(2, 3, 8, requires_grad=True)
     out = ls(x)
     out.sum().backward()
-    assert ls.gamma.grad is not None
+    assert ls.gamma.grad.shape == ls.gamma.shape

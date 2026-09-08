@@ -4,7 +4,10 @@ shell-level CLI flags (see scripts/run_experiment.sh)."""
 
 from pathlib import Path
 
+import pytest
 from hydra import compose, initialize_config_dir
+
+pytestmark = pytest.mark.integration
 
 CONF_DIR = Path(__file__).resolve().parents[1] / "conf"
 

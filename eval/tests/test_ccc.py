@@ -39,31 +39,38 @@ def test_ccc_penalizes_uncorrelated_signal():
     assert abs(ccc) < 0.15  # near zero for independent signals
 
 
+def test_ccc_rejects_shape_mismatch():
+    x = np.array([0.1, 0.5, -0.3])
+    y = np.array([0.1, 0.5])
+    with pytest.raises(ValueError, match="shape mismatch"):
+        concordance_correlation_coefficient(x, y)
+
+
 def test_ccc_rejects_non_1d_input():
     x = np.array([[0.1, 0.5], [-0.3, 0.8]])
     y = np.array([[0.1, 0.5], [-0.3, 0.8]])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="expected 1D"):
         concordance_correlation_coefficient(x, y)
 
 
 def test_ccc_rejects_empty_input():
     x = np.array([])
     y = np.array([])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="non-empty"):
         concordance_correlation_coefficient(x, y)
 
 
 def test_ccc_rejects_nan():
     x = np.array([0.1, 0.5, np.nan])
     y = np.array([0.1, 0.5, -0.3])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="finite"):
         concordance_correlation_coefficient(x, y)
 
 
 def test_ccc_rejects_inf():
     x = np.array([0.1, 0.5, np.inf])
     y = np.array([0.1, 0.5, -0.3])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="finite"):
         concordance_correlation_coefficient(x, y)
 
 

@@ -13,6 +13,8 @@ from video_encoding.scripts.select_voxmini_subset import (
     select_stratified_subset,
 )
 
+pytestmark = pytest.mark.integration
+
 
 def _fake_container(duration, streams):
     container = MagicMock(duration=duration, streams=streams)

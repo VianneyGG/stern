@@ -30,6 +30,8 @@ from video_encoding.scripts.build_wds_shards import (
     encode_frames_jpeg,
 )
 
+pytestmark = pytest.mark.integration
+
 
 def _write_fake_frames(clip_dir: Path, n: int, size: int = 224) -> None:
     clip_dir.mkdir(parents=True, exist_ok=True)

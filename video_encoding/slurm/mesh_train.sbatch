@@ -37,6 +37,22 @@
 # exit cleanly under this cap and resume via +mesh.start_round + master.pt.
 #SBATCH --time=02:00:00
 #SBATCH --signal=B:USR1@180
+# --requeue is a genuine safety net (node failure, not just walltime), but
+# it competes with the watcher's own chunk relaunch for the same
+# --exclusive node whenever a worker hits its 2h cap instead of exiting
+# early at the chunk boundary -- a self-requeued job goes back to PENDING
+# under the same job id, requesting the same node. The watcher reconciles
+# this itself before resubmitting (chunk_relaunch.stale_jobs_for_nodes,
+# scancel'd in mesh_tick._relaunch_chunk_if_finished) rather than dropping
+# the flag, so a true node failure still gets SLURM's own retry
+# (observed 2026-09-07, lev-fix16c).
+#
+# Separate from that: run_mesh_worker.sh also self-chains on a CLEAN exit,
+# via its own explicit `scontrol requeue` (not this flag). That loop is
+# bounded to the job's chunk_rounds by MESH_MAX_REQUEUES
+# (mesh_tick._submit_worker_job -> mesh_continue_allowed.sh Layer 2) so it
+# stops at the chunk boundary instead of racing the watcher's next-chunk
+# submission for the same node (same 2026-09-07 incident).
 #SBATCH --requeue
 #SBATCH --output=video_encoding/slurm/logs/%x-%j.out
 

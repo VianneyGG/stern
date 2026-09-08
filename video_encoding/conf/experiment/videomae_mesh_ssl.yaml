@@ -17,7 +17,10 @@ mesh:
   merge: true
   outer_lr: 0.7
   outer_momentum: 0.9
-  sync_timeout_s: 1800.0
+  # Was 1800.0: a DEGRADED-recovery detour on 2026-09-08 took 33min end-to-end
+  # (watcher.log lev-window-800 09:24-10:34), fatally killing every worker
+  # that had already finished its round and was waiting on the sync flag.
+  sync_timeout_s: 3600.0
   # Per-node pacing (mesh/pacing.py). null keeps the uniform steps_per_round
   # above for every node; each node instead trains what fits in this many
   # seconds at its own measured rate, so rounds finish together instead of

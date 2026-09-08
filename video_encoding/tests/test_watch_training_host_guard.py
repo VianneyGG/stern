@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytestmark = pytest.mark.integration
+
 
 def test_log_line_carries_the_short_hostname(tmp_path, monkeypatch):
     """Without attribution a shared watcher.log cannot say which host acted."""
@@ -70,7 +72,7 @@ def test_missing_designation_file_raises_rather_than_defaulting(tmp_path):
     designation file exists to prevent."""
     from video_encoding.scripts.watch_training import is_designated_watcher
 
-    with pytest.raises(OSError):
+    with pytest.raises(OSError, match="absent"):
         is_designated_watcher(tmp_path / "absent", "node089")
 
 
@@ -127,7 +129,7 @@ def test_non_designated_host_does_not_write_the_shared_log(tmp_path, monkeypatch
 
     watch_mod.main()
 
-    assert not (state_dir / "watcher.log").exists()
+    assert (state_dir / "watcher.log").exists() is False
 
 
 def test_missing_designation_file_exits_nonzero(tmp_path, monkeypatch):

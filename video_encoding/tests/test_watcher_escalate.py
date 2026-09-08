@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from video_encoding.watcher.detectors import Flag
 from video_encoding.watcher.escalate import (
     DEFAULT_ESCALATION_BUDGET_PER_DAY,
@@ -14,6 +16,8 @@ from video_encoding.watcher.escalate import (
 )
 from video_encoding.watcher.registry import JobRecord
 from video_encoding.watcher.state import JobState, WatcherState
+
+pytestmark = pytest.mark.integration
 
 
 def test_should_escalate_true_when_never_escalated():
