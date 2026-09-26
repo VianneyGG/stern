@@ -5,18 +5,26 @@ AFEW-VA (ibug, EULA-gated) ships 600 clip folders, each with zero-padded frame
 images and one JSON annotation file mapping every frame to integer valence /
 arousal in [-10, 10] plus 68 landmarks:
 
-    {"video_id": "001",
+    {"actor": "Actor Name", "video_id": "001",
      "frames": {"00000": {"valence": 2, "arousal": -3, "landmarks": [[x, y] * 68]},
                 ...}}
 
 This writes, under `--out-root` (defaults to the AFEW-VA root):
-  labels/<clip>.csv   two columns `valence,arousal`, one row per frame (raw [-10,10])
+  labels/<clip>.csv   two columns `valence,arousal`, one row per frame, pre-divided
+                       by 10.0 into [-1,1] (see PROBE_VA_RANGE note below)
   manifest.csv        one ManifestRecord per clip (role=probe)
 
-`conf/dataset/afewva.yaml` sets `va_range=[-10,10]`, so `harmonise_va` maps these
-to [-1,1] at load time. The exact JSON schema is not published on the ibug page --
-run this on the first real clip after download and eyeball the CSV to confirm the
-parser matches (verification step in the plan).
+`diag_probe.py` pins `PROBE_VA_RANGE = (-1.0, 1.0)` with no per-dataset override,
+so labels are written already in [-1,1] here rather than relying on `harmonise_va`
+to rescale from AFEW-VA's native [-10,10] -- `conf/dataset/afewva.yaml` must set
+`va_range: [-1.0, 1.0]` to match (making that harmonise_va call a no-op).
+
+`identity_id` is the clip's `actor` field when present (enables an actor-disjoint
+fit/scored split), falling back to the clip id otherwise.
+
+A clip whose frame count and annotation count disagree is skipped and reported --
+never aligned to the shorter, since `VAWindowDataset` mean-pools labels per window
+and a silent misalignment corrupts CCC for every window in that clip.
 
 Run as (repo root, `data.manifest` needs the root on PYTHONPATH -- pytest sets
 this via pyproject.toml's `pythonpath`, a bare script invocation does not):
@@ -34,16 +42,19 @@ from data.labels import write_label_csv
 from data.manifest import ManifestRecord, write_manifest
 from video_encoding.data.frame_decoder import _IMAGE_EXTS
 
+_VA_SCALE = 10.0  # AFEW-VA's native [-10, 10] -> [-1, 1] for PROBE_VA_RANGE
 
-def parse_clip_annotations(json_path: Path) -> list[tuple[float, float]]:
-    """Return `[(valence, arousal), ...]` in frame order from one clip's JSON.
 
-    Sorts frame keys numerically when every key is an integer, matching
-    `frame_decoder.list_frame_files`' numeric-sort guard: a plain lexicographic
-    `sorted(frames)` would order unpadded keys as "0","1","10","11","2",...,
-    silently misaligning every label from frame index 2 onward. The real
-    AFEW-VA JSON schema is unconfirmed (per this module's docstring), so this
-    guards against that risk rather than assuming zero-padding.
+def parse_clip_annotations(
+    json_path: Path,
+) -> tuple[str | None, list[tuple[float, float]]]:
+    """Return `(actor, [(valence, arousal), ...])` in frame order from one clip's JSON.
+
+    Valence/arousal are scaled from AFEW-VA's native [-10, 10] into [-1, 1] (see
+    module docstring). Sorts frame keys numerically when every key is an integer,
+    matching `frame_decoder.list_frame_files`' numeric-sort guard: a plain
+    lexicographic `sorted(frames)` would order unpadded keys as "0","1","10",
+    "11","2",..., silently misaligning every label from frame index 2 onward.
     """
     data = json.loads(Path(json_path).read_text())
     frames = data.get("frames")
@@ -55,11 +66,16 @@ def parse_clip_annotations(json_path: Path) -> list[tuple[float, float]]:
         sorted(frames, key=int) if all(k.isdigit() for k in frames) else sorted(frames)
     )
     rows = [
-        (float(frames[key]["valence"]), float(frames[key]["arousal"])) for key in keys
+        (
+            float(frames[key]["valence"]) / _VA_SCALE,
+            float(frames[key]["arousal"]) / _VA_SCALE,
+        )
+        for key in keys
     ]
     if not rows:
         raise ValueError(f"{json_path}: 'frames' is empty")
-    return rows
+    actor = data.get("actor") or None
+    return actor, rows
 
 
 def build(afewva_root: Path, out_root: Path, *, annotation_hz: float = 30.0) -> Path:
@@ -75,24 +91,22 @@ def build(afewva_root: Path, out_root: Path, *, annotation_hz: float = 30.0) -> 
         jsons = sorted(clip_dir.glob("*.json"))
         if not jsons:
             continue
-        rows = parse_clip_annotations(jsons[0])
         clip = clip_dir.name
+        actor, rows = parse_clip_annotations(jsons[0])
         n_frames = sum(1 for p in clip_dir.iterdir() if p.suffix.lower() in _IMAGE_EXTS)
         if n_frames == 0:
-            print(
-                f"WARNING: skipping {clip!r} -- 0 extracted frames (annotations present)"
-            )
+            print(f"SKIPPED {clip!r} -- 0 extracted frames (annotations present)")
             continue
         if n_frames != len(rows):
             print(
-                f"WARNING: {clip!r} has {n_frames} frames but {len(rows)} annotation "
-                "rows -- will align to the shorter of the two at training time"
+                f"SKIPPED {clip!r} -- {n_frames} frames but {len(rows)} annotation rows"
             )
+            continue
         csv_rel = f"labels/{clip}.csv"
         write_label_csv(out_root / csv_rel, rows)
         records.append(
             ManifestRecord(
-                identity_id=clip,
+                identity_id=actor or clip,
                 clip_path=clip,
                 duration_s=n_frames / annotation_hz,
                 role="probe",

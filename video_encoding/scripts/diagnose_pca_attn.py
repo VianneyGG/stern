@@ -33,13 +33,14 @@ import matplotlib.pyplot as plt
 import torch
 
 from video_encoding.models.videomaev2.masking import RandomTubeMasking
+from video_encoding.scripts._diag_common import load_bundle
 from video_encoding.scripts.diagnose_conditioning import (
     BATCH_SIZE,
     CHECKPOINTS,
     SEED,
+    _run_id_and_shared,
     load_encoder,
 )
-from video_encoding.training.checkpoint import load_checkpoint_file, load_encoder_state
 
 OUT_DIR = Path.home() / "stern" / "runs" / "results" / "diagnostics" / "pca_attn"
 DEPTH_SAMPLES = (1, 6, 12)  # early / mid / late blocks to visualise in detail
@@ -82,18 +83,10 @@ def pca_components_for_variance(
 
 
 def load_model(name: str, path: Path, device: torch.device):
-    payload = load_checkpoint_file(path)
-    state_dict = payload.get("model_state_dict", payload)
-    encoder_state = {
-        k[len("encoder.") :]: v
-        for k, v in state_dict.items()
-        if k.startswith("encoder.")
-    }
-    encoder, model_cfg = load_encoder(device)
-    missing, _ = load_encoder_state(encoder, encoder_state)
-    if missing:
-        print(f"  WARNING missing keys: {missing}")
-    encoder.eval()
+    _, model_cfg = load_encoder(device)
+    run_id, mesh_shared = _run_id_and_shared(path)
+    bundle = load_bundle(run_id, mesh_shared, model_cfg, full_model=False)
+    encoder = bundle.encoder.to(device)
     return encoder, model_cfg
 
 

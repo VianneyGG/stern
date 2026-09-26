@@ -1,7 +1,10 @@
 name: afewva
 role: probe            # labelled VA set for end-to-end fine-tuning; film-acted -> report separately (REPO_SETUP §2)
-present: false        # flip to true after the ibug EULA download + scripts/build_afewva_manifest.py
-va_range: [-10.0, 10.0]  # AFEW-VA native VA range; harmonise_va maps -> [-1, 1]
+present: ${oc.decode:${oc.env:AFEWVA_PRESENT,false}}  # staged on login-node at
+                       # /Data/$USER/afewva/raw (2026-09-10); export
+                       # AFEWVA_PRESENT=true on checkouts where it's mounted
+va_range: [-1.0, 1.0]  # build_afewva_manifest.py pre-scales native [-10,10] into [-1,1]
+                       # to match diag_probe.py's pinned PROBE_VA_RANGE=(-1,1)
 annotation_hz: 30.0   # AFEW-VA frames are sampled at ~30fps
 path: ${oc.env:AFEWVA_ROOT,???}
 manifest_path: ${oc.env:AFEWVA_ROOT,???}/manifest.csv

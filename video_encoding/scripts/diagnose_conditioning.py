@@ -38,9 +38,8 @@ import torch
 from omegaconf import OmegaConf
 
 from video_encoding.models.videomaev2.encoder import VideoMAEEncoder
-from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
 from video_encoding.models.videomaev2.masking import RandomTubeMasking
-from video_encoding.training.checkpoint import load_checkpoint_file, load_encoder_state
+from video_encoding.scripts._diag_common import load_bundle
 
 CHECKPOINT_ROOT = Path.home() / "stern_mesh" / "checkpoints"
 CHECKPOINTS = {
@@ -91,17 +90,18 @@ def load_encoder(device: torch.device) -> tuple[VideoMAEEncoder, dict]:
     return encoder, model_cfg
 
 
+def _run_id_and_shared(path: Path) -> tuple[str, Path]:
+    """`path` is `CHECKPOINT_ROOT/<run_id>/master.pt`, and `CHECKPOINT_ROOT`
+    itself already ends in `checkpoints` -- `load_bundle` appends
+    `checkpoints/<run_id>/master.pt` itself, so `mesh_shared` is three
+    `.parent`s up, not two."""
+    return path.parent.name, path.parent.parent.parent
+
+
 def analyze_checkpoint(name: str, path: Path, device: torch.device) -> None:
     print(f"\n=== {name} ({path}) ===")
-    payload = load_checkpoint_file(path)
-    state_dict = payload.get("model_state_dict", payload)
-    encoder_state = {
-        k[len("encoder.") :]: v
-        for k, v in state_dict.items()
-        if k.startswith("encoder.")
-    }
-
-    encoder, model_cfg = load_encoder(device)
+    run_id, mesh_shared = _run_id_and_shared(path)
+    model_cfg = OmegaConf.load(MODEL_CFG_PATH)
     # predict_head shape depends on target_mode (time_avg: 768, per_frame: 1536);
     # checkpoints were trained under both, so this must match the checkpoint,
     # not the base config's default, or mae_model.load_state_dict shape-mismatches.
@@ -112,9 +112,10 @@ def analyze_checkpoint(name: str, path: Path, device: torch.device) -> None:
     if "paper" in name:
         model_cfg.decoder_embed_dim = 384
         model_cfg.decoder_num_heads = 6
-    missing, unexpected = load_encoder_state(encoder, encoder_state)
-    if missing:
-        print(f"  WARNING missing keys: {missing}")
+
+    bundle = load_bundle(run_id, mesh_shared, model_cfg, full_model=True)
+    encoder = bundle.encoder.to(device)
+    mae_model = bundle.model.to(device)
 
     depth = int(model_cfg.depth)
     torch.manual_seed(SEED)
@@ -156,8 +157,6 @@ def analyze_checkpoint(name: str, path: Path, device: torch.device) -> None:
         )
 
     # --- gradient spectrum: one MAE-loss backward pass at this checkpoint ---
-    mae_model = VideoMAEForPreTraining(model_cfg).to(device)
-    mae_model.load_state_dict(state_dict, strict=False)
     mae_model.train()
     mae_model.zero_grad()
     pred, target = mae_model(

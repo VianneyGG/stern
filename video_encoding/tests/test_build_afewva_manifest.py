@@ -37,9 +37,10 @@ def _write_clip(clip_dir: Path, va_rows: list[tuple[int, int]]) -> None:
 def test_parse_clip_annotations_orders_by_frame_key(tmp_path: Path):
     _write_clip(tmp_path / "007", [(1, -2), (3, 4), (-5, 6)])
 
-    rows = parse_clip_annotations(tmp_path / "007" / "007.json")
+    actor, rows = parse_clip_annotations(tmp_path / "007" / "007.json")
 
-    assert rows == [(1.0, -2.0), (3.0, 4.0), (-5.0, 6.0)]
+    assert actor is None
+    assert rows == [(0.1, -0.2), (0.3, 0.4), (-0.5, 0.6)]
 
 
 def test_parse_clip_annotations_sorts_unpadded_keys_numerically(tmp_path: Path):
@@ -51,9 +52,9 @@ def test_parse_clip_annotations_sorts_unpadded_keys_numerically(tmp_path: Path):
     frames = {str(i): {"valence": i, "arousal": -i} for i in range(11)}
     (clip_dir / "010.json").write_text(json.dumps({"frames": frames}))
 
-    rows = parse_clip_annotations(clip_dir / "010.json")
+    _, rows = parse_clip_annotations(clip_dir / "010.json")
 
-    assert rows == [(float(i), float(-i)) for i in range(11)]
+    assert rows == [(i / 10.0, -i / 10.0) for i in range(11)]
 
 
 def test_build_emits_probe_manifest_and_harmonisable_labels(tmp_path: Path):
@@ -69,8 +70,8 @@ def test_build_emits_probe_manifest_and_harmonisable_labels(tmp_path: Path):
     assert rec001.clip_path == "001"
     assert rec001.label_path == "labels/001.csv"
 
-    # [-10,10] -> [-1,1]: endpoints map to +-1, midpoint to 0.
-    va = load_per_frame_va(tmp_path / rec001.label_path, (-10.0, 10.0))
+    # Labels are pre-scaled [-10,10] -> [-1,1]: endpoints map to +-1, midpoint to 0.
+    va = load_per_frame_va(tmp_path / rec001.label_path, (-1.0, 1.0))
     np.testing.assert_allclose(va[0], [1.0, -1.0])
     np.testing.assert_allclose(va[1], [0.0, 0.5])
     np.testing.assert_allclose(va[2], [-1.0, 1.0])

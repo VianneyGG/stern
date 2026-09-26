@@ -193,6 +193,40 @@ def test_load_encoder_missing_checkpoint_raises_file_not_found(tmp_path):
         load_encoder("no_such_run", tmp_path, cfg)
 
 
+def test_load_encoder_output_unchanged_by_loader_swap(tmp_path):
+    """Pins load_encoder's output against the pre-swap implementation: same
+    key set, bit-identical tensors. Must stay green after the load_bundle
+    swap (ssl-diag-02-loader-depth 2.4) -- a numeric change here is exactly
+    the regression the swap must not introduce."""
+    cfg = _tiny_model_cfg()
+    source_model = VideoMAEForPreTraining(cfg)
+    ckpt_dir = tmp_path / "checkpoints" / "r1"
+    ckpt_dir.mkdir(parents=True)
+    torch.save(
+        {"model_state_dict": source_model.state_dict(), "master_version": 1},
+        ckpt_dir / "master.pt",
+    )
+
+    loaded = load_encoder("r1", tmp_path, cfg)
+    expected = source_model.encoder.state_dict()
+
+    assert set(loaded.state_dict().keys()) == set(expected.keys())
+    for name, p_expected in expected.items():
+        assert torch.allclose(loaded.state_dict()[name], p_expected), name
+
+
+def test_load_encoder_random_init_returns_untrained_encoder(tmp_path):
+    """No checkpoint on disk at all for `random_init` -- routes to the
+    untrained control arm rather than reading checkpoints/random_init/master.pt.
+    Without this test, nothing catches export_vit_internals.py:322-325
+    swallowing FileNotFoundError into a silent "WARNING ... skipping", which
+    would make a broken control arm vanish from the plots instead of failing."""
+    cfg = _tiny_model_cfg()
+    encoder = load_encoder("random_init", tmp_path, cfg)
+    assert not (tmp_path / "checkpoints" / "random_init").exists()
+    assert encoder.training is False
+
+
 @pytest.mark.integration
 def test_model_cfg_for_run_e2b2_prefix_sets_paper_decoder_and_registers():
     """e2b2-* arms (EXPERIMENTS.md) launch from the same paper recipe as

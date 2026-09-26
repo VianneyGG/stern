@@ -370,3 +370,76 @@ class TestShuffleTransformAcrossDataLoaderWorkers:
     def test_every_draw_is_still_a_permutation(self, monkeypatch):
         for perm in self._perms(monkeypatch, 2, n=10):
             assert sorted(perm) == list(range(8))
+
+
+class TestFrameStride:
+    """Stride exists to match the probe corpus's frame rate to the SSL corpus's
+    (AFEW-VA ~30fps vs 8.33fps shards). What must not break is the alignment
+    contract: the label has to describe the frames the model was handed."""
+
+    def test_stride_one_is_the_pre_stride_behaviour(self, tmp_path):
+        labelled = _labelled(tmp_path, ["a/clip"], n_frames=NUM_FRAMES * 4)
+        assert len(_dataset(labelled, hi=100.0)) == len(
+            VAWindowDataset(
+                labelled,
+                num_frames=NUM_FRAMES,
+                image_size=IMAGE_SIZE,
+                overlap=0.0,
+                va_range=(0.0, 100.0),
+                frame_stride=1,
+            )
+        )
+
+    def test_strided_window_returns_every_nth_frame(self, tmp_path):
+        labelled = _labelled(tmp_path, ["a/clip"], n_frames=NUM_FRAMES * 4)
+        dataset = VAWindowDataset(
+            labelled,
+            num_frames=NUM_FRAMES,
+            image_size=IMAGE_SIZE,
+            overlap=0.0,
+            va_range=(0.0, 100.0),
+            frame_stride=3,
+        )
+        pixel_values, _ = dataset[0]
+        # frame i is a solid image of value i (see _write_indexed_frames), and
+        # preprocess_window normalises, so compare the *ordering* of frame means
+        # against the strided index list rather than raw pixel values.
+        frame_means = pixel_values[0].mean(dim=(1, 2))
+        steps = (frame_means[1:] - frame_means[:-1]).tolist()
+        assert all(step > 0 for step in steps)
+        assert steps[0] == pytest.approx(steps[-1], rel=1e-3)
+
+    def test_strided_label_averages_only_the_sampled_rows(self, tmp_path):
+        """The trap: averaging `va[start:start+num_frames]` under a stride would
+        label a 2.1s window with the VA of its first 0.53s."""
+        labelled = _labelled(tmp_path, ["a/clip"], n_frames=NUM_FRAMES * 3 + 1)
+        dataset = VAWindowDataset(
+            labelled,
+            num_frames=NUM_FRAMES,
+            image_size=IMAGE_SIZE,
+            overlap=0.0,
+            va_range=(0.0, 100.0),
+            frame_stride=3,
+        )
+        _, label = dataset[0]
+        sampled = np.arange(0, NUM_FRAMES * 3, 3, dtype=np.float64)
+        expected = float((2.0 * sampled / 100.0 - 1.0).mean())
+        assert label[0].item() == pytest.approx(expected, abs=1e-6)
+        contiguous = float(
+            (2.0 * np.arange(NUM_FRAMES, dtype=np.float64) / 100.0 - 1.0).mean()
+        )
+        assert label[0].item() != pytest.approx(contiguous, abs=1e-3)
+
+    def test_stride_drops_windows_that_run_past_the_clip(self, tmp_path):
+        """A strided window spans (num_frames-1)*stride+1 frames, so a clip that
+        fits three unstrided windows fits none at stride 4."""
+        labelled = _labelled(tmp_path, ["a/clip"], n_frames=NUM_FRAMES * 3)
+        with pytest.raises(ValueError, match="no usable clips"):
+            VAWindowDataset(
+                labelled,
+                num_frames=NUM_FRAMES,
+                image_size=IMAGE_SIZE,
+                overlap=0.0,
+                va_range=(0.0, 100.0),
+                frame_stride=4,
+            )

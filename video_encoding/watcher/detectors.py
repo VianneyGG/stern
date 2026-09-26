@@ -148,6 +148,33 @@ def detect_quota(
     return flags
 
 
+_DRAINED_STATE_PREFIXES = ("drain", "down")
+
+
+def detect_drained_nodes(
+    node_states: dict[str, str], roster: Collection[str]
+) -> list[Flag]:
+    """Flag roster nodes SLURM itself has drained/downed (sinfo state),
+    distinct from this repo's software-level exclude_node. A node absent
+    from node_states (sinfo failed, or the node isn't in the partition)
+    yields no flag -- fail-closed-on-unknown, matching
+    detect_foreign_gpu_process's stance."""
+    flags = []
+    for node in roster:
+        state = node_states.get(node)
+        if state is None:
+            continue
+        if state.lower().startswith(_DRAINED_STATE_PREFIXES):
+            flags.append(
+                Flag(
+                    subject=f"drain:{node}",
+                    kind="node_drained",
+                    detail=f"{node}: sinfo state={state}",
+                )
+            )
+    return flags
+
+
 def _last_json_line(path: Path) -> dict | None:
     last: str | None = None
     try:

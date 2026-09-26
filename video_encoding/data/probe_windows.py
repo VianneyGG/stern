@@ -93,6 +93,7 @@ class VAWindowDataset(Dataset):
         image_size: int,
         overlap: float,
         va_range: tuple[float, float],
+        frame_stride: int = 1,
         transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ):
         self._num_frames = num_frames
@@ -115,9 +116,18 @@ class VAWindowDataset(Dataset):
                 continue
             n = min(len(frame_files), va.shape[0])
             for _, idx in build_frame_windows(
-                clip_dir, num_frames=num_frames, overlap=overlap, n_frames=n
+                clip_dir,
+                num_frames=num_frames,
+                overlap=overlap,
+                n_frames=n,
+                frame_stride=frame_stride,
             ):
-                label = va[idx[0] : idx[0] + num_frames].mean(axis=0)
+                # Averaged over the sampled rows, not over the span: under a
+                # stride the span's other rows describe frames the encoder was
+                # never shown, so including them would label the window with
+                # motion it cannot see. Identical to the contiguous slice at
+                # stride 1.
+                label = va[idx].mean(axis=0)
                 self._items.append((frame_files, idx, label.astype(np.float32)))
         if skipped:
             print(

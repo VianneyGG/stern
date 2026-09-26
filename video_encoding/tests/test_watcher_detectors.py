@@ -4,6 +4,7 @@ import json
 
 from video_encoding.watcher.detectors import (
     detect_dead,
+    detect_drained_nodes,
     detect_foreign_gpu_process,
     detect_nan,
     detect_quota,
@@ -318,3 +319,43 @@ def test_detect_nan_still_flags_a_nan_written_during_the_current_round(tmp_path)
     flags = detect_nan("run1", tmp_path, state)
     assert len(flags) == 1
     assert flags[0].subject == "nan:run1:nodeA"
+
+
+def test_detect_drained_nodes_flags_drained_state():
+    flags = detect_drained_nodes(
+        {"node001": "drained", "node002": "idle"}, roster=["node001", "node002"]
+    )
+    assert len(flags) == 1
+    assert flags[0].subject == "drain:node001"
+    assert flags[0].kind == "node_drained"
+
+
+def test_detect_drained_nodes_flags_down_state():
+    flags = detect_drained_nodes({"node001": "down"}, roster=["node001"])
+    assert len(flags) == 1
+    assert flags[0].subject == "drain:node001"
+
+
+def test_detect_drained_nodes_flags_draining_state():
+    flags = detect_drained_nodes({"node001": "draining"}, roster=["node001"])
+    assert len(flags) == 1
+    assert flags[0].subject == "drain:node001"
+
+
+def test_detect_drained_nodes_ignores_idle_and_mixed_states():
+    flags = detect_drained_nodes(
+        {"node001": "idle", "node002": "mixed"}, roster=["node001", "node002"]
+    )
+    assert flags == []
+
+
+def test_detect_drained_nodes_only_checks_roster_nodes():
+    flags = detect_drained_nodes(
+        {"node001": "drained", "node002": "drained"}, roster=["node002"]
+    )
+    assert {f.subject for f in flags} == {"drain:node002"}
+
+
+def test_detect_drained_nodes_ignores_node_absent_from_sinfo():
+    flags = detect_drained_nodes({}, roster=["node001"])
+    assert flags == []

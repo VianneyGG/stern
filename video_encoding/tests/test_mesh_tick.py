@@ -15,6 +15,7 @@ from video_encoding.watcher.mesh_tick import (
     MeshRunConfig,
     _clean_stale_run_artifacts,
     _do_awaiting_checkpoints,
+    _exclude_drained_nodes,
     _recover_pool,
     _relaunch_chunk_if_finished,
     _replenish_pool,
@@ -196,7 +197,8 @@ def test_assigning_writes_assignments_file_and_submits_jobs(tmp_path):
             now=1000.0,
         )
 
-    assert mock_run.call_count == 3
+    # 3 sbatch submissions + 1 batched squeue recheck of the accepted job ids.
+    assert mock_run.call_count == 4
     assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
     assignments = json.loads(assignments_path.read_text())
     assert set(assignments.keys()) == set(_NODES)
@@ -243,9 +245,9 @@ def test_clean_stale_run_artifacts_does_not_touch_other_run_ids(tmp_path):
 
     deleted = _clean_stale_run_artifacts("pool-fish", mesh_shared)
 
-    assert (flags_dir / "sync_complete_pool-fish-5r_0.flag").exists()
-    assert not (flags_dir / "sync_complete_pool-fish_0.flag").exists()
     assert deleted == [flags_dir / "sync_complete_pool-fish_0.flag"]
+    assert (flags_dir / "sync_complete_pool-fish-5r_0.flag").exists()
+    assert (flags_dir / "sync_complete_pool-fish-5r_0.flag") not in deleted
 
 
 def test_clean_stale_run_artifacts_does_not_touch_underscore_suffixed_sibling(
@@ -1464,7 +1466,9 @@ def test_advance_all_runs_stops_at_first_blocking_state(tmp_path):
             now=1000.0,  # freshly-written files, nowhere near ROUND_TIMEOUT_S
         )
 
-    mock_run.assert_not_called()
+    # Exactly the batched sinfo drained-node recheck -- nothing else can run
+    # while genuinely blocked on checkpoints.
+    assert mock_run.call_count == 1
     assert actions == []
     assert state.run("RUN1").status == "AWAITING_CHECKPOINTS"
 
@@ -1598,6 +1602,78 @@ def test_submit_worker_job_extra_override_composes_against_real_experiment_confi
             overrides=[f"experiment={run_config.experiment}", *overrides],
         )
     assert cfg.train.accum_steps == 128
+
+
+def test_submit_worker_job_retries_once_after_a_failed_sbatch_call(tmp_path):
+    """A single rejected sbatch call (partition hiccup, transient scheduler
+    error) must not be treated as terminal -- retry once before giving up."""
+    run_config = _run_config()
+    registry_path = tmp_path / "jobs_registry.json"
+    failed = MagicMock(
+        returncode=1, stdout="", stderr="sbatch: error: Socket timed out"
+    )
+    succeeded = MagicMock(returncode=0, stdout="Submitted batch job 999\n")
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run",
+        side_effect=[failed, succeeded],
+    ) as mock_run:
+        job_id = _submit_worker_job(
+            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+        )
+    assert job_id == "999"
+    assert mock_run.call_count == 2
+
+
+def test_submit_worker_job_returns_none_after_two_failed_sbatch_calls(tmp_path):
+    run_config = _run_config()
+    registry_path = tmp_path / "jobs_registry.json"
+    failed = MagicMock(
+        returncode=1, stdout="", stderr="sbatch: error: Invalid node name"
+    )
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run",
+        side_effect=[failed, failed],
+    ) as mock_run:
+        job_id = _submit_worker_job(
+            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+        )
+    assert job_id is None
+    assert mock_run.call_count == 2
+
+
+def test_submit_worker_job_logs_returncode_and_stderr_on_final_failure(
+    tmp_path, capsys
+):
+    """Upgrade #1: sbatch's stderr/returncode used to be captured and
+    discarded (returned bare None), and with no sacct on this cluster that
+    was the only diagnostic signal a rejected submission ever produced."""
+    run_config = _run_config()
+    registry_path = tmp_path / "jobs_registry.json"
+    failed = MagicMock(
+        returncode=1, stdout="", stderr="sbatch: error: Invalid node name specified"
+    )
+    with patch(
+        "video_encoding.watcher.mesh_tick.subprocess.run",
+        side_effect=[failed, failed],
+    ):
+        _submit_worker_job(
+            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+        )
+    err = capsys.readouterr().err
+    assert "node001" in err
+    assert "returncode=1" in err
+    assert "Invalid node name specified" in err
+
+
+def test_submit_worker_job_does_not_log_on_success(tmp_path, capsys):
+    run_config = _run_config()
+    registry_path = tmp_path / "jobs_registry.json"
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 1000\n")
+    with patch("video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake):
+        _submit_worker_job(
+            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+        )
+    assert capsys.readouterr().err == ""
 
 
 def test_submit_worker_job_appends_call_site_extra_overrides(tmp_path):
@@ -2763,7 +2839,8 @@ def test_assigning_skips_a_node_that_holds_no_shards(tmp_path):
             now=1000.0,
         )
 
-    assert mock_run.call_count == 2, "a shardless node must not get a worker job"
+    # 2 sbatch submissions + 1 batched squeue recheck of the accepted job ids.
+    assert mock_run.call_count == 3, "a shardless node must not get a worker job"
     assignments = json.loads(
         (mesh_shared / "metadata" / "shard_assignments_RUN1.json").read_text()
     )
@@ -3649,8 +3726,13 @@ def test_assigning_reports_nodes_whose_sbatch_failed(tmp_path):
 
     outcomes = [
         MagicMock(returncode=0, stdout="Submitted batch job 101\n"),
+        # _submit_worker_job retries once before giving up on a node --
+        # both attempts must fail for this node to end up reported failed.
+        MagicMock(returncode=1, stdout="", stderr="sbatch: error: node down"),
         MagicMock(returncode=1, stdout="", stderr="sbatch: error: node down"),
         MagicMock(returncode=0, stdout="Submitted batch job 103\n"),
+        # Batched squeue recheck of the two accepted job ids (101, 103).
+        MagicMock(returncode=0, stdout="101|PENDING\n103|PENDING\n"),
     ]
     with patch("video_encoding.watcher.mesh_tick.subprocess.run", side_effect=outcomes):
         action = advance_one_run(
@@ -3675,6 +3757,102 @@ def test_assigning_reports_nodes_whose_sbatch_failed(tmp_path):
     )
     assert [r["slurm_job_id"] for r in registry] == ["101", "103"]
     assert [r["nodelist"] for r in registry] == [_NODES[0], _NODES[2]]
+
+
+def test_assigning_reports_node_whose_job_fails_immediately_after_accept(tmp_path):
+    """sbatch can accept a submission (return a job id) for a node a
+    concurrent launcher already grabbed, and SLURM then fails the job
+    itself moments later (NODE_FAIL/BOOT_FAIL) -- a bad batched squeue
+    recheck right after submission catches this before the full round
+    timeout would. Treated like a failed submit: reported, not excluded."""
+    mesh_shared = tmp_path / "mesh_shared"
+    _seed_shard_map(mesh_shared)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    outcomes = [
+        MagicMock(returncode=0, stdout="Submitted batch job 101\n"),
+        MagicMock(returncode=0, stdout="Submitted batch job 102\n"),
+        MagicMock(returncode=0, stdout="Submitted batch job 103\n"),
+    ]
+    job_states = {"101": "PENDING", "102": "NODE_FAIL", "103": "PENDING"}
+    with (
+        patch("video_encoding.watcher.mesh_tick.subprocess.run", side_effect=outcomes),
+        patch(
+            "video_encoding.watcher.mesh_tick.query_job_states",
+            return_value=job_states,
+        ),
+    ):
+        action = advance_one_run(
+            _run_config(),
+            state=WatcherState(),
+            repo_root=repo_root,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path / "mesh_root",
+            now=1000.0,
+        )
+
+    assert "2/3 nodes submitted" in action
+    failed = action.split("sbatch FAILED for ")[1].split(";")[0]
+    assert failed == _NODES[1]
+
+    # Registry keeps all three -- sbatch itself succeeded for all of them;
+    # only the post-accept state is bad.
+    registry = json.loads(
+        (repo_root / "runs" / "state" / "jobs_registry.json").read_text()
+    )
+    assert [r["slurm_job_id"] for r in registry] == ["101", "102", "103"]
+
+
+def test_exclude_drained_nodes_excludes_a_slurm_drained_roster_node():
+    run_config = _run_config()  # nodes = node001, node002, node003
+    state = WatcherState()
+    state.run("RUN1").status = "RUNNING"
+
+    actions = _exclude_drained_nodes(
+        [run_config], state, {"node003": "drained", "node001": "idle"}
+    )
+
+    assert state.excluded_nodes["node003"].startswith("slurm drained")
+    assert len(actions) == 1
+    assert "node003" in actions[0] and "RUN1" in actions[0]
+
+
+def test_exclude_drained_nodes_ignores_nodes_already_excluded():
+    """No re-notify every tick for a node already handled."""
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "RUNNING"
+    state.excluded_nodes["node003"] = "some earlier reason"
+
+    actions = _exclude_drained_nodes([run_config], state, {"node003": "drained"})
+
+    assert actions == []
+    assert state.excluded_nodes["node003"] == "some earlier reason"
+
+
+def test_exclude_drained_nodes_skips_done_runs():
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "DONE"
+
+    actions = _exclude_drained_nodes([run_config], state, {"node003": "drained"})
+
+    assert actions == []
+    assert "node003" not in state.excluded_nodes
+
+
+def test_exclude_drained_nodes_ignores_idle_nodes():
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "RUNNING"
+
+    actions = _exclude_drained_nodes(
+        [run_config], state, {n: "idle" for n in run_config.nodes}
+    )
+
+    assert actions == []
+    assert state.excluded_nodes == {}
 
 
 def _write_straggler_state(

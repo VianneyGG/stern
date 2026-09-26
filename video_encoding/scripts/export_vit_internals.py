@@ -32,13 +32,10 @@ from omegaconf import OmegaConf
 
 from video_encoding.data.wds_frames import load_shard_index, read_shard_frames_indexed
 from video_encoding.data.windows import window_starts
-from video_encoding.mesh.outer_step import to_fp32_state_dict
 from video_encoding.models.videomaev2.encoder import (
     VideoMAEEncoder,
     preprocess_window,
 )
-from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
-from video_encoding.training import checkpoint as ckpt_io
 
 
 def sample_clip_keys(
@@ -137,31 +134,14 @@ def load_encoder(run_id: str, mesh_shared: Path, model_cfg) -> VideoMAEEncoder:
     would mean plotting a random encoder's internals under a trained run's
     label.
     """
+    # Local import: _diag_common imports load_sample_windows from this module,
+    # so a module-level import here would be circular.
+    from video_encoding.scripts._diag_common import load_bundle, random_init_bundle
+
     model_cfg = model_cfg_for_run(model_cfg, run_id)
-    model = VideoMAEForPreTraining(model_cfg)
     if run_id == "random_init":
-        return model.encoder.eval()
-    ckpt_path = Path(mesh_shared) / "checkpoints" / run_id / "master.pt"
-    payload = ckpt_io.load_checkpoint_file(ckpt_path)
-    state_dict = to_fp32_state_dict(payload["model_state_dict"])
-    result = model.load_state_dict(state_dict, strict=False)
-    # Checkpoints predating RegisterTokens lack `encoder.registers.tokens`.
-    # At num_registers=0 that parameter holds zero elements and is never used,
-    # so tolerate exactly this key -- and only when it is genuinely empty.
-    missing = [
-        k
-        for k in result.missing_keys
-        if not (
-            k == "encoder.registers.tokens"
-            and model.encoder.registers.tokens.numel() == 0
-        )
-    ]
-    if missing or result.unexpected_keys:
-        raise ValueError(
-            f"{run_id}: checkpoint/model key mismatch -- "
-            f"missing={missing[:5]} unexpected={result.unexpected_keys[:5]}"
-        )
-    return model.encoder.eval()
+        return random_init_bundle(model_cfg, full_model=True).encoder
+    return load_bundle(run_id, mesh_shared, model_cfg, full_model=True).encoder
 
 
 def run_encoder_with_internals(

@@ -22,6 +22,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Collection
 from dataclasses import dataclass, field
@@ -42,7 +43,13 @@ from video_encoding.mesh.quorum import ready_for_merge
 from video_encoding.mesh.topology import NODE_GROUPS
 from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.tb_logger import flush_final_tb_rounds
-from video_encoding.watcher.cluster import query_idle_nodes
+from video_encoding.watcher.cluster import (
+    query_idle_nodes,
+    query_job_states,
+    query_node_states,
+)
+from video_encoding.watcher.detectors import detect_drained_nodes
+from video_encoding.watcher.notify import notify
 from video_encoding.watcher.node_health import query_node_health, truly_idle
 from video_encoding.watcher.epoch_advance import (
     MISSED_ROUND_THRESHOLD,
@@ -158,6 +165,38 @@ def load_run_configs(path: Path) -> list[MeshRunConfig]:
     return [MeshRunConfig(**entry) for entry in payload]
 
 
+def _exclude_drained_nodes(
+    run_configs: list[MeshRunConfig],
+    state: WatcherState,
+    node_states: dict[str, str],
+) -> list[str]:
+    """SLURM-drain a roster node (admin/hardware action, sinfo state) and
+    the run it belongs to never notices -- sbatch just keeps failing
+    against it every relaunch. Exclude it the same way a crash-loop would,
+    once per tick's worth of run configs (node_states itself is one
+    batched sinfo call for the whole tick, done by the caller).
+
+    Skips nodes already in state.excluded_nodes so notify() (no dedupe of
+    its own) doesn't refire every tick for the same standing drain, and
+    skips DONE runs since there is nothing left to protect there.
+    """
+    actions: list[str] = []
+    for run_config in run_configs:
+        if state.run(run_config.run_id).status == "DONE":
+            continue
+        roster = [n for n in run_config.nodes if n not in state.excluded_nodes]
+        for flag in detect_drained_nodes(node_states, roster=roster):
+            node = flag.subject.split(":", 1)[1]
+            exclude_node(
+                state, node, f"slurm drained ({flag.detail}), of {run_config.run_id}"
+            )
+            notify(flag.subject, flag.detail)
+            actions.append(
+                f"{run_config.run_id}: excluded {node} (SLURM drained) -- {flag.detail}"
+            )
+    return actions
+
+
 def advance_all_runs(
     run_configs: list[MeshRunConfig],
     *,
@@ -183,7 +222,7 @@ def advance_all_runs(
     keeps calling the same run_id until one returns None (genuinely
     blocked, e.g. still waiting on checkpoints) or the run reaches DONE.
     """
-    actions: list[str] = []
+    actions: list[str] = _exclude_drained_nodes(run_configs, state, query_node_states())
     for run_config in run_configs:
         # Loop guard: a handler may report an action *without* advancing the
         # state machine -- _do_assigning does exactly that when every node is
@@ -594,13 +633,36 @@ def _submit_worker_job(
         cmd.append(f"++mesh.chunk_rounds={run_config.chunk_rounds}")
     cmd.extend(run_config.extra_overrides)
     cmd.extend(extra_overrides)
-    try:
-        result = subprocess.run(
-            cmd, cwd=repo_root, capture_output=True, text=True, timeout=300
+    # Two attempts, not one: with no sacct/slurmdbd on this cluster, a
+    # rejected sbatch is otherwise undiagnosable after the fact and, left
+    # terminal, silently walks the node into grace-expiry -> permanent
+    # exclusion -> shard drop over one transient scheduler hiccup.
+    job_id = None
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                cmd, cwd=repo_root, capture_output=True, text=True, timeout=300
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            if attempt == 1:
+                print(
+                    f"_submit_worker_job: sbatch for {node} ({run_config.run_id}) "
+                    f"raised on attempt {attempt + 1}/2: {exc}",
+                    file=sys.stderr,
+                )
+            continue
+        job_id = (
+            _parse_submitted_job_id(result.stdout) if result.returncode == 0 else None
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    job_id = _parse_submitted_job_id(result.stdout) if result.returncode == 0 else None
+        if job_id is not None:
+            break
+        if attempt == 1:
+            print(
+                f"_submit_worker_job: sbatch for {node} ({run_config.run_id}) "
+                f"failed on attempt {attempt + 1}/2: returncode={result.returncode} "
+                f"stderr={result.stderr.strip()!r}",
+                file=sys.stderr,
+            )
     if job_id is not None:
         append_job_record(
             registry_path,
@@ -748,10 +810,8 @@ def _do_assigning(
     # "16 nodes" while 15 jobs existed. With quorum_k == pool size that one
     # missing worker cannot be waited out: every round runs to the full
     # grace_s and then merges timeout-forced, at 30 minutes a round.
-    failed_submit = [
-        node
-        for node in eligible
-        if _submit_worker_job(
+    submitted_job_ids = {
+        node: _submit_worker_job(
             run_config,
             node,
             repo_root,
@@ -761,8 +821,24 @@ def _do_assigning(
             mesh_shared=mesh_shared,
             shards=assignments[node],
         )
-        is None
-    ]
+        for node in eligible
+    }
+    failed_submit = [node for node, jid in submitted_job_ids.items() if jid is None]
+
+    # A concurrent launcher can grab a node in the window between our sinfo
+    # snapshot and sbatch actually landing it -- sbatch still accepts the
+    # submission (a job id comes back), but SLURM fails the job itself
+    # moments later (NODE_FAIL/BOOT_FAIL). One batched recheck right after
+    # submission catches this instead of waiting out the full round timeout.
+    accepted_ids = {jid: node for node, jid in submitted_job_ids.items() if jid}
+    if accepted_ids:
+        bad_states = {"NODE_FAIL", "BOOT_FAIL", "FAILED", "CANCELLED", "PREEMPTED"}
+        job_states = query_job_states(list(accepted_ids))
+        failed_submit.extend(
+            accepted_ids[jid]
+            for jid, state in job_states.items()
+            if state in bad_states
+        )
 
     run.status = "RUNNING"
     run.round_started_at = now
