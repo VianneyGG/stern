@@ -19,6 +19,7 @@ CPU-sized unit test in tests/test_videomae_encoder.py.
 from __future__ import annotations
 
 import contextlib
+import math
 from pathlib import Path
 
 import hydra
@@ -32,6 +33,7 @@ from eval.ccc import ccc_loss, concordance_correlation_coefficient
 from video_encoding.data.loaders import build_probe_loader
 from video_encoding.data.probe_windows import VAWindowDataset, make_temporal_transform
 from video_encoding.models import VideoMAEVARegressor
+from video_encoding.models.levjepa_hf import HFLeVJEPAVARegressor
 from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.ddp.ddp import setup_ddp, teardown_ddp, wrap_ddp
 from video_encoding.training.loop_utils import set_sampler_epoch
@@ -68,6 +70,7 @@ def run_train_stage(
         image_size=int(cfg.model.image_size),
         overlap=float(cfg.preprocess.window.overlap),
         va_range=tuple(cfg.dataset.va_range),
+        frame_stride=int(cfg.model.get("frame_stride", 1)),
         transform=_temporal_transform(cfg),
     )
     train_loader, val_loader = _split_loaders(
@@ -80,7 +83,10 @@ def run_train_stage(
         num_workers=int(cfg.train.get("num_workers", 0)),
     )
 
-    model = VideoMAEVARegressor(cfg.model).to(device)
+    is_hf = str(cfg.model.get("encoder", "videomae")) == "levjepa_hf"
+    model_cls = HFLeVJEPAVARegressor if is_hf else VideoMAEVARegressor
+    model = model_cls(cfg.model).to(device)
+    model_name = "levjepa_hf_va_regressor" if is_hf else "videomae_va_regressor"
 
     pretrain_encoder_path = cfg.train.get("pretrain_encoder_path", None)
     if pretrain_encoder_path:
@@ -103,8 +109,11 @@ def run_train_stage(
             p.requires_grad = False
 
     model = wrap_ddp(model, cfg, local_rank=local_rank)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable_params, lr=float(cfg.train.learning_rate))
+    optimizer, optimizer_name = _build_optimizer(model, cfg.train)
+    scheduler = _build_scheduler(
+        optimizer, cfg.train, steps_per_epoch=len(train_loader)
+    )
+    amp_bf16 = bool(cfg.train.get("amp_bf16", False))
     writer = make_writer(checkpoint_root / "tb", rank=rank)
 
     best_path = checkpoint_root / "best.pt"
@@ -113,6 +122,9 @@ def run_train_stage(
     start_epoch, best_ccc = _maybe_resume(
         model=model,
         optimizer=optimizer,
+        scheduler=scheduler,
+        model_name=model_name,
+        optimizer_name=optimizer_name,
         device=device,
         best_path=best_path,
         latest_path=latest_path,
@@ -129,8 +141,14 @@ def run_train_stage(
             device,
             accum_steps=int(cfg.train.get("accum_steps", 1)),
             grad_clip=float(cfg.train.get("grad_clip", 0.0)),
+            scheduler=scheduler,
+            amp_bf16=amp_bf16,
         )
-        val = _validate(model, val_loader, device) if val_loader else {}
+        val = (
+            _validate(model, val_loader, device, amp_bf16=amp_bf16)
+            if val_loader
+            else {}
+        )
         mean_ccc = val.get("mean_ccc", -train_loss)  # fall back to -loss if no val
 
         if writer is not None:
@@ -150,7 +168,13 @@ def run_train_stage(
                 best_ccc = mean_ccc
                 result = val
             payload = _payload(
-                model=model, optimizer=optimizer, epoch=epoch, best_ccc=best_ccc
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                best_ccc=best_ccc,
+                model_name=model_name,
+                optimizer_name=optimizer_name,
             )
             if improved:
                 _, disk_best = ckpt_io.save_best(
@@ -183,21 +207,78 @@ def run_train_stage(
     return {"stage": "train", **result}
 
 
-def _payload(*, model, optimizer, epoch: int, best_ccc: float) -> dict:
-    return ckpt_io.base_payload(
+def _build_optimizer(model, train_cfg) -> tuple[torch.optim.Optimizer, str]:
+    """`adam` (the default, unchanged) or `adamw` with the `head.*` params at
+    `learning_rate * head_lr_mult` -- a fine-tuned pretrained backbone wants a
+    far smaller step than a freshly initialised head."""
+    name = str(train_cfg.get("optimizer", "adam"))
+    lr = float(train_cfg.learning_rate)
+    named = [
+        (n, p) for n, p in ckpt_io.unwrap(model).named_parameters() if p.requires_grad
+    ]
+    if name == "adam":
+        return torch.optim.Adam([p for _, p in named], lr=lr), name
+    if name != "adamw":
+        raise ValueError(f"train.optimizer must be adam or adamw, got {name!r}")
+    head_lr = lr * float(train_cfg.get("head_lr_mult", 1.0))
+    groups = [
+        {"params": [p for n, p in named if not n.startswith("head.")], "lr": lr},
+        {"params": [p for n, p in named if n.startswith("head.")], "lr": head_lr},
+    ]
+    groups = [g for g in groups if g["params"]]
+    wd = float(train_cfg.get("weight_decay", 0.0))
+    return torch.optim.AdamW(groups, weight_decay=wd), name
+
+
+def _build_scheduler(optimizer, train_cfg, *, steps_per_epoch: int):
+    """Per-optimizer-step linear warmup then cosine to 0, or None when
+    `warmup_epochs` is unset (the default: constant LR, unchanged)."""
+    warmup_epochs = float(train_cfg.get("warmup_epochs", 0))
+    if warmup_epochs <= 0:
+        return None
+    steps = steps_per_epoch // int(train_cfg.get("accum_steps", 1))
+    total = max(1, steps * int(train_cfg.epochs))
+    warmup = max(1, int(steps * warmup_epochs))
+
+    def factor(step: int) -> float:
+        if step < warmup:
+            return (step + 1) / warmup
+        progress = min(1.0, (step - warmup) / max(1, total - warmup))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+
+
+def _payload(
+    *,
+    model,
+    optimizer,
+    epoch: int,
+    best_ccc: float,
+    scheduler=None,
+    model_name: str = "videomae_va_regressor",
+    optimizer_name: str = "adam",
+) -> dict:
+    payload = ckpt_io.base_payload(
         model=model,
         optimizer=optimizer,
         epoch=epoch,
         best_val_metric=best_ccc,
-        model_name="videomae_va_regressor",
-        optimizer_name="adam",
+        model_name=model_name,
+        optimizer_name=optimizer_name,
     )
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    return payload
 
 
 def _maybe_resume(
     *,
     model,
     optimizer,
+    scheduler,
+    model_name: str,
+    optimizer_name: str,
     device: torch.device,
     best_path: Path,
     latest_path: Path,
@@ -220,10 +301,10 @@ def _maybe_resume(
         source,
         model=model,
         optimizer=optimizer,
-        scheduler=None,
+        scheduler=scheduler,
         device=device,
-        expected_model_name="videomae_va_regressor",
-        expected_optimizer_name="adam",
+        expected_model_name=model_name,
+        expected_optimizer_name=optimizer_name,
     )
     if rank == 0:
         print(
@@ -234,7 +315,15 @@ def _maybe_resume(
 
 
 def _train_epoch(
-    model, loader, optimizer, device, *, accum_steps: int = 1, grad_clip: float = 0.0
+    model,
+    loader,
+    optimizer,
+    device,
+    *,
+    accum_steps: int = 1,
+    grad_clip: float = 0.0,
+    scheduler=None,
+    amp_bf16: bool = False,
 ) -> float:
     """Trains one epoch with `accum_steps` micro-batches per optimizer step.
 
@@ -265,8 +354,9 @@ def _train_epoch(
             else contextlib.nullcontext()
         )
         with no_sync_ctx:
-            pred = model(pixel_values)
-            loss = ccc_loss(pred, labels) / accum_steps
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp_bf16):
+                pred = model(pixel_values)
+            loss = ccc_loss(pred.float(), labels) / accum_steps
             loss.backward()
 
         total += float(loss.item()) * accum_steps * batch_size
@@ -277,16 +367,20 @@ def _train_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            if scheduler is not None:
+                scheduler.step()
 
     return total / max(count, 1)
 
 
 @torch.no_grad()
-def _validate(model, loader, device) -> dict:
+def _validate(model, loader, device, *, amp_bf16: bool = False) -> dict:
     model.eval()
     preds, targets = [], []
     for pixel_values, labels in loader:
-        pred = model(pixel_values.to(device)).cpu().numpy()
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp_bf16):
+            pred = model(pixel_values.to(device))
+        pred = pred.float().cpu().numpy()
         preds.append(pred)
         targets.append(labels.numpy())
     pred = np.concatenate(preds)

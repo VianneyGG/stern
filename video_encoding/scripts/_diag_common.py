@@ -398,16 +398,34 @@ def _bundle_from_checkpoint(
         raise ValueError(f"{run_id}: checkpoint/model shape mismatch -- {exc}") from exc
 
 
-def random_init_bundle(model_cfg, *, full_model: bool = False) -> DiagBundle:
-    """The untrained control rung, touching no checkpoint path at all."""
-    if full_model:
-        model = VideoMAEForPreTraining(model_cfg)
+def random_init_bundle(
+    model_cfg, *, full_model: bool = False, seed: int | None = None
+) -> DiagBundle:
+    """The untrained control rung, touching no checkpoint path at all.
+
+    `seed` pins the init without touching the caller's global RNG; unseeded,
+    two controls built in two jobs are two different models. A `levjepa_hf`
+    `model_cfg` gives rung 4's control: the same ViT-L, randomly initialised
+    from its snapshot's `config.json`.
+    """
+    with torch.random.fork_rng(devices=[], enabled=seed is not None):
+        if seed is not None:
+            torch.manual_seed(seed)
+        if str(model_cfg.get("encoder", "")) == "levjepa_hf":
+            return DiagBundle(
+                encoder=_hf_levjepa_from_config(model_cfg).eval(),
+                model=None,
+                run_id="",
+                round=None,
+            )
+        if full_model:
+            model = VideoMAEForPreTraining(model_cfg)
+            return DiagBundle(
+                encoder=model.encoder.eval(), model=model.eval(), run_id="", round=None
+            )
         return DiagBundle(
-            encoder=model.encoder.eval(), model=model.eval(), run_id="", round=None
+            encoder=VideoMAEEncoder(model_cfg).eval(), model=None, run_id="", round=None
         )
-    return DiagBundle(
-        encoder=VideoMAEEncoder(model_cfg).eval(), model=None, run_id="", round=None
-    )
 
 
 def paired_inputs(
@@ -476,6 +494,8 @@ def forward_with_hidden_states(
     tensors can never re-enter autograd, which would break training an
     attentive probe on these features.
     """
+    if is_hf_levjepa(encoder):
+        return _hf_levjepa_hidden_states(encoder, pixel_values)
     with torch.no_grad():
         x = encoder.patch_embed(pixel_values)
         if x.shape[1] != encoder.pos_embed.shape[1]:
@@ -925,9 +945,122 @@ def _load_public_videomaev2_rung(
     )
 
 
-def _load_supervised_va_rung(*_args, **_kwargs) -> DiagBundle:
-    raise NotImplementedError(
-        "ladder rung 4 (supervised VA) is gated on VEATIC re-staging"
+def is_hf_levjepa(encoder) -> bool:
+    """Rung 4's encoder: the released LeVJEPA ViT-L, loaded through transformers."""
+    return getattr(getattr(encoder, "config", None), "model_type", None) == "levjepa"
+
+
+def _hf_levjepa_hidden_states(encoder, pixel_values: "torch.Tensor") -> list:
+    """`forward_with_hidden_states` for the HF LeVJEPA encoder: `depth + 1` raw
+    (pre-norm, CLS attached) streams, read by hooks off the model's own forward
+    rather than a mirrored traversal -- its RoPE and block-causal mask are built
+    inside `VisionTransformer.forward`, and a copy of that is exactly the drift
+    the VideoMAE path needs a parity test to guard against."""
+    blocks = encoder.encoder.blocks
+    states: list = []
+    handles = [
+        blocks[0].register_forward_pre_hook(lambda _m, args: states.append(args[0]))
+    ] + [
+        b.register_forward_hook(lambda _m, _a, out: states.append(out)) for b in blocks
+    ]
+    try:
+        with torch.no_grad():
+            encoder(pixel_values=pixel_values)
+    finally:
+        for handle in handles:
+            handle.remove()
+    return states
+
+
+def _hf_levjepa_from_config(model_cfg):
+    """A randomly initialised LeVJEPA from `model_cfg.weights_path`'s `config.json`."""
+    from transformers import AutoConfig, AutoModel
+
+    hf_cfg = AutoConfig.from_pretrained(
+        str(model_cfg.weights_path), trust_remote_code=True, local_files_only=True
+    )
+    return AutoModel.from_config(hf_cfg, trust_remote_code=True)
+
+
+def encoder_geometry(encoder) -> tuple[int, int, int, int]:
+    """`(depth, embed_dim, num_frames, image_size)` for either encoder family."""
+    if is_hf_levjepa(encoder):
+        c = encoder.config
+        return c.depth, c.embed_dim, c.num_frames, c.img_size
+    return (
+        len(encoder.blocks),
+        encoder.embed_dim,
+        encoder.num_frames,
+        encoder.image_size,
+    )
+
+
+def patch_tokens(encoder, hidden: "torch.Tensor") -> "torch.Tensor":
+    """`hidden` with the non-patch tokens removed: registers for VideoMAE, the
+    CLS token for HF LeVJEPA."""
+    if is_hf_levjepa(encoder):
+        return hidden[:, 1:]
+    return encoder.registers.strip(hidden)
+
+
+def _load_supervised_va_rung(
+    model_cfg, ckpt_path: "Path | str | None" = None
+) -> DiagBundle:
+    """Load rung 4 -- the `HFLeVJEPAVARegressor` fine-tuned by
+    `experiment=ssl_diag_rung4_levjepa_hf` -- as its encoder alone, or raise.
+
+    The architecture comes from `model_cfg.weights_path`'s `config.json` (the
+    released weights themselves are not read: every tensor is overwritten), the
+    tensors from the checkpoint's `backbone.*` subtree. The `head.*` subtree is
+    dropped by design; any other key, a missing key, or a shape mismatch raises
+    before anything is loaded -- never a partial load, never a fallback path.
+    """
+    if str(model_cfg.get("encoder", "")) != "levjepa_hf":
+        raise ValueError(
+            "rung 4 is an HFLeVJEPAVARegressor checkpoint; pass its model config "
+            f"(conf/model/levjepa_hf_large.yaml), got encoder={model_cfg.get('encoder')!r}"
+        )
+    if ckpt_path is None or not Path(ckpt_path).exists():
+        raise RungUnavailable(f"supervised_va checkpoint not found at {ckpt_path}")
+    payload = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    if payload.get("model_name") != "levjepa_hf_va_regressor":
+        raise RungUnavailable(
+            f"{ckpt_path} is a {payload.get('model_name')!r} checkpoint, not "
+            "levjepa_hf_va_regressor"
+        )
+    state = {
+        k.removeprefix("module.").removeprefix("_orig_mod."): v
+        for k, v in payload["model_state_dict"].items()
+    }
+    stray = sorted(k for k in state if not k.startswith(("backbone.", "head.")))
+    if stray:
+        raise RungUnavailable(f"supervised_va checkpoint has unexpected keys {stray}")
+    backbone_state = {
+        k.removeprefix("backbone."): v
+        for k, v in state.items()
+        if k.startswith("backbone.")
+    }
+
+    encoder = _hf_levjepa_from_config(model_cfg)
+    target = encoder.state_dict()
+    missing = sorted(set(target) - set(backbone_state))
+    unexpected = sorted(set(backbone_state) - set(target))
+    mismatched = sorted(
+        k
+        for k in set(target) & set(backbone_state)
+        if target[k].shape != backbone_state[k].shape
+    )
+    if missing or unexpected or mismatched:
+        raise RungUnavailable(
+            f"supervised_va backbone does not match {model_cfg.weights_path}: "
+            f"missing={missing} unexpected={unexpected} shape_mismatch={mismatched}"
+        )
+    encoder.load_state_dict(backbone_state, strict=True)
+    return DiagBundle(
+        encoder=encoder.eval(),
+        model=None,
+        run_id=f"supervised_va:{Path(ckpt_path).parent.name}",
+        round=None,
     )
 
 
@@ -940,6 +1073,7 @@ def load_ladder_rung(
     full_model: bool = False,
     public_videomaev2_ckpt_path: "Path | str | None" = None,
     supervised_va_ckpt_path: "Path | str | None" = None,
+    supervised_va_model_cfg=None,
 ) -> DiagBundle:
     """Build one ladder rung, or raise naming what is missing.
 
@@ -957,7 +1091,11 @@ def load_ladder_rung(
     if rung is Rung.PUBLIC_VIDEOMAEV2:
         return _load_public_videomaev2_rung(model_cfg, public_videomaev2_ckpt_path)
     if rung is Rung.SUPERVISED_VA:
-        return _load_supervised_va_rung(model_cfg, supervised_va_ckpt_path)
+        # Rung 4 is a different architecture from the ladder's ViT-B (design.md),
+        # so it takes its own model config; the ladder's is rejected, loudly.
+        return _load_supervised_va_rung(
+            supervised_va_model_cfg or model_cfg, supervised_va_ckpt_path
+        )
 
     entry = (ladder_run_ids or {}).get(rung)
     if entry is None:

@@ -1,5 +1,6 @@
 import copy
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -13,10 +14,14 @@ from video_encoding.scripts._diag_common import (
 from video_encoding.scripts.diag_depth import (
     branch_norm_ratio,
     check,
+    cka,
+    cka_between,
+    cka_matrix,
     delta_from_init,
     layerscale_gamma,
     residual_branch_norm,
 )
+from video_encoding.scripts.diag_reconstruction import temporal_split
 
 MODEL_CFG_PATH = "video_encoding/conf/model/videomae_base.yaml"
 
@@ -284,3 +289,219 @@ def test_check_emits_delta_from_init_report_with_and_without_ref_bundle():
     with_ref = check(bundle, {"ref_bundle": bundle})
     assert "skipped" not in with_ref["delta_from_init"].meta
     assert with_ref["delta_from_init"].metrics
+
+
+def test_check_skips_only_delta_from_init_on_a_non_init_reference():
+    """A random-init reference at round >= 2 is valid for residual_branch_norm
+    but not for delta_from_init. check must skip delta_from_init alone, not
+    raise and lose all six reports."""
+    cfg = _cfg()
+    bundle = _bundle(cfg, run_id="r", round=5)
+    ref_bundle = _bundle(cfg, run_id="random_init", round=None)
+
+    reports = check(bundle, {"ref_bundle": ref_bundle})
+
+    assert reports.keys() == check(bundle, {}).keys()
+    assert reports["delta_from_init"].metrics == {}
+    assert reports["delta_from_init"].meta["skipped"].startswith("r: delta_from_init")
+    assert len(reports["residual_branch_norm"].metrics) == 2 * cfg.depth
+
+
+# --- cka ---------------------------------------------------------------
+
+
+def test_cka_of_matrix_with_itself_is_one():
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((50, 12))
+    assert cka(x, x) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_cka_invariant_to_rotation_and_scaling():
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((50, 12))
+    y = rng.standard_normal((50, 12))
+    q, _ = np.linalg.qr(rng.standard_normal((12, 12)))
+    base = cka(x, y)
+    assert cka(x @ q, y) == pytest.approx(base, rel=1e-4)
+    assert cka(x * 3.0, y) == pytest.approx(base, rel=1e-4)
+
+
+def test_cka_of_independent_gaussians_near_zero():
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((2000, 16))
+    y = rng.standard_normal((2000, 16))
+    assert cka(x, y) == pytest.approx(0.0, abs=0.1)
+
+
+def test_cka_is_nan_on_zero_variance_input_not_zero():
+    """A dead (constant) layer has no similarity structure to compare. 0.0
+    would read as "maximally different", a strong false depth signal."""
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((50, 12))
+    dead = np.ones((50, 12))
+    assert cka(x, dead) == pytest.approx(float("nan"), nan_ok=True)
+    assert cka(x, dead) != pytest.approx(0.0)
+
+
+def test_cka_outlier_sensitivity_reproduced():
+    """Davari et al.: a handful of huge-norm outlier tokens should move
+    trimmed CKA less than untrimmed CKA, relative to the outlier-free
+    baseline."""
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((60, 16))
+    y = rng.standard_normal((60, 16))
+    baseline = cka(x, y)
+
+    x_outlier = x.copy()
+    x_outlier[:5] *= 1000.0
+
+    untrimmed = cka(x_outlier, y, trim_outlier_tokens=0)
+    trimmed = cka(x_outlier, y, trim_outlier_tokens=5)
+
+    assert abs(trimmed - baseline) < abs(untrimmed - baseline)
+
+
+def _cfg(*, depth: int | None = None, layer_scale_init: float | None = None):
+    cfg = OmegaConf.load(MODEL_CFG_PATH)
+    cfg.depth = depth if depth is not None else MUTILATION_BLOCK + 2
+    cfg.embed_dim = 32
+    cfg.num_heads = 4
+    cfg.num_frames = 4
+    cfg.image_size = 32
+    if layer_scale_init is not None:
+        cfg.layer_scale_init = layer_scale_init
+    return cfg
+
+
+def _bundle_(cfg, run_id: str = "r", round: int | None = None) -> DiagBundle:
+    encoder = VideoMAEEncoder(cfg).eval()
+    return DiagBundle(encoder=encoder, model=None, run_id=run_id, round=round)
+
+
+def test_cka_matrix_symmetric_unit_diagonal():
+    cfg = _cfg(depth=3)
+    bundle = _bundle_(cfg)
+    pixel_values = torch.randn(2, 3, 4, 32, 32)
+
+    result = cka_matrix(bundle, pixel_values)
+
+    assert set(result.keys()) == {"full", "trimmed", "diff"}
+    for key in ("full", "trimmed"):
+        matrix = result[key]
+        assert np.allclose(matrix, matrix.T, atol=1e-5)
+        assert np.allclose(np.diag(matrix), 1.0, atol=1e-5)
+    assert np.allclose(result["diff"], result["full"] - result["trimmed"], atol=1e-6)
+
+
+def test_cka_between_depth_matched():
+    cfg = _cfg(depth=3)
+    bundle_a = _bundle_(cfg, run_id="a")
+    bundle_b = _bundle_(cfg, run_id="b")
+    pixel_values = torch.randn(2, 3, 4, 32, 32)
+
+    result = cka_between(bundle_a, bundle_b, pixel_values)
+
+    assert result.shape == (cfg.depth + 1,)
+    assert np.all(np.isfinite(result))
+
+
+# --- decode_from_depth ---------------------------------------------------
+
+
+def _decode_bundle_and_input():
+    cfg = _cfg(depth=3)
+    bundle = _bundle_(cfg)
+    pixel_values = torch.randn(2, int(cfg.in_channels), 4, 32, 32)
+    return bundle, pixel_values, cfg
+
+
+def test_fit_depth_head_signature_forces_a_keep_split():
+    from video_encoding.scripts.diag_depth import _fit_depth_head
+
+    bundle, pixel_values, cfg = _decode_bundle_and_input()
+    grid = bundle.encoder.token_grid
+    keep, mask, _ = temporal_split(grid, pixel_values.device, keep_frac=0.5)
+
+    import inspect
+
+    sig = inspect.signature(_fit_depth_head)
+    assert "keep" in sig.parameters
+    assert sig.parameters["keep"].kind == inspect.Parameter.KEYWORD_ONLY
+
+    keep_set = set(keep.tolist())
+    mask_set = set(mask.tolist())
+    assert keep_set.isdisjoint(mask_set)
+
+    head = _fit_depth_head(bundle, pixel_values, 1, keep=keep, steps=5, seed=0)
+    assert isinstance(head, torch.nn.Linear)
+
+
+def test_decode_from_depth_fits_separate_head_per_depth():
+    from video_encoding.scripts.diag_depth import _fit_depth_head, decode_from_depth
+
+    bundle, pixel_values, cfg = _decode_bundle_and_input()
+
+    result = decode_from_depth(bundle, pixel_values, [1, 2], n_seeds=3)
+
+    grid = bundle.encoder.token_grid
+    keep, _mask, _ = temporal_split(grid, pixel_values.device, keep_frac=0.5)
+    head1 = _fit_depth_head(bundle, pixel_values, 1, keep=keep, steps=5, seed=0)
+    head2 = _fit_depth_head(bundle, pixel_values, 2, keep=keep, steps=5, seed=0)
+    assert not torch.allclose(head1.weight, head2.weight)
+    assert set(result.keys()) == {1, 2}
+
+
+def test_decode_from_depth_head_capacity_identical_across_depths():
+    from video_encoding.scripts.diag_depth import _fit_depth_head
+
+    bundle, pixel_values, cfg = _decode_bundle_and_input()
+    grid = bundle.encoder.token_grid
+    keep, _mask, _ = temporal_split(grid, pixel_values.device, keep_frac=0.5)
+
+    head1 = _fit_depth_head(bundle, pixel_values, 1, keep=keep, steps=5, seed=0)
+    head2 = _fit_depth_head(bundle, pixel_values, 2, keep=keep, steps=5, seed=0)
+    assert head1.weight.shape == head2.weight.shape
+
+
+def test_decode_from_depth_returns_replicated_metric_value():
+    from video_encoding.scripts.diag_depth import decode_from_depth
+
+    bundle, pixel_values, cfg = _decode_bundle_and_input()
+
+    result = decode_from_depth(bundle, pixel_values, [1], n_seeds=3)
+
+    value = result[1]
+    assert value.n == 3
+    assert len(set(value.seeds)) == 3
+    assert value.deterministic is False
+    assert np.isfinite(value.mean)
+
+
+# --- check() wiring for cka_matrix / decode_from_depth ------------------
+
+
+def test_check_wires_cka_matrix_and_decode_from_depth_when_input_present():
+    cfg = _cfg(depth=3)
+    bundle = _bundle_(cfg)
+    pixel_values = torch.randn(2, int(cfg.in_channels), 4, 32, 32)
+
+    reports = check(bundle, {"real": pixel_values})
+
+    assert "skipped" not in reports["cka_matrix"].meta
+    assert set(reports["cka_matrix"].arrays.keys()) == {"full", "trimmed", "diff"}
+
+    assert "skipped" not in reports["decode_from_depth"].meta
+    assert reports["decode_from_depth"].metrics
+    for value in reports["decode_from_depth"].metrics.values():
+        assert value.n == 3
+
+
+def test_check_skips_cka_matrix_and_decode_from_depth_without_input():
+    bundle = _bundle_(_cfg())
+
+    reports = check(bundle, {})
+
+    assert reports["cka_matrix"].arrays == {}
+    assert reports["cka_matrix"].meta["skipped"] == "no input tensor supplied"
+    assert reports["decode_from_depth"].metrics == {}
+    assert reports["decode_from_depth"].meta["skipped"] == "no input tensor supplied"

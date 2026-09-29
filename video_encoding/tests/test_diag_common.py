@@ -11,8 +11,11 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import pickle
+import shutil
 import tarfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -31,13 +34,17 @@ from video_encoding.scripts._diag_common import (
     Rung,
     RungUnavailable,
     Tier,
+    _load_supervised_va_rung,
     _public_videomae_sinusoid_pos_embed,
+    encoder_geometry,
     forward_with_hidden_states,
+    is_hf_levjepa,
     ladder_tau,
     load_bundle,
     load_ladder_rung,
     load_solo_bundle,
     paired_inputs,
+    patch_tokens,
     random_init_bundle,
     remap_public_videomae,
     replicate,
@@ -835,9 +842,166 @@ def test_load_ladder_rung_solo_spec_missing_a_field_raises(tmp_path):
         )
 
 
-def test_load_ladder_rung_supervised_va_names_its_blocking_dependency(tmp_path):
-    with pytest.raises(NotImplementedError, match="VEATIC"):
-        load_ladder_rung(Rung.SUPERVISED_VA, _tiny_model_cfg())
+# --- rung 4: the fine-tuned HF LeVJEPA regressor ------------------------------
+# Built from the released snapshot's remote code at a tiny geometry; needs the
+# snapshot's *.py files (not its weights), so skipped where it is absent.
+_HF_SNAPSHOT = Path(
+    os.environ.get("LEVJEPA_HF_PATH", Path.home() / "models/levjepa-hf")
+)
+_needs_hf = pytest.mark.skipif(
+    not (_HF_SNAPSHOT / "modeling_levjepa.py").exists(),
+    reason=f"no LeVJEPA HF snapshot at {_HF_SNAPSHOT}",
+)
+
+
+def _tiny_hf_snapshot(root: Path, embed_dim: int = 32) -> Path:
+    """A weights-free snapshot dir: the released remote code + a tiny config."""
+    root.mkdir(parents=True, exist_ok=True)
+    for name in ("configuration_levjepa.py", "modeling_levjepa.py"):
+        shutil.copy(_HF_SNAPSHOT / name, root / name)
+    config = json.loads((_HF_SNAPSHOT / "config.json").read_text())
+    config.update(img_size=32, num_frames=4, embed_dim=embed_dim, depth=2, num_heads=2)
+    (root / "config.json").write_text(json.dumps(config))
+    return root
+
+
+def _rung4_model_cfg(snapshot: Path, embed_dim: int = 32):
+    return OmegaConf.create(
+        {"encoder": "levjepa_hf", "weights_path": str(snapshot), "embed_dim": embed_dim}
+    )
+
+
+def _save_rung4_checkpoint(snapshot: Path, path: Path, *, key_prefix: str = ""):
+    """A checkpoint shaped exactly as train.py writes one for rung 4."""
+    from transformers import AutoConfig, AutoModel
+
+    from video_encoding.models.levjepa_hf import HFLeVJEPAVARegressor
+    from video_encoding.training.train import _payload
+
+    torch.manual_seed(3)
+    hf_cfg = AutoConfig.from_pretrained(
+        str(snapshot), trust_remote_code=True, local_files_only=True
+    )
+    regressor = HFLeVJEPAVARegressor(
+        _rung4_model_cfg(snapshot, hf_cfg.embed_dim),
+        backbone=AutoModel.from_config(hf_cfg, trust_remote_code=True),
+    )
+    payload = _payload(
+        model=regressor,
+        optimizer=torch.optim.SGD(regressor.parameters(), lr=0.1),
+        epoch=0,
+        best_ccc=0.1,
+        model_name="levjepa_hf_va_regressor",
+    )
+    payload["model_state_dict"] = {
+        key_prefix + k: v for k, v in payload["model_state_dict"].items()
+    }
+    torch.save(payload, path)
+    return regressor
+
+
+@_needs_hf
+def test_load_supervised_va_rung_strips_backbone_prefix(tmp_path):
+    snapshot = _tiny_hf_snapshot(tmp_path / "snap")
+    ckpt = tmp_path / "ssl_diag_rung4_levjepa_hf" / "best.pt"
+    ckpt.parent.mkdir()
+    # DDP's `module.` prefix on top of `backbone.`: both must come off.
+    regressor = _save_rung4_checkpoint(snapshot, ckpt, key_prefix="module.")
+
+    bundle = load_ladder_rung(
+        Rung.SUPERVISED_VA,
+        _tiny_model_cfg(),
+        supervised_va_ckpt_path=ckpt,
+        supervised_va_model_cfg=_rung4_model_cfg(snapshot),
+    )
+
+    loaded = bundle.encoder.state_dict()
+    expected = regressor.backbone.state_dict()
+    assert loaded.keys() == expected.keys()
+    assert all(torch.equal(loaded[k], expected[k]) for k in expected)
+    assert not any("head" in k for k in loaded)
+    assert bundle.run_id == "supervised_va:ssl_diag_rung4_levjepa_hf"
+    assert not bundle.encoder.training
+
+
+@_needs_hf
+def test_missing_rung4_checkpoint_raises(tmp_path):
+    missing = tmp_path / "nope" / "best.pt"
+    with pytest.raises(RungUnavailable, match=str(missing)):
+        load_ladder_rung(
+            Rung.SUPERVISED_VA,
+            _tiny_model_cfg(),
+            supervised_va_ckpt_path=missing,
+            supervised_va_model_cfg=_rung4_model_cfg(_tiny_hf_snapshot(tmp_path / "s")),
+        )
+
+
+def test_rung4_refuses_the_ladders_vit_b_model_cfg(tmp_path):
+    """Without its own model config, rung 4 must not guess an architecture."""
+    with pytest.raises(ValueError, match="levjepa_hf"):
+        load_ladder_rung(
+            Rung.SUPERVISED_VA, _tiny_model_cfg(), supervised_va_ckpt_path=tmp_path
+        )
+
+
+@_needs_hf
+def test_rung4_raises_on_shape_mismatch_before_loading(tmp_path):
+    ckpt = tmp_path / "best.pt"
+    _save_rung4_checkpoint(_tiny_hf_snapshot(tmp_path / "small", 32), ckpt)
+    wider = _tiny_hf_snapshot(tmp_path / "wide", 64)
+    with pytest.raises(RungUnavailable, match="shape_mismatch=\\[.+\\]"):
+        _load_supervised_va_rung(_rung4_model_cfg(wider, 64), ckpt)
+
+
+@_needs_hf
+def test_rung4_raises_on_a_key_outside_backbone_and_head(tmp_path):
+    snapshot = _tiny_hf_snapshot(tmp_path / "snap")
+    ckpt = tmp_path / "best.pt"
+    _save_rung4_checkpoint(snapshot, ckpt)
+    payload = torch.load(ckpt, weights_only=False)
+    payload["model_state_dict"]["projector.weight"] = torch.zeros(1)
+    torch.save(payload, ckpt)
+    with pytest.raises(RungUnavailable, match="projector.weight"):
+        _load_supervised_va_rung(_rung4_model_cfg(snapshot), ckpt)
+
+
+@_needs_hf
+def test_rung4_rejects_a_checkpoint_of_another_model(tmp_path):
+    snapshot = _tiny_hf_snapshot(tmp_path / "snap")
+    ckpt = tmp_path / "best.pt"
+    _save_rung4_checkpoint(snapshot, ckpt)
+    payload = torch.load(ckpt, weights_only=False)
+    payload["model_name"] = "videomae_va_regressor"
+    torch.save(payload, ckpt)
+    with pytest.raises(RungUnavailable, match="videomae_va_regressor"):
+        _load_supervised_va_rung(_rung4_model_cfg(snapshot), ckpt)
+
+
+@_needs_hf
+def test_hf_hidden_states_are_depth_plus_one_raw_streams_matching_the_forward(
+    tmp_path,
+):
+    from transformers import AutoConfig, AutoModel
+
+    snapshot = _tiny_hf_snapshot(tmp_path / "snap")
+    hf_cfg = AutoConfig.from_pretrained(
+        str(snapshot), trust_remote_code=True, local_files_only=True
+    )
+    torch.manual_seed(0)
+    encoder = AutoModel.from_config(hf_cfg, trust_remote_code=True).eval()
+    x = torch.randn(2, 3, 4, 32, 32, generator=torch.Generator().manual_seed(1))
+
+    states = forward_with_hidden_states(encoder, x)
+
+    assert len(states) == hf_cfg.depth + 1
+    assert all(s.shape == (2, 1 + 4 * 2 * 2, 32) for s in states)
+    assert not any(torch.equal(a, b) for a, b in zip(states, states[1:]))
+    # Raw, pre-norm: the model's own final norm over the last state IS its output.
+    with torch.no_grad():
+        reference = encoder(pixel_values=x).last_hidden_state
+        torch.testing.assert_close(encoder.encoder.norm(states[-1]), reference)
+    # Hooks are removed: a second call does not accumulate stale states.
+    assert len(forward_with_hidden_states(encoder, x)) == hf_cfg.depth + 1
 
 
 def test_remap_public_videomae_raises_on_unmatched_key():
@@ -992,3 +1156,47 @@ def test_public_videomaev2_pos_embed_is_computed_not_left_random(tmp_path):
 def test_public_videomaev2_rung_raises_when_no_local_path_given():
     with pytest.raises(RungUnavailable, match="PUBLIC_VIDEOMAEV2_LOCAL_PATH"):
         load_ladder_rung(Rung.PUBLIC_VIDEOMAEV2, _tiny_model_cfg())
+
+
+# --- seeded random-init control -----------------------------------------------
+
+
+def _same_weights(a, b) -> bool:
+    sa, sb = a.state_dict(), b.state_dict()
+    return sa.keys() == sb.keys() and all(torch.equal(sa[k], sb[k]) for k in sa)
+
+
+def test_seeded_random_init_is_reproducible_and_leaves_global_rng_alone():
+    before = torch.get_rng_state()
+    a = random_init_bundle(_tiny_model_cfg(), seed=5).encoder
+    b = random_init_bundle(_tiny_model_cfg(), seed=5).encoder
+    c = random_init_bundle(_tiny_model_cfg(), seed=6).encoder
+    assert torch.equal(torch.get_rng_state(), before)
+    assert _same_weights(a, b)
+    assert not _same_weights(a, c)
+
+
+@_needs_hf
+def test_levjepa_hf_cfg_gives_a_seeded_random_vit_of_the_snapshot_geometry(tmp_path):
+    cfg = _rung4_model_cfg(_tiny_hf_snapshot(tmp_path / "snap"))
+    a = random_init_bundle(cfg, seed=1).encoder
+    b = random_init_bundle(cfg, seed=1).encoder
+    c = random_init_bundle(cfg, seed=2).encoder
+
+    assert is_hf_levjepa(a)
+    assert encoder_geometry(a) == (2, 32, 4, 32)
+    assert _same_weights(a, b)
+    assert not _same_weights(a, c)
+
+
+@_needs_hf
+def test_patch_tokens_drops_only_the_hf_cls_token(tmp_path):
+    cfg = _rung4_model_cfg(_tiny_hf_snapshot(tmp_path / "snap"))
+    encoder = random_init_bundle(cfg, seed=0).encoder
+    x = torch.randn(2, 3, 4, 32, 32, generator=torch.Generator().manual_seed(1))
+    hidden = forward_with_hidden_states(encoder, x)[-1]
+
+    tokens = patch_tokens(encoder, hidden)
+
+    assert tokens.shape == (2, 4 * 2 * 2, 32)
+    assert torch.equal(tokens, hidden[:, 1:])

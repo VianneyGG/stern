@@ -31,7 +31,9 @@ from video_encoding.scripts._diag_common import (
     DiagBundle,
     DiagReport,
     MetricValue,
+    encoder_geometry,
     forward_with_hidden_states,
+    patch_tokens,
     replicate,
 )
 
@@ -44,7 +46,10 @@ PROBE_N_BLOCKS = 3
 # Fit-budget constants. Every quantity that changes how well the probe fits is
 # pinned here rather than read from a per-dataset Hydra config or varied per
 # call -- see design.md's "probe_ccc owns its dataset contract" decision.
-PROBE_FIT_LR = 1e-3
+# 1e-5, not 1e-3: at 1e-3 the fit's raw predictions blew up within one epoch
+# on real AFEW-VA and ccc_loss's gradient vanished (design.md, "The probe fits
+# at 1e-5").
+PROBE_FIT_LR = 1e-5
 PROBE_FIT_EPOCHS = 20
 # ccc_loss estimates two variances from the batch; a batch this small turns
 # sampling noise into MetricValue.sd for reasons that have nothing to do with
@@ -63,7 +68,7 @@ PROBE_WINDOW_OVERLAP = 0.0
 # make the depth profile a temporal-scale profile.
 PROBE_FRAME_STRIDE = 2
 PROBE_VA_RANGE = (-1.0, 1.0)
-# ~25 of VEATIC's 124 clips held out at 0.2 -- design.md weighs 90/10 against
+# 48 of AFEW-VA's 240 actors held out at 0.2 -- design.md weighs 90/10 against
 # 80/20 and leaves the fraction "fixed once here and not tuned per checkpoint".
 PROBE_SPLIT_FRACTION = 0.2
 # Chunk size for the scoring forward pass. Not a fit-budget constant: the probe
@@ -76,6 +81,10 @@ _SCORE_CHUNK = 32
 # x 3 seeds x 2 arms x PROBE_FIT_EPOCHS)", matching the spec's own
 # layers=[1, 4, 8, 12] scenario for a 12-block ViT-B encoder.
 DEFAULT_PROBE_DEPTH_LAYERS = (1, 4, 8, 12)
+# Rung 4 is the 24-block HF LeVJEPA ViT-L. Its layers are read at the same
+# RELATIVE depth as the ViT-B rungs' (design.md's rung-4 geometry exception):
+# layer 2k there stands against layer k here.
+RUNG4_PROBE_DEPTH_LAYERS = tuple(2 * layer for layer in DEFAULT_PROBE_DEPTH_LAYERS)
 
 # The two arms' replicate seed bases for probe_by_depth: independent of each
 # other and of layer, so a depth profile is never secretly a seed profile, and
@@ -116,7 +125,9 @@ class AttentiveProbe(torch.nn.Module):
         # num_heads passed explicitly: LinearVAHead's own default is 12, and a
         # readout running at a different head count from the blocks in front
         # of it is a silent construction bug, not a configuration choice.
-        self.head = LinearVAHead(embed_dim, num_heads=num_heads)
+        # bounded=False: the tanh saturated to exactly +-1 on real AFEW-VA
+        # within two fit epochs (job 2943) and every score was a dead fit.
+        self.head = LinearVAHead(embed_dim, num_heads=num_heads, bounded=False)
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
         for block in self.blocks:
@@ -210,7 +221,7 @@ def _materialize_tokens(
 
     Writes into a preallocated tensor rather than list-append + `torch.cat`:
     `cat` needs every per-batch chunk and the concatenated result alive at
-    once, a transient doubling that OOM-killed a real-VEATIC run at the full
+    once, a transient doubling that OOM-killed a real-dataset run at the full
     cache's size on top of itself.
     """
     device = _resolve_device() if device is None else device
@@ -223,7 +234,7 @@ def _materialize_tokens(
         hidden = forward_with_hidden_states(encoder, pixel_values.to(device))
         # Back to host memory immediately: the cache is several GB per layer at
         # real-dataset scale, far past any VRAM this runs on.
-        batch_tokens = encoder.registers.strip(hidden[layer]).half().cpu()
+        batch_tokens = patch_tokens(encoder, hidden[layer]).half().cpu()
         if tokens is None:
             tokens = torch.empty((total, *batch_tokens.shape[1:]), dtype=torch.float16)
         tokens[write_idx : write_idx + batch_tokens.shape[0]] = batch_tokens
@@ -249,7 +260,7 @@ def _materialize_tokens_for_layers(
 
     Writes into a preallocated tensor per layer rather than list-append +
     `torch.cat`: `cat` needs every per-batch chunk and the concatenated
-    result alive at once, a transient doubling that OOM-killed a real-VEATIC
+    result alive at once, a transient doubling that OOM-killed a real-dataset
     run at the full cache's size on top of itself.
     """
     device = _resolve_device() if device is None else device
@@ -263,7 +274,7 @@ def _materialize_tokens_for_layers(
         for layer in layers:
             # Back to host memory immediately: the cache is several GB per layer
             # at real-dataset scale, far past any VRAM this runs on.
-            batch_tokens = encoder.registers.strip(hidden[layer]).half().cpu()
+            batch_tokens = patch_tokens(encoder, hidden[layer]).half().cpu()
             if layer not in tokens_by_layer:
                 tokens_by_layer[layer] = torch.empty(
                     (total, *batch_tokens.shape[1:]), dtype=torch.float16
@@ -414,14 +425,12 @@ def probe_ccc(
 
     encoder = bundle.encoder
     root = manifest_path.parent
+    _, _, num_frames, image_size = encoder_geometry(encoder)
     fit_ds = _probe_dataset(
-        fit_records, root, num_frames=encoder.num_frames, image_size=encoder.image_size
+        fit_records, root, num_frames=num_frames, image_size=image_size
     )
     scored_ds = _probe_dataset(
-        scored_records,
-        root,
-        num_frames=encoder.num_frames,
-        image_size=encoder.image_size,
+        scored_records, root, num_frames=num_frames, image_size=image_size
     )
     # `generator=` here isn't for shuffling (shuffle=False) -- it's because
     # DataLoader always draws a base_seed from `generator or the global RNG`
@@ -451,7 +460,7 @@ def probe_ccc(
         scored_labels,
         seed=seed,
         epochs=epochs,
-        embed_dim=encoder.embed_dim,
+        embed_dim=encoder_geometry(encoder)[1],
     )
 
 
@@ -468,14 +477,12 @@ def _bundle_layer_tokens(
     """One forward pass each over the fit and scored splits, caching every
     requested layer's tokens for `bundle`'s (frozen) encoder."""
     encoder = bundle.encoder
+    _, _, num_frames, image_size = encoder_geometry(encoder)
     fit_ds = _probe_dataset(
-        fit_records, root, num_frames=encoder.num_frames, image_size=encoder.image_size
+        fit_records, root, num_frames=num_frames, image_size=image_size
     )
     scored_ds = _probe_dataset(
-        scored_records,
-        root,
-        num_frames=encoder.num_frames,
-        image_size=encoder.image_size,
+        scored_records, root, num_frames=num_frames, image_size=image_size
     )
     fit_loader = DataLoader(
         fit_ds,
@@ -528,7 +535,8 @@ def probe_by_depth(
     scored_records = [r for r in records if r.identity_id in scored_ids]
     root = manifest_path.parent
 
-    final_layer = len(bundle.encoder.blocks)
+    final_layer, ckpt_dim = encoder_geometry(bundle.encoder)[:2]
+    ctrl_dim = encoder_geometry(control_bundle.encoder)[1]
     all_layers = set(layers) | {final_layer}
 
     ckpt_fit_tokens, ckpt_fit_labels, ckpt_scored_tokens, ckpt_scored_labels = (
@@ -592,7 +600,7 @@ def probe_by_depth(
             ckpt_fit_labels,
             ckpt_scored_tokens[layer],
             ckpt_scored_labels,
-            bundle.encoder.embed_dim,
+            ckpt_dim,
             _CHECKPOINT_SEED_BASE,
         )
         control_value = _arm_metric(
@@ -600,7 +608,7 @@ def probe_by_depth(
             ctrl_fit_labels,
             ctrl_scored_tokens[layer],
             ctrl_scored_labels,
-            control_bundle.encoder.embed_dim,
+            ctrl_dim,
             _CONTROL_SEED_BASE,
         )
         per_layer[layer] = (checkpoint_value, control_value)
@@ -610,7 +618,7 @@ def probe_by_depth(
         ckpt_fit_labels,
         ckpt_scored_tokens[final_layer],
         ckpt_scored_labels,
-        bundle.encoder.embed_dim,
+        ckpt_dim,
         _CHECKPOINT_SEED_BASE,
     )
 
@@ -631,7 +639,7 @@ def _skip_report(reason: str) -> DiagReport:
 
 def check(bundle: DiagBundle, inputs: dict) -> dict[str, DiagReport]:
     """Plan 5's orchestrator entry point: `probe_by_depth` against real
-    VEATIC data, or a clean skip -- never a raise, never an empty mapping
+    AFEW-VA data, or a clean skip -- never a raise, never an empty mapping
     (indistinguishable from "this check does not exist" to a caller merging
     reports from every module).
 
@@ -640,11 +648,11 @@ def check(bundle: DiagBundle, inputs: dict) -> dict[str, DiagReport]:
     carries none) and, optionally, `layers`/`n_seeds`. It is never a source of
     fit-budget parameters: `epochs=PROBE_FIT_EPOCHS` unconditionally.
     """
-    veatic_root = os.environ.get("VEATIC_ROOT")
-    if not veatic_root:
-        return {"probe_by_depth": _skip_report("VEATIC_ROOT unset")}
+    afewva_root = os.environ.get("AFEWVA_ROOT")
+    if not afewva_root:
+        return {"probe_by_depth": _skip_report("AFEWVA_ROOT unset")}
 
-    manifest_path = Path(veatic_root) / "manifest.csv"
+    manifest_path = Path(afewva_root) / "manifest.csv"
     if not manifest_path.exists():
         return {"probe_by_depth": _skip_report(f"no manifest.csv at {manifest_path}")}
 

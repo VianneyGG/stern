@@ -231,7 +231,7 @@ def test_run_train_stage_skips_malformed_clip_instead_of_crashing(
     # via the earlier call pattern; reproduce it directly here since we're
     # bypassing build() to control which records land in the manifest.
 
-    rows = parse_clip_annotations(tmp_path / "001" / "001.json")
+    _, rows = parse_clip_annotations(tmp_path / "001" / "001.json")
     write_label_csv(tmp_path / "labels" / "001.csv", rows)
 
     monkeypatch.setattr(train_mod, "VideoMAEVARegressor", _FakeRegressor)
@@ -274,3 +274,96 @@ def test_run_train_stage_emits_live_heartbeat_every_epoch(tmp_path, monkeypatch)
     # they all land on the same stable filename (still exactly 1 file).
     assert calls == [True, True, True, True]
     assert len(list((tmp_path / "results").glob("*.json"))) == 1
+
+
+def test_adamw_puts_head_params_at_head_lr_mult_with_weight_decay():
+    model = _FakeRegressorWithBackbone(None)
+    train_cfg = OmegaConf.create(
+        {"optimizer": "adamw", "learning_rate": 1e-5, "head_lr_mult": 100.0,
+         "weight_decay": 0.05}
+    )
+    optimizer, name = train_mod._build_optimizer(model, train_cfg)
+    assert name == "adamw" and isinstance(optimizer, torch.optim.AdamW)
+    backbone_group, head_group = optimizer.param_groups
+    assert backbone_group["lr"] == 1e-5
+    assert head_group["lr"] == pytest.approx(1e-3)
+    assert {id(p) for p in head_group["params"]} == {
+        id(p) for p in model.head.parameters()
+    }
+    assert {id(p) for p in backbone_group["params"]} == {
+        id(p) for p in model.backbone.parameters()
+    }
+    assert all(g["weight_decay"] == 0.05 for g in optimizer.param_groups)
+
+
+def test_default_optimizer_is_unchanged_adam_with_no_scheduler():
+    model = _FakeRegressorWithBackbone(None)
+    train_cfg = OmegaConf.create({"learning_rate": 1e-4, "epochs": 3})
+    optimizer, name = train_mod._build_optimizer(model, train_cfg)
+    assert name == "adam" and type(optimizer) is torch.optim.Adam
+    assert train_mod._build_scheduler(optimizer, train_cfg, steps_per_epoch=10) is None
+
+
+def test_scheduler_warms_up_linearly_then_decays_to_zero():
+    param = nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD([param], lr=1.0)
+    train_cfg = OmegaConf.create({"warmup_epochs": 1, "epochs": 3})
+    scheduler = train_mod._build_scheduler(optimizer, train_cfg, steps_per_epoch=10)
+    lrs = []
+    for _ in range(30):
+        lrs.append(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        scheduler.step()
+    assert lrs[0] == pytest.approx(0.1)  # step 1 of a 10-step warmup
+    assert lrs[9] == pytest.approx(1.0)  # warmup complete
+    assert all(a >= b for a, b in zip(lrs[10:], lrs[11:]))  # cosine never rises
+    assert lrs[-1] < 0.01
+
+
+def test_resume_continues_the_lr_schedule_instead_of_restarting_warmup(
+    tmp_path, monkeypatch
+):
+    rng = np.random.default_rng(0)
+    _write_clip(tmp_path / "001", 24, rng)
+    _write_clip(tmp_path / "002", 24, rng)
+    manifest_path = build(tmp_path, tmp_path)
+    monkeypatch.setattr(train_mod, "VideoMAEVARegressor", _FakeRegressor)
+    cfg = _cfg(tmp_path, manifest_path)
+    cfg.train.update({"optimizer": "adamw", "warmup_epochs": 1, "epochs": 2})
+    train_mod.run_train_stage(
+        cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+    )
+    latest = tmp_path / "ckpt" / "test_va_finetune" / "latest.pt"
+    steps_after_2 = torch.load(latest, weights_only=False)["scheduler_state_dict"][
+        "last_epoch"
+    ]
+    assert steps_after_2 > 0
+
+    cfg.train.epochs = 3
+    train_mod.run_train_stage(
+        cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+    )
+    steps_after_3 = torch.load(latest, weights_only=False)["scheduler_state_dict"][
+        "last_epoch"
+    ]
+    assert steps_after_3 == steps_after_2 * 3 // 2
+
+
+def test_levjepa_hf_encoder_routes_to_the_hf_regressor(tmp_path, monkeypatch):
+    rng = np.random.default_rng(0)
+    _write_clip(tmp_path / "001", 24, rng)
+    _write_clip(tmp_path / "002", 24, rng)
+    manifest_path = build(tmp_path, tmp_path)
+    monkeypatch.setattr(train_mod, "HFLeVJEPAVARegressor", _FakeRegressor)
+    monkeypatch.setattr(
+        train_mod, "VideoMAEVARegressor", lambda _cfg: pytest.fail("wrong model")
+    )
+    cfg = _cfg(tmp_path, manifest_path)
+    cfg.model.encoder = "levjepa_hf"
+    train_mod.run_train_stage(
+        cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+    )
+    saved = torch.load(
+        tmp_path / "ckpt" / "test_va_finetune" / "latest.pt", weights_only=False
+    )
+    assert saved["model_name"] == "levjepa_hf_va_regressor"

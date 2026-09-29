@@ -1,0 +1,17 @@
+# Released LeVJEPA ViT-L (galilai-group/LeVJEPA-VideoMix-Large, CC BY-NC 4.0),
+# loaded through transformers with trust_remote_code from a LOCAL snapshot --
+# never the network. Ladder rung 4's backbone (ssl-diag-03 design.md).
+name: levjepa_hf_large
+encoder: levjepa_hf
+weights_path: ${oc.env:LEVJEPA_HF_PATH,???}
+# --- input geometry (fixed by the release: tubelet 1, 16 frames, 224px) ---
+num_frames: 16
+image_size: 224
+# diag_probe.py pins PROBE_FRAME_STRIDE = 2 (15 fps, a 1.07 s window) for every
+# rung; rung 4 is fine-tuned on the same temporal scale it is probed on. The
+# release was pretrained at ~7.5 fps, so this is 2x its native rate.
+frame_stride: 2
+embed_dim: 1024
+depth: 24
+num_heads: 16
+grad_checkpointing: true   # 3137 tokens x 24 blocks does not fit a 20 GB card otherwise

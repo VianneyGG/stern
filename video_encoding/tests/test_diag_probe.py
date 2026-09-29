@@ -14,8 +14,14 @@ from data.labels import write_label_csv
 from data.manifest import ManifestRecord, read_manifest, write_manifest
 from video_encoding.models.videomaev2.encoder import VideoMAEEncoder
 from video_encoding.models.videomaev2.regressor import LinearVAHead
-from video_encoding.scripts._diag_common import DiagBundle, DiagReport, MetricValue
+from video_encoding.scripts._diag_common import (
+    DiagBundle,
+    DiagReport,
+    MetricValue,
+    random_init_bundle,
+)
 from video_encoding.scripts.diag_probe import (
+    PROBE_FIT_LR,
     AttentiveProbe,
     _fit_and_score_probe,
     _identity_disjoint_split,
@@ -23,6 +29,11 @@ from video_encoding.scripts.diag_probe import (
     probe_by_depth,
     probe_ccc,
     standardise_on_fit,
+)
+from video_encoding.tests.test_diag_common import (
+    _needs_hf,
+    _rung4_model_cfg,
+    _tiny_hf_snapshot,
 )
 
 
@@ -116,10 +127,50 @@ def test_attentive_probe_output_shape_and_range():
     probe = AttentiveProbe(embed_dim=768, num_heads=16, n_blocks=3)
     tokens = torch.randn(4, 197, 768)
 
-    out = probe(tokens)
+    out = probe.eval()(tokens)
 
     assert out.shape == (4, 2)
     assert torch.all(out >= -1.0) and torch.all(out <= 1.0)
+
+
+def _probe_with_constant_readout(bias: float) -> AttentiveProbe:
+    probe = AttentiveProbe(embed_dim=32, num_heads=2, n_blocks=1)
+    with torch.no_grad():
+        probe.head.unembed.weight.zero_()
+        probe.head.unembed.bias.fill_(bias)
+    return probe
+
+
+def test_probe_training_output_is_unbounded_and_scoring_output_clamped():
+    """2026-09-26 (job 2943): on real AFEW-VA the probe's tanh saturated to
+    exactly -1.00 within two fit epochs, zeroing the gradient; every probe
+    score was a dead fit. Training output must be free to leave [-1, 1]."""
+    probe = _probe_with_constant_readout(3.0)
+    tokens = torch.randn(2, 5, 32)
+    out_train = probe.train()(tokens).flatten().tolist()
+    assert out_train == [3.0, 3.0, 3.0, 3.0]
+    out_eval = probe.eval()(tokens).flatten().tolist()
+    assert out_eval == [1.0, 1.0, 1.0, 1.0]
+
+
+def test_linear_va_head_keeps_its_tanh_by_default():
+    # train.py's regressor still uses the bounded head; only the probe opts out.
+    head = LinearVAHead(32, num_heads=2)
+    with torch.no_grad():
+        head.unembed.weight.zero_()
+        head.unembed.bias.fill_(3.0)
+    out = head.train()(torch.randn(2, 5, 32))
+    rounded = [round(v, 6) for v in out.flatten().tolist()]
+    assert rounded == [0.995055, 0.995055, 0.995055, 0.995055]  # tanh(3)
+
+
+def test_probe_fit_lr_is_the_one_that_does_not_blow_up():
+    """2026-09-26 (job 3363, real AFEW-VA, random-init ViT-B layer 6): at 1e-3
+    the raw fit predictions reached ~1e2 in one epoch and ~4e3 by epoch 20,
+    where ccc_loss's gradient vanishes (a 2-epoch warmup only delayed it);
+    1e-4 overfit the fit actors (train CCC 0.90, held-out -0.06); 1e-5 kept
+    predictions on the label scale with held-out CCC ~0.13."""
+    assert PROBE_FIT_LR == 1e-5
 
 
 def test_final_block_is_linear_va_head():
@@ -340,8 +391,8 @@ def _tiny_checkpoint_bundle() -> DiagBundle:
     return DiagBundle(encoder=encoder, model=None, run_id="ckpt", round=None)
 
 
-def test_check_skips_cleanly_without_veatic_root(monkeypatch):
-    monkeypatch.delenv("VEATIC_ROOT", raising=False)
+def test_check_skips_cleanly_without_afewva_root(monkeypatch):
+    monkeypatch.delenv("AFEWVA_ROOT", raising=False)
     bundle = _tiny_checkpoint_bundle()
 
     reports = check(bundle, {"control_bundle": _random_init_bundle()})
@@ -354,7 +405,7 @@ def test_check_skips_cleanly_without_veatic_root(monkeypatch):
 
 
 def test_check_skips_cleanly_with_missing_manifest(tmp_path, monkeypatch):
-    monkeypatch.setenv("VEATIC_ROOT", str(tmp_path))  # no manifest.csv written
+    monkeypatch.setenv("AFEWVA_ROOT", str(tmp_path))  # no manifest.csv written
     bundle = _tiny_checkpoint_bundle()
 
     reports = check(bundle, {"control_bundle": _random_init_bundle()})
@@ -366,7 +417,7 @@ def test_check_skips_cleanly_with_missing_manifest(tmp_path, monkeypatch):
 
 def test_check_skips_cleanly_without_control_bundle(tmp_path, monkeypatch):
     _write_probe_manifest(tmp_path, n_identities=10, n_frames=40)
-    monkeypatch.setenv("VEATIC_ROOT", str(tmp_path))
+    monkeypatch.setenv("AFEWVA_ROOT", str(tmp_path))
     bundle = _tiny_checkpoint_bundle()
 
     reports = check(bundle, {})
@@ -376,11 +427,11 @@ def test_check_skips_cleanly_without_control_bundle(tmp_path, monkeypatch):
     assert "skipped" in report.meta
 
 
-def test_check_runs_probe_by_depth_with_veatic_and_control_present(
+def test_check_runs_probe_by_depth_with_afewva_and_control_present(
     tmp_path, monkeypatch
 ):
     _write_probe_manifest(tmp_path, n_identities=10, n_frames=40)
-    monkeypatch.setenv("VEATIC_ROOT", str(tmp_path))
+    monkeypatch.setenv("AFEWVA_ROOT", str(tmp_path))
     bundle = _tiny_checkpoint_bundle()
     control = _random_init_bundle()
 
@@ -399,7 +450,7 @@ def test_check_ignores_fit_budget_keys_in_inputs(tmp_path, monkeypatch):
     """`check()` SHALL NOT read a fit parameter out of `inputs` -- an epochs
     key there must not change the pinned PROBE_FIT_EPOCHS fit."""
     _write_probe_manifest(tmp_path, n_identities=10, n_frames=40)
-    monkeypatch.setenv("VEATIC_ROOT", str(tmp_path))
+    monkeypatch.setenv("AFEWVA_ROOT", str(tmp_path))
     bundle = _tiny_checkpoint_bundle()
     control = _random_init_bundle()
 
@@ -471,10 +522,12 @@ def _informative_tokens(n: int, dim: int, scale: float, seed: int):
 
 def test_standardisation_is_what_makes_a_realistic_stream_scale_learnable():
     """The 2026-09-23 failure, pinned. At a residual-stream scale this
-    workstream actually produces, the tanh head saturates and the fit barely
-    moves; the same tokens standardised recover the signal. On real AFEW-VA
-    tokens the unstandardised score was exactly 0.0 for every arm and seed --
-    a dead fit wearing the shape of a precise null."""
+    workstream actually produces, the fit barely moves; the same tokens
+    standardised recover the signal. On real AFEW-VA tokens the unstandardised
+    score was exactly 0.0 for every arm and seed -- a dead fit wearing the
+    shape of a precise null. At PROBE_FIT_LR=1e-5 (2026-09-26) the fit runs
+    200 epochs, ~600 steps on these 48 windows -- close to the ~680 a real
+    AFEW-VA fit takes in 20 -- where 20 epochs (60 steps) learned nothing."""
     raw_fit, fit_labels = _informative_tokens(48, 16, scale=500.0, seed=0)
     raw_scored, scored_labels = _informative_tokens(16, 16, scale=500.0, seed=1)
     std_fit, std_scored = raw_fit.clone(), raw_scored.clone()
@@ -487,15 +540,14 @@ def test_standardisation_is_what_makes_a_realistic_stream_scale_learnable():
             scored_tokens,
             scored_labels,
             seed=0,
-            epochs=20,
+            epochs=200,
             embed_dim=16,
         )
 
     raw_score = _score(raw_fit, raw_scored)
     standardised_score = _score(std_fit, std_scored)
-    assert raw_score < 0.05
-    assert standardised_score > 0.1
-    assert standardised_score > raw_score + 0.1
+    # Seeded, so pinned to one decimal: -0.033 -> 0.0 and 0.409 -> 0.4.
+    assert (round(raw_score, 1), round(standardised_score, 1)) == (0.0, 0.4)
 
 
 def test_standardisation_revives_the_fit_at_that_same_scale():
@@ -508,7 +560,28 @@ def test_standardisation_revives_the_fit_at_that_same_scale():
         scored_tokens,
         scored_labels,
         seed=0,
-        epochs=20,
+        epochs=200,  # see the test above: ~600 steps at PROBE_FIT_LR
         embed_dim=16,
     )
-    assert score > 0.1
+    assert round(score, 1) == 0.4
+
+
+@_needs_hf
+def test_probe_by_depth_runs_on_hf_levjepa_against_its_own_random_init(tmp_path):
+    """Rung 4's path: an HF ViT checkpoint arm and a random-init HF control,
+    read at the final block (the tiny snapshot's depth is 2)."""
+    manifest_path = _write_probe_manifest(tmp_path, n_identities=10, n_frames=40)
+    cfg = _rung4_model_cfg(_tiny_hf_snapshot(tmp_path / "snap"))
+    bundle = random_init_bundle(cfg, seed=0)
+    control = random_init_bundle(cfg, seed=1)
+
+    per_layer, final_block_reference = probe_by_depth(
+        bundle, control, manifest_path, layers=[1], n_seeds=3, epochs=1
+    )
+
+    checkpoint_value, control_value = per_layer[1]
+    assert all(
+        np.isfinite(v.mean)
+        for v in (checkpoint_value, control_value, final_block_reference)
+    )
+    assert checkpoint_value.mean != control_value.mean
