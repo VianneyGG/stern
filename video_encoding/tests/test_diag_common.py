@@ -42,6 +42,7 @@ from video_encoding.scripts._diag_common import (
     ladder_tau,
     load_bundle,
     load_ladder_rung,
+    load_snapshot_bundle,
     load_solo_bundle,
     paired_inputs,
     patch_tokens,
@@ -399,6 +400,42 @@ def test_load_solo_bundle_does_not_fall_back_to_master(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="no solo checkpoint"):
         load_solo_bundle("solo-run", tmp_path, cfg, node="node055", round=3)
+
+
+def write_snapshot(snapshot_dir, run_id: str, model_cfg, *, round_num: int):
+    """A captured round master, where snapshot_mesh_checkpoints.sh puts it."""
+    torch.manual_seed(round_num)
+    model = VideoMAEForPreTraining(model_cfg)
+    path = snapshot_dir / run_id / f"master_round{round_num}.pt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model_state_dict": model.state_dict()}, path)
+    return model
+
+
+def test_load_snapshot_bundle_reads_the_captured_round(tmp_path):
+    cfg = _tiny_model_cfg()
+    saved = write_snapshot(tmp_path, "r1", cfg, round_num=5)
+
+    bundle = load_snapshot_bundle("r1", tmp_path, cfg, round=5)
+
+    assert (bundle.run_id, bundle.round) == ("r1", 5)
+    first = "patch_embed.proj.weight"
+    assert torch.equal(
+        bundle.encoder.state_dict()[first], saved.encoder.state_dict()[first]
+    )
+
+
+def test_load_snapshot_bundle_does_not_fall_back_to_master(tmp_path):
+    """An uncaptured round raises naming its file -- rendering master.pt as
+    round 5 would put one point on a trajectory under the wrong label."""
+    cfg = _tiny_model_cfg()
+    write_snapshot(tmp_path, "r1", cfg, round_num=4)
+    (tmp_path / "r1" / "master.pt").write_bytes(
+        (tmp_path / "r1" / "master_round4.pt").read_bytes()
+    )
+
+    with pytest.raises(FileNotFoundError, match="master_round5.pt"):
+        load_snapshot_bundle("r1", tmp_path, cfg, round=5)
 
 
 def test_load_bundle_and_load_solo_bundle_agree_on_identical_weights(tmp_path):

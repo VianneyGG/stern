@@ -350,6 +350,32 @@ def load_solo_bundle(
     )
 
 
+def load_snapshot_bundle(
+    run_id: str,
+    snapshot_dir: "Path | str",
+    model_cfg,
+    *,
+    round: int,
+    full_model: bool = False,
+) -> DiagBundle:
+    """Load a round master captured by `snapshot_mesh_checkpoints.sh` --
+    `<snapshot_dir>/<run_id>/master_round<round>.pt` -- the round axis's route.
+
+    A missing round raises. There is deliberately no fallback to `master.pt`:
+    the final weights relabelled as round N would render one point as a
+    trajectory.
+    """
+    ckpt_path = Path(snapshot_dir) / run_id / f"master_round{round}.pt"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"{run_id}: no captured snapshot at {ckpt_path} -- round {round} was "
+            "not captured, and master.pt is never substituted for it"
+        )
+    return _bundle_from_checkpoint(
+        ckpt_path, model_cfg, run_id=run_id, round=round, full_model=full_model
+    )
+
+
 def _bundle_from_checkpoint(
     ckpt_path: Path,
     model_cfg,
