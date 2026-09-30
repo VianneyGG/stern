@@ -12,6 +12,7 @@ from PIL import Image
 
 from data.labels import write_label_csv
 from data.manifest import ManifestRecord, read_manifest, write_manifest
+from video_encoding.data.loaders import identity_disjoint_split
 from video_encoding.models.videomaev2.encoder import VideoMAEEncoder
 from video_encoding.models.videomaev2.regressor import LinearVAHead
 from video_encoding.scripts._diag_common import (
@@ -24,7 +25,6 @@ from video_encoding.scripts.diag_probe import (
     PROBE_FIT_LR,
     AttentiveProbe,
     _fit_and_score_probe,
-    _identity_disjoint_split,
     check,
     probe_by_depth,
     probe_ccc,
@@ -211,7 +211,7 @@ def _records(identity_ids: list[str]) -> list[ManifestRecord]:
 
 def test_probe_ccc_split_is_identity_disjoint():
     records = _records([f"id{i}" for i in range(10)])
-    fit_ids, scored_ids = _identity_disjoint_split(records)
+    fit_ids, scored_ids = identity_disjoint_split(records)
     assert len(fit_ids & scored_ids) == 0
     assert fit_ids | scored_ids == {r.identity_id for r in records}
 
@@ -220,8 +220,8 @@ def test_probe_ccc_split_is_identical_across_seeds():
     """The split is derived from identity_ids alone -- it must not vary with
     a caller-supplied seed, since both arms need the same held-out set."""
     records = _records([f"id{i}" for i in range(10)])
-    split_a = _identity_disjoint_split(records)
-    split_b = _identity_disjoint_split(records)
+    split_a = identity_disjoint_split(records)
+    split_b = identity_disjoint_split(records)
     assert split_a == split_b
 
 
@@ -232,7 +232,7 @@ def test_probe_ccc_windows_of_one_clip_do_not_straddle_split(tmp_path):
     identity."""
     manifest_path = _write_probe_manifest(tmp_path, n_identities=10, n_frames=40)
     records = read_manifest(manifest_path, expected_role="probe")
-    fit_ids, scored_ids = _identity_disjoint_split(records)
+    fit_ids, scored_ids = identity_disjoint_split(records)
     fit_records = [r for r in records if r.identity_id in fit_ids]
     scored_records = [r for r in records if r.identity_id in scored_ids]
     fit_clips = {r.clip_path for r in fit_records}

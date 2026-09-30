@@ -90,7 +90,11 @@ class VideoMAEVARegressor(nn.Module):
         super().__init__()
         self.backbone = backbone if backbone is not None else VideoMAEEncoder(model_cfg)
         self._embed_dim = int(model_cfg.embed_dim)
-        self.head = LinearVAHead(embed_dim=self._embed_dim, num_heads=12)
+        self.head = LinearVAHead(
+            embed_dim=self._embed_dim,
+            num_heads=12,
+            bounded=bool(model_cfg.get("head_bounded", True)),
+        )
 
     def freeze_backbone(self) -> None:
         """Freeze the pretrained encoder while leaving the cross-attention VA head trainable."""

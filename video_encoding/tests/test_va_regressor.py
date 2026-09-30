@@ -95,3 +95,27 @@ def test_videomae_va_regressor_accepts_levjepa_encoder_as_backbone():
     out = regressor(x)
     assert out.shape == (2, 2)
     assert torch.all(out >= -1.0) and torch.all(out <= 1.0)
+
+
+def test_head_is_bounded_unless_the_model_config_says_otherwise():
+    default = VideoMAEVARegressor(_cfg(12), backbone=_StubBackbone(12))
+    cfg = OmegaConf.create({"embed_dim": 12, "num_frames": 4, "head_bounded": False})
+    unbounded = VideoMAEVARegressor(cfg, backbone=_StubBackbone(12))
+
+    assert default.head.bounded is True
+    assert unbounded.head.bounded is False
+
+
+def test_unbounded_head_trains_past_where_tanh_saturates():
+    # The ssl-diag-08 collapse: a pre-activation of ~7 pins tanh at +-1 and
+    # zeroes the output's spread. Unbounded, the training output keeps it.
+    cfg = OmegaConf.create({"embed_dim": 12, "num_frames": 4, "head_bounded": False})
+    model = VideoMAEVARegressor(cfg, backbone=_StubBackbone(12))
+    with torch.no_grad():
+        model.head.unembed.bias.fill_(7.0)
+    model.train()
+
+    out = model(torch.randn(8, 3, 4, 8, 8))
+
+    assert out.min() > 1.0
+    assert out.std(dim=0).min() > 0.0

@@ -105,7 +105,9 @@ def test_run_train_stage_loads_and_freezes_pretrained_backbone(tmp_path, monkeyp
     )
 
 
-def _write_clip(clip_dir: Path, n: int, rng: np.random.Generator) -> None:
+def _write_clip(
+    clip_dir: Path, n: int, rng: np.random.Generator, actor: str | None = None
+) -> None:
     clip_dir.mkdir(parents=True, exist_ok=True)
     for i in range(n):
         Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(
@@ -118,7 +120,8 @@ def _write_clip(clip_dir: Path, n: int, rng: np.random.Generator) -> None:
         }
         for i in range(n)
     }
-    (clip_dir / f"{clip_dir.name}.json").write_text(json.dumps({"frames": frames}))
+    payload = {"frames": frames, **({"actor": actor} if actor else {})}
+    (clip_dir / f"{clip_dir.name}.json").write_text(json.dumps(payload))
 
 
 def _cfg(tmp_path: Path, manifest_path: Path):
@@ -367,3 +370,157 @@ def test_levjepa_hf_encoder_routes_to_the_hf_regressor(tmp_path, monkeypatch):
         tmp_path / "ckpt" / "test_va_finetune" / "latest.pt", weights_only=False
     )
     assert saved["model_name"] == "levjepa_hf_va_regressor"
+
+
+# --- train.split=identity, epochs_run, final (ssl-diag-08) -------------------
+
+
+def _five_actor_manifest(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """Ten clips over five actors, two clips each, so a window-level split
+    would put one actor on both sides. Returns (manifest, clip -> actor)."""
+    rng = np.random.default_rng(0)
+    clip_actor = {f"{i:03d}": f"actor{i // 2}" for i in range(10)}
+    for clip, actor in clip_actor.items():
+        _write_clip(tmp_path / clip, 24, rng, actor=actor)
+    return build(tmp_path, tmp_path), clip_actor
+
+
+def _clips(dataset) -> set[str]:
+    """Clip names behind a VAWindowDataset or a random_split Subset of one."""
+    if isinstance(dataset, torch.utils.data.Subset):
+        items = [dataset.dataset._items[i] for i in dataset.indices]
+    else:
+        items = dataset._items
+    return {frame_files[0].parent.name for frame_files, _, _ in items}
+
+
+def _capture_datasets(monkeypatch) -> list[tuple]:
+    seen: list[tuple] = []
+    real = train_mod._make_loaders
+
+    def _spy(train_ds, val_ds, **kwargs):
+        seen.append((train_ds, val_ds))
+        return real(train_ds, val_ds, **kwargs)
+
+    monkeypatch.setattr(train_mod, "_make_loaders", _spy)
+    return seen
+
+
+def test_identity_split_puts_no_actor_on_both_sides(tmp_path, monkeypatch):
+    manifest_path, clip_actor = _five_actor_manifest(tmp_path)
+    monkeypatch.setattr(train_mod, "VideoMAEVARegressor", _FakeRegressor)
+    seen = _capture_datasets(monkeypatch)
+    cfg = _cfg(tmp_path, manifest_path)
+    cfg.train.split = "identity"
+    cfg.train.epochs = 1
+
+    train_mod.run_train_stage(
+        cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+    )
+
+    ((train_ds, val_ds),) = seen
+    train_actors = {clip_actor[c] for c in _clips(train_ds)}
+    val_actors = {clip_actor[c] for c in _clips(val_ds)}
+    # 0.2 of five actors, taken from the end of the sorted ids: the held-out
+    # side is actor4 alone -- not merely disjoint, but the right way round.
+    assert val_actors == {"actor4"}
+    assert train_actors == {f"actor{i}" for i in range(4)}
+
+
+def test_identity_split_honours_split_fraction(tmp_path, monkeypatch):
+    manifest_path, clip_actor = _five_actor_manifest(tmp_path)
+    monkeypatch.setattr(train_mod, "VideoMAEVARegressor", _FakeRegressor)
+    seen = _capture_datasets(monkeypatch)
+    cfg = _cfg(tmp_path, manifest_path)
+    cfg.train.update({"split": "identity", "split_fraction": 0.4, "epochs": 1})
+
+    train_mod.run_train_stage(
+        cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+    )
+
+    ((_, val_ds),) = seen
+    assert {clip_actor[c] for c in _clips(val_ds)} == {"actor3", "actor4"}
+
+
+def test_identity_split_does_not_move_with_seed(tmp_path, monkeypatch):
+    manifest_path, _ = _five_actor_manifest(tmp_path)
+    monkeypatch.setattr(train_mod, "VideoMAEVARegressor", _FakeRegressor)
+    seen = _capture_datasets(monkeypatch)
+    for seed in (0, 1):
+        cfg = _cfg(tmp_path, manifest_path)
+        cfg.train.update({"split": "identity", "epochs": 1, "seed": seed})
+        cfg.experiment.name = f"seed{seed}"
+        train_mod.run_train_stage(
+            cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+        )
+
+    assert _clips(seen[0][1]) == _clips(seen[1][1])
+
+
+def test_default_split_is_the_seeded_window_level_random_split(tmp_path, monkeypatch):
+    manifest_path, _ = _five_actor_manifest(tmp_path)
+    monkeypatch.setattr(train_mod, "VideoMAEVARegressor", _FakeRegressor)
+    seen = _capture_datasets(monkeypatch)
+    cfg = _cfg(tmp_path, manifest_path)
+    cfg.train.update({"epochs": 1, "seed": 3})
+
+    train_mod.run_train_stage(
+        cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+    )
+
+    ((_, val_ds),) = seen
+    n_total = len(val_ds.dataset)
+    n_val = max(1, int(round(n_total * 0.1)))
+    expected = torch.utils.data.random_split(
+        range(n_total),
+        [n_total - n_val, n_val],
+        generator=torch.Generator().manual_seed(3),
+    )[1].indices
+    assert list(val_ds.indices) == list(expected)
+
+
+def test_final_is_the_last_epoch_and_best_keys_are_unchanged(tmp_path, monkeypatch):
+    rng = np.random.default_rng(0)
+    _write_clip(tmp_path / "001", 24, rng)
+    _write_clip(tmp_path / "002", 24, rng)
+    manifest_path = build(tmp_path, tmp_path)
+    monkeypatch.setattr(train_mod, "VideoMAEVARegressor", _FakeRegressor)
+    scripted = iter(
+        [
+            {"val_ccc_v": 0.6, "val_ccc_a": 0.4, "mean_ccc": 0.5},
+            {"val_ccc_v": 0.2, "val_ccc_a": 0.0, "mean_ccc": 0.1},
+        ]
+    )
+    monkeypatch.setattr(train_mod, "_validate", lambda *a, **k: next(scripted))
+    cfg = _cfg(tmp_path, manifest_path)
+    cfg.train.update({"epochs": 2, "resume": False})
+
+    result = train_mod.run_train_stage(
+        cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+    )
+
+    assert result["epochs_run"] == 2
+    assert result["final"] == {"val_ccc_v": 0.2, "val_ccc_a": 0.0, "mean_ccc": 0.1}
+    assert result["mean_ccc"] == 0.5  # best epoch, as before
+
+
+def test_epochs_run_counts_only_the_epochs_this_call_ran(tmp_path, monkeypatch):
+    """A resumed run is shorter than `train.epochs`; `epochs_run` must say so
+    rather than echo the config."""
+    rng = np.random.default_rng(0)
+    _write_clip(tmp_path / "001", 24, rng)
+    _write_clip(tmp_path / "002", 24, rng)
+    manifest_path = build(tmp_path, tmp_path)
+    monkeypatch.setattr(train_mod, "VideoMAEVARegressor", _FakeRegressor)
+    cfg = _cfg(tmp_path, manifest_path)
+    cfg.train.epochs = 1
+    train_mod.run_train_stage(
+        cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+    )
+
+    cfg.train.epochs = 3
+    result = train_mod.run_train_stage(
+        cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+    )
+
+    assert result["epochs_run"] == 2

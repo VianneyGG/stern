@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from data.manifest import ManifestRecord, read_manifest
 from eval.ccc import ccc_loss, concordance_correlation_coefficient
-from video_encoding.data.loaders import LabelledDataset
+from video_encoding.data.loaders import LabelledDataset, identity_disjoint_split
 from video_encoding.data.probe_windows import VAWindowDataset
 from video_encoding.models.ViT.block import BlockConfig, ViTBlock
 from video_encoding.models.videomaev2.regressor import LinearVAHead
@@ -133,28 +133,6 @@ class AttentiveProbe(torch.nn.Module):
         for block in self.blocks:
             x = block(x)
         return self.head(x)
-
-
-# --- identity-disjoint split -------------------------------------------------
-
-
-def _identity_disjoint_split(
-    records: list[ManifestRecord], split_fraction: float = PROBE_SPLIT_FRACTION
-) -> tuple[set[str], set[str]]:
-    """Partition `records` into (fit_ids, scored_ids) by `identity_id`.
-
-    Derived deterministically from the manifest's identity_ids alone (sorted
-    order) -- never from a seed, so the split is identical across every seed,
-    every layer, and both arms, which is what makes the checkpoint-minus-
-    control difference a paired difference. `train.py:_split_loaders` splits
-    windows (not clips) and seeds from the caller's `seed`; neither property
-    holds here on purpose (design.md's split decision).
-    """
-    identity_ids = sorted({record.identity_id for record in records})
-    n_scored = max(1, round(len(identity_ids) * split_fraction))
-    scored_ids = set(identity_ids[-n_scored:])
-    fit_ids = set(identity_ids) - scored_ids
-    return fit_ids, scored_ids
 
 
 def permute_labels(labels: "torch.Tensor", seed: int) -> "torch.Tensor":
@@ -419,7 +397,7 @@ def probe_ccc(
     """
     manifest_path = Path(manifest_path)
     records = read_manifest(manifest_path, expected_role="probe")
-    fit_ids, scored_ids = _identity_disjoint_split(records)
+    fit_ids, scored_ids = identity_disjoint_split(records, PROBE_SPLIT_FRACTION)
     fit_records = [r for r in records if r.identity_id in fit_ids]
     scored_records = [r for r in records if r.identity_id in scored_ids]
 
@@ -530,7 +508,7 @@ def probe_by_depth(
     """
     manifest_path = Path(manifest_path)
     records = read_manifest(manifest_path, expected_role="probe")
-    fit_ids, scored_ids = _identity_disjoint_split(records)
+    fit_ids, scored_ids = identity_disjoint_split(records, PROBE_SPLIT_FRACTION)
     fit_records = [r for r in records if r.identity_id in fit_ids]
     scored_records = [r for r in records if r.identity_id in scored_ids]
     root = manifest_path.parent

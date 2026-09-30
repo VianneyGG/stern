@@ -37,7 +37,7 @@ from video_encoding.mesh.pending_files import (
     pending_files_for_round,
 )
 from video_encoding.mesh.assignment import read_my_shards
-from video_encoding.scripts.run_outer_step import _compute_alphas
+from video_encoding.scripts.run_outer_step import _compute_alphas, filter_nonfinite
 from video_encoding.scripts._diag_common import (
     DEFAULT_SEPARATION_K,
     LADDER_REVISION,
@@ -111,6 +111,7 @@ class MergeInputs:
     n_steps: dict[str, int]
     payload_kinds: dict[str, str]
     gaps: tuple[str, ...]
+    dropped_nonfinite: tuple[str, ...] = ()
 
 
 def _manifest_record(snapshot_dir: Path, round: int) -> dict:
@@ -165,6 +166,9 @@ def load_merge_inputs(snapshot_dir: Path, round: int) -> MergeInputs:
             )
         checkpoints[node] = payload
 
+    # Production's order: non-finite first (run_outer_step.merge_round), then
+    # stale. A nan worker would otherwise make every replayed master nan.
+    checkpoints, nonfinite = filter_nonfinite(checkpoints)
     survivors, dropped = filter_stale_deltas(checkpoints, master_version)
     deltas: dict[str, StateDict] = {}
     kinds: dict[str, str] = {}
@@ -205,6 +209,7 @@ def load_merge_inputs(snapshot_dir: Path, round: int) -> MergeInputs:
         },
         payload_kinds=kinds,
         gaps=tuple(record.get("gaps", [])),
+        dropped_nonfinite=tuple(sorted(nonfinite)),
     )
 
 
@@ -508,13 +513,17 @@ def merge_regression(
     return _regression(loss_fn(post), contributors, inputs.alphas, master_loss)
 
 
-def _sweep_alphas(inputs: MergeInputs, weighting: str) -> dict[str, float] | None:
-    """Production alphas for `weighting`, or None when a survivor lacks the
-    field it reads -- defaulting a missing value would fabricate a weighting."""
+def _sweep_alphas(
+    inputs: MergeInputs, weighting: str
+) -> tuple[dict[str, float] | None, str | None]:
+    """`(production alphas, None)` for `weighting`, or `(None, reason)` when a
+    survivor lacks the field it reads or production would refuse its value --
+    defaulting either would fabricate a weighting."""
     nodes = sorted(inputs.worker_deltas)
     field = _WEIGHTING_NEEDS.get(weighting)
-    if field and any(n not in getattr(inputs, field) for n in nodes):
-        return None
+    missing = [n for n in nodes if field and n not in getattr(inputs, field)]
+    if missing:
+        return None, f"{field} missing for {missing}"
     checkpoints = {
         n: {
             "n_samples": inputs.n_samples[n],
@@ -523,7 +532,10 @@ def _sweep_alphas(inputs: MergeInputs, weighting: str) -> dict[str, float] | Non
         }
         for n in nodes
     }
-    return _compute_alphas(checkpoints, weighting)
+    try:
+        return _compute_alphas(checkpoints, weighting), None
+    except ValueError as exc:
+        return None, str(exc)
 
 
 def counterfactual_sweep(
@@ -555,7 +567,7 @@ def counterfactual_sweep(
     contributors, master_loss = _baseline_losses(inputs, loss_fn)
     rows = []
     for weighting in weightings:
-        alphas = _sweep_alphas(inputs, weighting)
+        alphas, _ = _sweep_alphas(inputs, weighting)
         if alphas is None:
             continue
         merged = average_deltas(inputs.worker_deltas, alphas)
@@ -687,23 +699,53 @@ def _forward_reports(
     merge: MergeInputs, inputs: dict, base_meta: dict
 ) -> dict[str, DiagReport]:
     """Checks 6-7, replicated over masking seeds. Each seed's sweep contains
-    the configured nesterov/data cell, which IS that seed's merge regression
-    (same alphas, same step, same mask), so the regression is read off it
-    rather than paid for twice."""
-    required = ("diloco_eval_shard", "diloco_assignments", "model_cfg")
-    if any(inputs.get(key) is None for key in required):
+    the configured cell (nesterov at the run's own weighting), which IS that
+    seed's merge regression (same alphas, same step, same mask), so the
+    regression is read off it rather than paid for twice."""
+
+    def skipped(reason: str) -> dict[str, DiagReport]:
         return {
             name: DiagReport(
-                metrics={},
-                arrays={},
-                meta={**base_meta, "skipped": "no diloco eval shard supplied"},
+                metrics={}, arrays={}, meta={**base_meta, "skipped": reason}
             )
             for name in _FORWARD_CHECKS
         }
 
+    required = ("diloco_eval_shard", "diloco_assignments", "model_cfg")
+    if any(inputs.get(key) is None for key in required):
+        return skipped("no diloco eval shard supplied")
+
+    # A misconfigured eval set is the operator's error and raises; anything
+    # after it (a refused weighting, an OOM) is this pair's failure alone and
+    # must not take the five 12a reports down with it.
     assert_held_out(
         inputs["diloco_eval_shard"], inputs["diloco_assignments"], merge.worker_deltas
     )
+    try:
+        return _forward_reports_unguarded(merge, inputs, base_meta)
+    except Exception as exc:  # noqa: BLE001 -- see above
+        return skipped(f"forward-pass checks failed: {type(exc).__name__}: {exc}")
+
+
+def _forward_reports_unguarded(
+    merge: MergeInputs, inputs: dict, base_meta: dict
+) -> dict[str, DiagReport]:
+    n_replicates = inputs["diloco_n_replicates"]
+    if n_replicates < 3:
+        # MetricValue needs n >= 3; failing here names the cause instead of
+        # surfacing as a StatisticsError after every forward pass has run.
+        raise ValueError(f"diloco_n_replicates must be >= 3, got {n_replicates}")
+    weighting = inputs.get("diloco_weighting", "data")
+    unavailable = {
+        w: reason
+        for w in _SWEEP_WEIGHTINGS
+        if (reason := _sweep_alphas(merge, w)[1]) is not None
+    }
+    if weighting in unavailable:
+        raise ValueError(
+            f"the run's own weighting {weighting!r} cannot be replayed: "
+            f"{unavailable[weighting]}"
+        )
     model_cfg = inputs["model_cfg"]
     windows, _ = paired_inputs(
         inputs["diloco_eval_shard"],
@@ -719,10 +761,10 @@ def _forward_reports(
         for a in sorted({*_SWEEP_LRS, lr})
         for b in sorted({*_SWEEP_MOMENTA, mu})
     ]
-    configured = ("nesterov", "data", lr, mu)
+    configured = ("nesterov", weighting, lr, mu)
 
     per_seed = []
-    for seed in range(inputs["diloco_n_replicates"]):
+    for seed in range(n_replicates):
         rows = counterfactual_sweep(
             merge,
             mae_loss_fn(model_cfg, windows, seed=seed, device=device),
@@ -781,9 +823,10 @@ def _forward_reports(
                 "best_cell": dict(
                     zip(("rule", "weighting", "outer_lr", "outer_momentum"), best)
                 ),
-                "weightings_unavailable": [
-                    w for w in _SWEEP_WEIGHTINGS if not any(c[1] == w for c in cells)
-                ],
+                "configured_cell": dict(
+                    zip(("rule", "weighting", "outer_lr", "outer_momentum"), configured)
+                ),
+                "weightings_unavailable": unavailable,
                 # best <= configured by construction, so only one side exists.
                 "verdict": _separation(gain, above="INCONCLUSIVE", below="CONFIG_CHANGE"),
             },
@@ -806,7 +849,9 @@ def check(bundle: DiagBundle, inputs: dict) -> dict[str, DiagReport]:
                 meta={
                     "LADDER_REVISION": LADDER_REVISION,
                     "input_kind": "real",
-                    "skipped": "no diloco snapshot supplied",
+                    "skipped": inputs.get(
+                        "diloco_skip_reason", "no diloco snapshot supplied"
+                    ),
                 },
             )
             for name in _CHECKS + _FORWARD_CHECKS
@@ -820,6 +865,7 @@ def check(bundle: DiagBundle, inputs: dict) -> dict[str, DiagReport]:
         "input_kind": "real",
         "gaps": list(merge.gaps),
         "dropped_stale": list(merge.dropped_stale),
+        "dropped_nonfinite": list(merge.dropped_nonfinite),
     }
 
     # D8: the lexicographically first survivor stands in for a single-node run.

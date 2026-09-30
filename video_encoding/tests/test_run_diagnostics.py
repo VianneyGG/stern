@@ -236,7 +236,10 @@ def test_raising_check_is_recorded_and_others_still_write(tmp_path, monkeypatch)
     assert len(boom) == 1
     assert "intentional" in boom[0]["reason"]
     assert boom[0]["run_id"] == "r1"
-    assert {e["check"] for e in out["reports"]} == {"attention_entropy_by_block"}
+    # The AFEW-VA gate always runs (GATES), so it is not "another check".
+    assert {e["check"] for e in out["reports"]} - run_diagnostics.GATES == {
+        "attention_entropy_by_block"
+    }
 
 
 def test_unknown_check_name_raises_listing_valid_names(tmp_path):
@@ -299,7 +302,7 @@ def test_paired_check_missing_random_is_a_wiring_error(tmp_path, monkeypatch):
     out = _run(tmp_path, checks=("_half",))
     assert [e["check"] for e in out["errors"]] == ["_half"]
     assert "random" in out["errors"][0]["reason"]
-    assert out["reports"] == []
+    assert [e for e in out["reports"] if e["check"] not in run_diagnostics.GATES] == []
 
 
 def test_identical_invocations_write_identical_bytes(tmp_path):
@@ -774,7 +777,11 @@ def test_diag_diloco_is_registered_with_every_name_controlled():
     assert run_diagnostics.EMITS["diag_diloco"] == DILOCO_NAMES
     assert DILOCO_NAMES <= CONTROLLED
     assert {PANEL_OF[name] for name in DILOCO_NAMES} == {"diloco"}
-    for registry in (run_diagnostics.PAIRED, run_diagnostics.WEIGHTS_ONLY, run_diagnostics.GATES):
+    for registry in (
+        run_diagnostics.PAIRED,
+        run_diagnostics.WEIGHTS_ONLY,
+        run_diagnostics.GATES,
+    ):
         assert "diag_diloco" not in registry
 
 
@@ -814,7 +821,7 @@ def test_diloco_inputs_keys_and_snapshot_path(tmp_path):
         "r1",
         5,
         snapshot_dir=tmp_path,
-        configs_path=_configs(tmp_path, outer_lr=0.7, outer_momentum=0.9),
+        configs_path=_configs(tmp_path, outer_lr=0.7, outer_momentum=0.9, weighting="token"),
         eval_shard=None,
         assignments_path=None,
         model_cfg=cfg,
@@ -823,6 +830,7 @@ def test_diloco_inputs_keys_and_snapshot_path(tmp_path):
     assert inputs["diloco_snapshot_dir"] == tmp_path / "r1"
     assert inputs["diloco_round"] == 5
     assert (inputs["diloco_outer_lr"], inputs["diloco_outer_momentum"]) == (0.7, 0.9)
+    assert inputs["diloco_weighting"] == "token"
     assert inputs["model_cfg"] is cfg
     assert inputs["diloco_n_replicates"] == 3
     assert "diloco_eval_shard" not in inputs
@@ -884,7 +892,7 @@ def test_round_axis_writes_diloco_reports_end_to_end(tmp_path):
         out_dir=tmp_path / "out",
         ladder_path=None,
         skip_ladder_check=True,
-        configs_path=_configs(tmp_path, outer_lr=0.7, outer_momentum=0.9),
+        configs_path=_configs(tmp_path, outer_lr=0.7, outer_momentum=0.9, weighting="token"),
         n_windows=2,
     )
     diagnostics = json.loads((tmp_path / "out" / "diagnostics.json").read_text())
@@ -895,3 +903,250 @@ def test_round_axis_writes_diloco_reports_end_to_end(tmp_path):
     skipped = {s["check"]: s["reason"] for s in diagnostics["skipped"]}
     assert skipped["merge_regression"] == "no diloco eval shard supplied"
     assert skipped["counterfactual_sweep"] == "no diloco eval shard supplied"
+
+
+def test_diloco_inputs_refuse_one_eval_flag_without_the_other(tmp_path):
+    for shard, assignments in ((tmp_path / "val" / "s.tar", None), (None, tmp_path / "a.json")):
+        with pytest.raises(ValueError, match="together"):
+            run_diagnostics.diloco_inputs(
+                "r1",
+                5,
+                snapshot_dir=tmp_path,
+                configs_path=_configs(
+                    tmp_path, outer_lr=0.7, outer_momentum=0.9, weighting="data"
+                ),
+                eval_shard=shard,
+                assignments_path=assignments,
+                model_cfg=_cfg(),
+                n_replicates=3,
+            )
+
+
+def test_diloco_inputs_require_the_run_weighting(tmp_path):
+    with pytest.raises(ValueError, match="weighting"):
+        run_diagnostics.diloco_inputs(
+            "r1",
+            5,
+            snapshot_dir=tmp_path,
+            configs_path=_configs(tmp_path, outer_lr=0.7, outer_momentum=0.9),
+            eval_shard=None,
+            assignments_path=None,
+            model_cfg=_cfg(),
+            n_replicates=3,
+        )
+
+
+def test_default_checks_skip_diag_diloco_without_hyperparameters(tmp_path):
+    snapshot_dir = _snapshots(tmp_path, _cfg(), [5])
+    run_diagnostics.run_rounds(
+        run_id="r1",
+        rounds=[5],
+        snapshot_dir=snapshot_dir,
+        checks=["diag_diloco"],
+        shard_path=_shard(tmp_path),
+        model_cfg=_cfg(),
+        out_dir=tmp_path / "out",
+        ladder_path=None,
+        skip_ladder_check=True,
+        n_windows=2,
+        diloco_optional=True,
+    )
+    diagnostics = json.loads((tmp_path / "out" / "diagnostics.json").read_text())
+    assert diagnostics["errors"] == []
+    reasons = {s["check"]: s["reason"] for s in diagnostics["skipped"]}
+    assert set(reasons) == DILOCO_NAMES
+    assert {r for r in reasons.values()} == {
+        "no outer hyperparameters for this run (--mesh-run-configs)"
+    }
+
+
+def test_cli_marks_diag_diloco_optional_only_when_checks_is_defaulted(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(
+        run_diagnostics, "run_rounds", lambda **kw: seen.append(kw["diloco_optional"])
+    )
+    base = ["--run-ids", "r1", "--rounds", "5", "--snapshot-dir", str(tmp_path),
+            "--shard-path", str(tmp_path / "s.tar"), "--out-dir", str(tmp_path / "o")]
+    run_diagnostics.main(base)
+    run_diagnostics.main(base + ["--checks", "diag_diloco"])
+    assert seen == [True, False]
+
+
+def test_cli_eval_flags_reach_the_forward_pass_end_to_end(tmp_path):
+    """--diloco-eval-shard/--diloco-assignments through main() -> run_rounds ->
+    diloco_inputs -> check -> real tiny-model forward passes."""
+    import torch
+    from omegaconf import OmegaConf
+
+    from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
+    from video_encoding.tests.test_diag_common import make_fake_shard
+    from video_encoding.tests.test_diag_diloco import _model_payload, _write_snapshot
+
+    cfg = _cfg()
+    cfg_path = tmp_path / "model.yaml"
+    OmegaConf.save(cfg, cfg_path)
+    torch.manual_seed(0)
+    master = VideoMAEForPreTraining(cfg).state_dict()
+    nodes = {
+        n: _model_payload(
+            {k: v + 0.01 * s * torch.ones_like(v) for k, v in master.items()},
+            n_samples=100 * s,
+        )
+        for s, n in enumerate(("a", "b"), start=1)
+    }
+    run_dir = tmp_path / "snapshots" / "r1"
+    run_dir.mkdir(parents=True)
+    _write_snapshot(run_dir, "r1", 4, nodes, master=master)
+    (tmp_path / "val").mkdir()
+    eval_shard = make_fake_shard(tmp_path / "val", {"c0": 8, "c1": 8})
+    assignments = tmp_path / "shard_assignments_r1.json"
+    assignments.write_text(json.dumps({"a": ["t0.tar"], "b": ["t1.tar"]}))
+
+    run_diagnostics.main(
+        [
+            "--run-ids", "r1", "--rounds", "4",
+            "--snapshot-dir", str(tmp_path / "snapshots"),
+            "--shard-path", str(_shard(tmp_path)),
+            "--out-dir", str(tmp_path / "out"),
+            "--skip-ladder-check",
+            "--checks", "diag_diloco",
+            "--n-windows", "2",
+            "--model-config", str(cfg_path),
+            "--mesh-run-configs",
+            str(_configs(tmp_path, outer_lr=0.7, outer_momentum=0.9, weighting="data")),
+            "--diloco-eval-shard", str(eval_shard),
+            "--diloco-assignments", str(assignments),
+        ]
+    )
+    diagnostics = json.loads((tmp_path / "out" / "diagnostics.json").read_text())
+    assert diagnostics["errors"] == []
+    by_check = {e["check"]: e for e in diagnostics["reports"]}
+    assert by_check["merge_regression"]["metrics"]["vs_alpha_mean"]["n"] == 3
+    assert by_check["counterfactual_sweep"]["meta"]["configured_cell"]["weighting"] == "data"
+    assert by_check["merge_regression"]["meta"]["eval_shard"] == str(eval_shard)
+
+
+# --- AFEW-VA gate wiring (ssl-diag-08) ---------------------------------------
+
+
+def test_the_afewva_gate_is_the_registered_gate():
+    from video_encoding.scripts import diag_finetune_afewva
+    from video_encoding.scripts.render_report import CONTROLLED
+
+    assert run_diagnostics.GATES == frozenset({"finetune_afewva"})
+    assert run_diagnostics.CHECKS["finetune_afewva"] is diag_finetune_afewva.check
+    assert run_diagnostics.EMITS["finetune_afewva"] == frozenset({"finetune_afewva"})
+    assert "finetune_afewva" in CONTROLLED
+
+
+def test_intrinsic_checks_alone_never_pass_the_gate(tmp_path, monkeypatch):
+    from video_encoding.scripts.render_report import verdict
+
+    monkeypatch.delenv("AFEWVA_ROOT", raising=False)
+    diagnostics = _run(tmp_path, checks=("diag_depth",))
+
+    gates = [e for e in diagnostics["reports"] if e["check"] == "finetune_afewva"]
+    assert len(gates) == 1
+    assert gates[0]["meta"]["status"] == "GATE_NOT_MET"
+    assert not [e for e in diagnostics["errors"] if e["check"] == "finetune_afewva"]
+    assert verdict(diagnostics["reports"]) == "GATE_NOT_MET"
+
+
+def _spy_gate_inputs(monkeypatch) -> list[dict]:
+    seen: list[dict] = []
+
+    def _spy(bundle, inputs):
+        seen.append(inputs)
+        return {}
+
+    monkeypatch.setitem(run_diagnostics.CHECKS, "finetune_afewva", _spy)
+    return seen
+
+
+def test_run_threads_the_gate_parameters(tmp_path, monkeypatch):
+    seen = _spy_gate_inputs(monkeypatch)
+    _run(tmp_path, checks=("diag_depth",), min_epochs=4, gate_seeds=5)
+
+    (inputs,) = seen
+    gate = inputs["gate"]
+    assert gate["min_epochs"] == 4 and gate["n_seeds"] == 5
+    assert gate["cache_dir"] == tmp_path / "out" / "gate_cache"
+    assert gate["model_cfg"] == _cfg()
+    assert inputs["control_bundle"] is not None
+
+
+def test_run_without_a_ceiling_checkpoint_is_not_an_error(tmp_path, monkeypatch):
+    seen = _spy_gate_inputs(monkeypatch)
+    diagnostics = _run(tmp_path, checks=("diag_depth",))
+
+    assert seen[0]["gate"]["ceiling_bundle"] is None
+    assert diagnostics["errors"] == []
+
+
+def test_an_unloadable_ceiling_is_absent_not_an_error(tmp_path, monkeypatch):
+    seen = _spy_gate_inputs(monkeypatch)
+    diagnostics = _run(
+        tmp_path,
+        checks=("diag_depth",),
+        public_videomaev2_ckpt=tmp_path / "missing.pth",
+    )
+
+    assert seen[0]["gate"]["ceiling_bundle"] is None
+    assert diagnostics["errors"] == []
+
+
+def test_the_round_axis_never_fine_tunes(tmp_path, monkeypatch):
+    afewva = tmp_path / "afewva"
+    afewva.mkdir()
+    (afewva / "manifest.csv").write_text("")
+    monkeypatch.setenv("AFEWVA_ROOT", str(afewva))
+    snapshot_dir = _snapshots(tmp_path, _cfg(), [4, 5])
+
+    diagnostics = _run_rounds(tmp_path, [4, 5], snapshot_dir)
+
+    gates = [e for e in diagnostics["reports"] if e["check"] == "finetune_afewva"]
+    assert len(gates) == 2
+    for e in gates:
+        assert e["meta"]["status"] == "GATE_NOT_MET"
+        assert "run axis" in e["meta"]["reason"]
+
+
+def test_an_incomparable_gate_cache_is_an_error_and_not_a_pass(tmp_path, monkeypatch):
+    from video_encoding.scripts.render_report import verdict
+
+    afewva = tmp_path / "afewva"
+    afewva.mkdir()
+    (afewva / "manifest.csv").write_text("")
+    monkeypatch.setenv("AFEWVA_ROOT", str(afewva))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "gate_params.json").write_text(
+        json.dumps({"min_epochs": 10, "gate_seeds": 3, "split_fraction": 0.2})
+    )
+
+    diagnostics = _run(
+        tmp_path, checks=("diag_depth",), min_epochs=5, gate_cache_dir=cache
+    )
+
+    (error,) = [e for e in diagnostics["errors"] if e["check"] == "finetune_afewva"]
+    assert "min_epochs" in error["reason"]
+    assert verdict(diagnostics["reports"]) == "GATE_NOT_MET"
+
+
+def test_cli_threads_the_gate_flags(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(run_diagnostics, "run", lambda **kw: seen.update(kw))
+    run_diagnostics.main(
+        [
+            "--run-ids", "r1",
+            "--shard-path", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+            "--min-epochs", "7",
+            "--gate-seeds", "4",
+            "--gate-cache-dir", str(tmp_path / "cache"),
+            "--public-videomaev2-ckpt", str(tmp_path / "v2.pth"),
+        ]
+    )  # fmt: skip
+    assert seen["min_epochs"] == 7 and seen["gate_seeds"] == 4
+    assert seen["gate_cache_dir"] == tmp_path / "cache"
+    assert seen["public_videomaev2_ckpt"] == tmp_path / "v2.pth"

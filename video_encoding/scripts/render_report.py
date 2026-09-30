@@ -37,6 +37,8 @@ CONTROLLED: frozenset[str] = frozenset(
         "momentum_alignment",
         "merge_regression",
         "counterfactual_sweep",
+        # The AFEW-VA gate: random_init under the identical fine-tune recipe.
+        "finetune_afewva",
     }
 )
 

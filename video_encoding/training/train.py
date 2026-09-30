@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import hydra
@@ -30,7 +31,11 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from torch.utils.data.distributed import DistributedSampler
 
 from eval.ccc import ccc_loss, concordance_correlation_coefficient
-from video_encoding.data.loaders import build_probe_loader
+from video_encoding.data.loaders import (
+    LabelledDataset,
+    build_probe_loader,
+    identity_disjoint_split,
+)
 from video_encoding.data.probe_windows import VAWindowDataset, make_temporal_transform
 from video_encoding.models import VideoMAEVARegressor
 from video_encoding.models.levjepa_hf import HFLeVJEPAVARegressor
@@ -64,24 +69,30 @@ def run_train_stage(
         checkpoint_root.mkdir(parents=True, exist_ok=True)
 
     labelled = build_probe_loader(cfg.dataset, cfg.preprocess.window)
-    dataset = VAWindowDataset(
-        labelled,
-        num_frames=int(cfg.model.num_frames),
-        image_size=int(cfg.model.image_size),
-        overlap=float(cfg.preprocess.window.overlap),
-        va_range=tuple(cfg.dataset.va_range),
-        frame_stride=int(cfg.model.get("frame_stride", 1)),
-        transform=_temporal_transform(cfg),
-    )
-    train_loader, val_loader = _split_loaders(
-        dataset,
-        val_frac=0.1,
+    loader_kwargs = dict(
         batch_size=int(cfg.train.batch_size),
-        seed=int(cfg.train.seed),
         rank=rank,
         world_size=world_size,
         num_workers=int(cfg.train.get("num_workers", 0)),
     )
+    if str(cfg.train.get("split", "random")) == "identity":
+        # Identity-disjoint and seed-independent, so held-out windows share no
+        # clip or actor with training and seed-paired runs score on one set.
+        fit_ids, scored_ids = identity_disjoint_split(
+            labelled.records, float(cfg.train.get("split_fraction", 0.2))
+        )
+        train_loader, val_loader = _make_loaders(
+            _window_dataset(cfg, labelled, fit_ids),
+            _window_dataset(cfg, labelled, scored_ids),
+            **loader_kwargs,
+        )
+    else:
+        train_loader, val_loader = _split_loaders(
+            _window_dataset(cfg, labelled, None),
+            val_frac=0.1,
+            seed=int(cfg.train.seed),
+            **loader_kwargs,
+        )
 
     is_hf = str(cfg.model.get("encoder", "videomae")) == "levjepa_hf"
     model_cls = HFLeVJEPAVARegressor if is_hf else VideoMAEVARegressor
@@ -132,7 +143,10 @@ def run_train_stage(
         rank=rank,
     )
     result: dict = {}
+    final: dict = {}
+    epochs_run = 0
     for epoch in range(start_epoch, int(cfg.train.epochs)):
+        epochs_run += 1
         set_sampler_epoch(train_loader, epoch)
         train_loss = _train_epoch(
             model,
@@ -149,6 +163,7 @@ def run_train_stage(
             if val_loader
             else {}
         )
+        final = val
         mean_ccc = val.get("mean_ccc", -train_loss)  # fall back to -loss if no val
 
         if writer is not None:
@@ -204,7 +219,7 @@ def run_train_stage(
         write_result_json(
             result, cfg, results_root=cfg.train.results_root, overwrite=True
         )
-    return {"stage": "train", **result}
+    return {"stage": "train", **result, "final": final, "epochs_run": epochs_run}
 
 
 def _build_optimizer(model, train_cfg) -> tuple[torch.optim.Optimizer, str]:
@@ -390,6 +405,26 @@ def _validate(model, loader, device, *, amp_bf16: bool = False) -> dict:
     return {"val_ccc_v": ccc_v, "val_ccc_a": ccc_a, "mean_ccc": (ccc_v + ccc_a) / 2}
 
 
+def _window_dataset(
+    cfg: DictConfig, labelled: LabelledDataset, identity_ids: set[str] | None
+) -> VAWindowDataset:
+    """Windows over `labelled`, restricted to `identity_ids` when given."""
+    if identity_ids is not None:
+        labelled = replace(
+            labelled,
+            records=[r for r in labelled.records if r.identity_id in identity_ids],
+        )
+    return VAWindowDataset(
+        labelled,
+        num_frames=int(cfg.model.num_frames),
+        image_size=int(cfg.model.image_size),
+        overlap=float(cfg.preprocess.window.overlap),
+        va_range=tuple(cfg.dataset.va_range),
+        frame_stride=int(cfg.model.get("frame_stride", 1)),
+        transform=_temporal_transform(cfg),
+    )
+
+
 def _split_loaders(
     dataset: Dataset,
     *,
@@ -412,7 +447,25 @@ def _split_loaders(
         )
     else:
         train_ds, val_ds = dataset, None
+    return _make_loaders(
+        train_ds,
+        val_ds,
+        batch_size=batch_size,
+        rank=rank,
+        world_size=world_size,
+        num_workers=num_workers,
+    )
 
+
+def _make_loaders(
+    train_ds: Dataset,
+    val_ds: Dataset | None,
+    *,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    num_workers: int = 0,
+) -> tuple[DataLoader, DataLoader | None]:
     sampler = (
         DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
         if world_size > 1

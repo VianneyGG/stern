@@ -23,6 +23,7 @@ import numpy as np
 from video_encoding.scripts import (
     diag_depth,
     diag_diloco,
+    diag_finetune_afewva,
     diag_labelfree,
     diag_probe,
     diag_qualitative,
@@ -74,6 +75,7 @@ CHECKS: dict[str, Callable] = {
     "diag_qualitative": _as_list(diag_qualitative.check),
     "probe_by_depth": diag_probe.check,
     "diag_diloco": diag_diloco.check,
+    "finetune_afewva": diag_finetune_afewva.check,
 }
 
 # Registry key -> every check name it may emit.
@@ -103,6 +105,7 @@ EMITS: dict[str, frozenset[str]] = {
             "counterfactual_sweep",
         }
     ),
+    "finetune_afewva": frozenset({"finetune_afewva"}),
 }
 
 # Registry keys that must return both a `real` and a `random` report -- the
@@ -116,9 +119,9 @@ WEIGHTS_ONLY: frozenset[str] = frozenset(
     {"residual_branch_norm", "delta_from_init", "layerscale_gamma"}
 )
 
-# Registry keys that always run, whatever `--checks` says. Empty until the
-# AFEW-VA gate (`finetune_afewva`) lands.
-GATES: frozenset[str] = frozenset()
+# Registry keys that always run, whatever `--checks` says: no checkpoint is
+# accepted on intrinsic diagnostics alone.
+GATES: frozenset[str] = frozenset({"finetune_afewva"})
 
 
 def validate_registry(
@@ -195,6 +198,12 @@ def build_inputs(
     }
 
 
+# The run's merge settings a replay needs; each run's mesh_run_configs.json
+# entry carries all three.
+DILOCO_HYPERPARAMS = ("outer_lr", "outer_momentum", "weighting")
+_DILOCO_NO_HYPERPARAMS = "no outer hyperparameters for this run (--mesh-run-configs)"
+
+
 def diloco_inputs(
     run_id: str,
     round: int,
@@ -210,8 +219,13 @@ def diloco_inputs(
     stays check-agnostic; only the round axis has a merge to diagnose. The
     outer hyperparameters are required: the replayed step is meaningless
     without the ones the run actually used."""
+    if (eval_shard is None) != (assignments_path is None):
+        raise ValueError(
+            "--diloco-eval-shard and --diloco-assignments go together: the held-out "
+            "guard needs the assignments to vouch for the shard"
+        )
     hyperparams = run_hyperparams(run_id, configs_path) if configs_path else {}
-    missing = [k for k in ("outer_lr", "outer_momentum") if k not in hyperparams]
+    missing = [k for k in DILOCO_HYPERPARAMS if k not in hyperparams]
     if missing:
         raise ValueError(
             f"{run_id}: diag_diloco needs {missing} from its mesh_run_configs.json "
@@ -222,10 +236,11 @@ def diloco_inputs(
         "diloco_round": round,
         "diloco_outer_lr": float(hyperparams["outer_lr"]),
         "diloco_outer_momentum": float(hyperparams["outer_momentum"]),
+        "diloco_weighting": hyperparams["weighting"],
         "model_cfg": model_cfg,
         "diloco_n_replicates": n_replicates,
     }
-    if eval_shard is not None and assignments_path is not None:
+    if eval_shard is not None:
         inputs["diloco_eval_shard"] = Path(eval_shard)
         inputs["diloco_assignments"] = Path(assignments_path)
     return inputs
@@ -496,6 +511,20 @@ def write_plots(
     return skipped
 
 
+def _gate_ceiling(model_cfg, public_videomaev2_ckpt: Path | None) -> DiagBundle | None:
+    """The gate's ceiling arm: rung 3, the one ladder rung sharing the
+    checkpoint's architecture. Absent is not an error -- the gate still
+    classifies against the floor and records why it has no position."""
+    try:
+        return load_ladder_rung(
+            Rung.PUBLIC_VIDEOMAEV2,
+            model_cfg,
+            public_videomaev2_ckpt_path=public_videomaev2_ckpt,
+        )
+    except RungUnavailable:
+        return None
+
+
 def run(
     *,
     run_ids: list[str],
@@ -510,12 +539,26 @@ def run(
     configs_path: Path | None = None,
     seed: int = 0,
     n_windows: int = 4,
+    min_epochs: int = 10,
+    gate_seeds: int = 3,
+    gate_cache_dir: Path | None = None,
+    public_videomaev2_ckpt: Path | None = None,
 ) -> None:
     """The run axis: every check on each run's `master.pt`, against a ladder.
-    A run whose checkpoint fails to load is an error for that run alone."""
+    A run whose checkpoint fails to load is an error for that run alone.
+
+    The only axis that supplies the AFEW-VA gate's inputs: fine-tuning per
+    ladder rung or per captured round is not what the gate measures."""
     checks = _resolve_checks(checks, n_replicates)
     ladder_tiers = _read_ladder(ladder_path, skip_ladder_check)
     out_dir = Path(out_dir)
+    gate_inputs = {
+        "model_cfg": model_cfg,
+        "min_epochs": min_epochs,
+        "n_seeds": gate_seeds,
+        "cache_dir": Path(gate_cache_dir) if gate_cache_dir else out_dir / "gate_cache",
+        "ceiling_bundle": _gate_ceiling(model_cfg, public_videomaev2_ckpt),
+    }
 
     envelopes: list[dict] = []
     arrays: list[dict] = []
@@ -532,6 +575,7 @@ def run(
                 n_windows=n_windows,
                 ref_bundle=None,
             )
+            inputs["gate"] = gate_inputs
         except Exception as exc:  # noqa: BLE001 -- one bad run must not abort the rest
             errors.append(
                 {
@@ -749,6 +793,7 @@ def run_rounds(
     n_windows: int = 4,
     diloco_eval_shard: Path | None = None,
     diloco_assignments: Path | None = None,
+    diloco_optional: bool = False,
 ) -> None:
     """The round axis: one run's captured round masters, each with the round
     n-1 snapshot as its reference. Every requested round is validated against
@@ -766,20 +811,27 @@ def run_rounds(
     captured = {json.loads(ln)["round"] for ln in manifest_lines if ln.strip()}
     ladder_tiers = _read_ladder(ladder_path, skip_ladder_check)
     # Built up front so a missing outer hyperparameter fails before any load.
-    diloco = {
-        r: diloco_inputs(
-            run_id,
-            r,
-            snapshot_dir=snapshot_dir,
-            configs_path=configs_path,
-            eval_shard=diloco_eval_shard,
-            assignments_path=diloco_assignments,
-            model_cfg=model_cfg,
-            n_replicates=n_replicates,
-        )
-        for r in rounds
-        if "diag_diloco" in checks
-    }
+    # `diloco_optional` (diag_diloco only there because --checks defaulted)
+    # turns that failure into a skip, so depth-only command lines keep working.
+    diloco: dict[int, dict] = {}
+    if "diag_diloco" in checks:
+        hyperparams = run_hyperparams(run_id, configs_path) if configs_path else {}
+        if diloco_optional and not set(DILOCO_HYPERPARAMS) <= set(hyperparams):
+            diloco = {r: {"diloco_skip_reason": _DILOCO_NO_HYPERPARAMS} for r in rounds}
+        else:
+            diloco = {
+                r: diloco_inputs(
+                    run_id,
+                    r,
+                    snapshot_dir=snapshot_dir,
+                    configs_path=configs_path,
+                    eval_shard=diloco_eval_shard,
+                    assignments_path=diloco_assignments,
+                    model_cfg=model_cfg,
+                    n_replicates=n_replicates,
+                )
+                for r in rounds
+            }
 
     envelopes: list[dict] = []
     arrays: list[dict] = []
@@ -852,7 +904,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--snapshot-dir", type=Path, default=None)
     parser.add_argument("--mesh-shared", type=Path, default=None)
     parser.add_argument("--shard-path", type=Path, required=True)
-    parser.add_argument("--checks", default=",".join(CHECKS))
+    parser.add_argument(
+        "--checks", default=None, help="comma-separated; default: every check"
+    )
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--ladder-path", type=Path, default=None)
     parser.add_argument(
@@ -882,6 +936,19 @@ def main(argv: list[str] | None = None) -> None:
         default=Path("video_encoding/conf/model/videomae_base.yaml"),
     )
     parser.add_argument("--public-videomaev2-ckpt", type=Path, default=None)
+    parser.add_argument(
+        "--min-epochs",
+        type=int,
+        default=10,
+        help="run axis: AFEW-VA gate fine-tune length, identical for every arm",
+    )
+    parser.add_argument("--gate-seeds", type=int, default=3)
+    parser.add_argument(
+        "--gate-cache-dir",
+        type=Path,
+        default=None,
+        help="run axis: shared gate arm cache; default <out-dir>/gate_cache",
+    )
     parser.add_argument("--supervised-va-ckpt", type=Path, default=None)
     parser.add_argument("--supervised-va-model-config", type=Path, default=None)
     args = parser.parse_args(argv)
@@ -896,7 +963,7 @@ def main(argv: list[str] | None = None) -> None:
 
     model_cfg = OmegaConf.load(args.model_config)
     common = dict(
-        checks=_csv(args.checks),
+        checks=_csv(args.checks) if args.checks is not None else list(CHECKS),
         shard_path=args.shard_path,
         model_cfg=model_cfg,
         out_dir=args.out_dir,
@@ -927,6 +994,7 @@ def main(argv: list[str] | None = None) -> None:
             configs_path=args.mesh_run_configs,
             diloco_eval_shard=args.diloco_eval_shard,
             diloco_assignments=args.diloco_assignments,
+            diloco_optional=args.checks is None,
             **common,
         )
     else:
@@ -936,6 +1004,10 @@ def main(argv: list[str] | None = None) -> None:
             ladder_path=args.ladder_path,
             skip_ladder_check=args.skip_ladder_check,
             configs_path=args.mesh_run_configs,
+            min_epochs=args.min_epochs,
+            gate_seeds=args.gate_seeds,
+            gate_cache_dir=args.gate_cache_dir,
+            public_videomaev2_ckpt=args.public_videomaev2_ckpt,
             **common,
         )
 

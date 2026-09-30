@@ -859,6 +859,17 @@ def test_sweep_uses_real_per_node_sample_counts():
         )
 
 
+def test_sweep_omits_a_weighting_production_would_refuse():
+    # _inverse_loss_weights raises on a non-positive val_loss; the sweep must
+    # drop that weighting, not take the whole check down.
+    inputs = _scalar_inputs({"a": 1.5, "b": 2.0}, val_losses={"a": 0.5, "b": 0.0})
+    rows = _sweep(inputs, weightings=["data", "inverse_loss"])
+    assert {r["weighting"] for r in rows} == {"data"}
+    alphas, reason = diag_diloco._sweep_alphas(inputs, "inverse_loss")
+    assert alphas is None
+    assert "val_loss" in reason
+
+
 def test_sweep_omits_a_weighting_with_incomplete_inputs():
     inputs = _scalar_inputs({"a": 1.5, "b": 2.0})
     inputs = diag_diloco.MergeInputs(**{**inputs.__dict__, "n_steps": {"a": 10}})
@@ -873,8 +884,9 @@ def test_sweep_scores_the_baselines_once():
         calls.append(sd)
         return _weight_loss(sd)
 
-    _sweep(loss_fn=counting)
-    assert len(calls) == 2 + 1 + 5
+    # Two weightings, so scoring the baselines per weighting would show up.
+    _sweep(loss_fn=counting, weightings=["data", "token"])
+    assert len(calls) == 2 + 1 + 2 * 5
 
 
 # --- held-out guard and forward-pass checks --------------------------------------
@@ -977,12 +989,13 @@ def test_check_forward_pass_reports_on_a_tiny_model(tmp_path):
             diag_diloco.mae_loss_fn(inputs["model_cfg"], windows, seed=s, device="cpu"),
             outer_lr=0.7,
             outer_momentum=0.9,
-        )["vs_best_worker"]
+        )
         for s in range(3)
     ]
-    assert regression.metrics["vs_best_worker"].mean == pytest.approx(
-        float(np.mean(direct)), abs=1e-9
-    )
+    for key in ("vs_alpha_mean", "vs_best_worker", "vs_prev_master"):
+        assert regression.metrics[key].mean == pytest.approx(
+            float(np.mean([d[key] for d in direct])), abs=1e-9
+        )
 
     sweep = reports["counterfactual_sweep"]
     assert set(sweep.metrics) == {
@@ -997,7 +1010,7 @@ def test_check_forward_pass_reports_on_a_tiny_model(tmp_path):
     assert len(configured) == 1
     assert min(c["outer_lr"] for c in sweep.meta["grid"]) < 0.7
     assert sweep.meta["verdict"] in {"CONFIG_CHANGE", "INCONCLUSIVE"}
-    assert sweep.meta["weightings_unavailable"] == []
+    assert sweep.meta["weightings_unavailable"] == {}
     assert set(sweep.meta["best_cell"]) == {"rule", "weighting", "outer_lr", "outer_momentum"}
 
 
@@ -1008,3 +1021,89 @@ def test_check_raises_on_an_overlapping_eval_shard(tmp_path, monkeypatch):
     monkeypatch.setattr(diag_diloco, "mae_loss_fn", forbidden)
     with pytest.raises(ValueError, match="'a'"):
         check(None, _forward_pass_inputs(tmp_path, overlap=True))
+
+
+def test_merge_inputs_drop_and_record_nonfinite_workers(tmp_path):
+    master = _master()
+
+    def nodes(master):
+        bad = _worker(master, seed=3)
+        bad["w"][0, 0] = float("nan")
+        return {
+            "a": _model_payload(_worker(master, seed=1)),
+            "b": _model_payload(_worker(master, seed=2)),
+            "c": _model_payload(bad),
+        }
+
+    _write_snapshot(tmp_path, "run-x", 4, nodes(master), master=master)
+    merge = diag_diloco.load_merge_inputs(tmp_path, 4)
+    assert sorted(merge.worker_deltas) == ["a", "b"]
+    assert merge.dropped_nonfinite == ("c",)
+    assert set(merge.alphas) == {"a", "b"}
+
+
+def test_check_replays_the_run_configured_weighting(tmp_path):
+    import dataclasses
+
+    inputs = _forward_pass_inputs(tmp_path)
+    inputs["diloco_weighting"] = "token"
+    reports = check(None, inputs)
+    sweep = reports["counterfactual_sweep"]
+    assert sweep.meta["configured_cell"] == {
+        "rule": "nesterov", "weighting": "token", "outer_lr": 0.7, "outer_momentum": 0.9,
+    }
+    merge = diag_diloco.load_merge_inputs(inputs["diloco_snapshot_dir"], 4)
+    token_alphas, _ = diag_diloco._sweep_alphas(merge, "token")
+    assert token_alphas != merge.alphas  # else this test could not tell them apart
+    windows = diag_diloco.paired_inputs(
+        inputs["diloco_eval_shard"], n_windows=2, num_frames=4, image_size=32, seed=0
+    )[0]
+    direct = [
+        diag_diloco.merge_regression(
+            dataclasses.replace(merge, alphas=token_alphas),
+            diag_diloco.mae_loss_fn(inputs["model_cfg"], windows, seed=s, device="cpu"),
+            outer_lr=0.7,
+            outer_momentum=0.9,
+        )["vs_alpha_mean"]
+        for s in range(3)
+    ]
+    assert reports["merge_regression"].metrics["vs_alpha_mean"].mean == pytest.approx(
+        float(np.mean(direct)), abs=1e-9
+    )
+
+
+def test_forward_pass_failure_is_a_skip_and_12a_survives(tmp_path, monkeypatch):
+    def oom(*args, **kwargs):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(diag_diloco, "mae_loss_fn", oom)
+    reports = check(None, _forward_pass_inputs(tmp_path))
+    assert "mean_cos" in reports["agreement_matrix"].metrics
+    for name in ("merge_regression", "counterfactual_sweep"):
+        assert reports[name].metrics == {}
+        assert "RuntimeError: CUDA out of memory" in reports[name].meta["skipped"]
+
+
+def test_check_reports_a_custom_skip_reason_without_a_snapshot():
+    reports = check(None, {"diloco_skip_reason": "no outer hyperparameters"})
+    assert {r.meta["skipped"] for r in reports.values()} == {"no outer hyperparameters"}
+
+
+def test_an_unreplayable_run_weighting_skips_12b(tmp_path):
+    inputs = _forward_pass_inputs(tmp_path)
+    inputs["diloco_weighting"] = "no_such_weighting"
+    reports = check(None, inputs)
+    assert "mean_cos" in reports["agreement_matrix"].metrics
+    for name in ("merge_regression", "counterfactual_sweep"):
+        assert "no_such_weighting" in reports[name].meta["skipped"]
+
+
+def test_fewer_than_three_replicates_is_refused_before_any_forward_pass(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("forward pass ran with too few replicates")
+
+    monkeypatch.setattr(diag_diloco, "mae_loss_fn", forbidden)
+    inputs = _forward_pass_inputs(tmp_path)
+    inputs["diloco_n_replicates"] = 1
+    reports = check(None, inputs)
+    assert "diloco_n_replicates must be >= 3" in reports["merge_regression"].meta["skipped"]

@@ -105,3 +105,23 @@ def build_eval_loader(
     return LabelledDataset(
         records=records, window_cfg=window_cfg, root=Path(dataset_cfg.path)
     )
+
+
+def identity_disjoint_split(
+    records: list[ManifestRecord], split_fraction: float = 0.2
+) -> tuple[set[str], set[str]]:
+    """Partition `records` into (fit_ids, scored_ids) by `identity_id`.
+
+    Derived deterministically from the manifest's identity_ids alone (sorted
+    order) -- never from a seed, so the split is identical across every seed,
+    every layer, and both arms, which is what makes the checkpoint-minus-
+    control difference a paired difference. `train.py:_split_loaders` splits
+    windows (not clips) and seeds from the caller's `seed`; neither property
+    holds here on purpose. Shared by diag_probe and train.py's
+    `train.split=identity`.
+    """
+    identity_ids = sorted({record.identity_id for record in records})
+    n_scored = max(1, round(len(identity_ids) * split_fraction))
+    scored_ids = set(identity_ids[-n_scored:])
+    fit_ids = set(identity_ids) - scored_ids
+    return fit_ids, scored_ids
