@@ -275,6 +275,22 @@ def test_finiteness_sweep_every_metric_on_freshly_init_activations():
     assert i == pytest.approx(cfg.embed_dim / 2, abs=cfg.embed_dim / 2)  # in [0, D]
 
 
+def test_alpha_req_recovers_decay_order_when_samples_are_fewer_than_dims():
+    """Pooled embeddings give N < D (256 windows, 768 dims): the covariance
+    then has at most N-1 nonzero eigenvalues, and fitting the clipped zeros
+    swamped the slope -- steeper true decay scored *lower*."""
+    rng = np.random.default_rng(0)
+    n, d = 64, 192
+
+    def sample(alpha):
+        scales = np.arange(1, d + 1) ** (-alpha / 2)
+        return rng.standard_normal((n, d)) * scales
+
+    shallow, mid, steep = (alpha_req(sample(a)) for a in (0.5, 1.0, 2.0))
+    assert shallow < mid < steep
+    assert mid == pytest.approx(1.0, abs=0.5)
+
+
 def test_batch_split_invariance():
     """rankme/alpha_req computed on the full token matrix must not depend on
     an arbitrary split into two batches -- both read the same matrix either
@@ -318,13 +334,41 @@ def test_by_block_scores_patch_tokens_only_not_registers():
     pixel_values = torch.randn(4, 3, 4, 32, 32)
 
     states = forward_with_hidden_states(encoder, pixel_values)
-    patch = states[-1][:, 4:, :].detach().numpy().reshape(-1, cfg.embed_dim)
-    with_registers = states[-1].detach().numpy().reshape(-1, cfg.embed_dim)
+    patch = states[-1][:, 4:, :].mean(dim=1).detach().numpy()
+    with_registers = states[-1].mean(dim=1).detach().numpy()
     assert rankme(with_registers) != pytest.approx(rankme(patch), rel=0.05)
 
     result = by_block(bundle, pixel_values, "rankme")
 
     assert result[1] == pytest.approx(rankme(patch), rel=1e-6)
+
+
+def test_by_block_pools_one_embedding_per_window():
+    """RankMe/IdEst are defined over one embedding per sample. Scoring the
+    flattened tokens of a few clips measures within-clip spatial variation
+    instead, so the rank must be bounded by the window count, not the token
+    count (4 windows x 8 tokens here)."""
+    cfg = _tiny_model_cfg(depth=2)
+    encoder = VideoMAEEncoder(cfg).eval()
+    bundle = DiagBundle(encoder=encoder, model=None, run_id="r", round=None)
+    pixel_values = torch.randn(4, 3, 4, 32, 32)
+
+    result = by_block(bundle, pixel_values, "rankme")
+
+    assert result[1] <= 4.0 + 1e-6
+
+
+def test_by_block_is_invariant_to_forward_chunking():
+    cfg = _tiny_model_cfg(depth=2)
+    encoder = VideoMAEEncoder(cfg).eval()
+    bundle = DiagBundle(encoder=encoder, model=None, run_id="r", round=None)
+    pixel_values = torch.randn(6, 3, 4, 32, 32)
+
+    one = by_block(bundle, pixel_values, "alpha_req", chunk=1)
+    all_at_once = by_block(bundle, pixel_values, "alpha_req", chunk=6)
+
+    for block in one:
+        assert one[block] == pytest.approx(all_at_once[block], rel=1e-5)
 
 
 def test_by_block_scores_only_requested_blocks():
@@ -356,7 +400,7 @@ def test_check_scores_one_block_per_replicate(tmp_path, monkeypatch):
     encoder = VideoMAEEncoder(_tiny_model_cfg(depth=3)).eval()
     bundle = DiagBundle(encoder=encoder, model=None, run_id="r", round=None)
 
-    check(bundle, {"shard_path": shard, "n_windows": 8})
+    check(bundle, {"shard_path": shard, "labelfree_n_windows": 8})
 
     # 2 input kinds x 3 metrics x 3 replicates.
     assert len(calls) == 18
@@ -370,28 +414,44 @@ def test_by_block_rejects_unknown_metric_name():
         by_block(bundle, torch.randn(1, 3, 4, 32, 32), "not_a_metric")
 
 
-def test_check_draws_three_independent_windows_not_one_fixed_input(tmp_path):
-    shard = make_fake_shard(tmp_path, {f"clip{i}": 8 for i in range(10)})
-    cfg = _tiny_model_cfg()
-    encoder = VideoMAEEncoder(cfg).eval()
+def test_check_draws_three_independent_windows_shared_across_metrics(
+    tmp_path, monkeypatch
+):
+    """Three replicates means three independent window draws -- and only
+    three: every metric and both input kinds read the same draw, so the three
+    metrics describe one sample and a 256-window draw is forwarded once."""
+    from video_encoding.scripts import diag_labelfree
+
+    draws = []
+    real_paired_inputs = diag_labelfree.paired_inputs
+    monkeypatch.setattr(
+        diag_labelfree,
+        "paired_inputs",
+        lambda *a, **kw: draws.append(kw) or real_paired_inputs(*a, **kw),
+    )
+    shard = make_fake_shard(tmp_path, {f"clip{i}": 8 for i in range(80)})
+    encoder = VideoMAEEncoder(_tiny_model_cfg()).eval()
     bundle = DiagBundle(encoder=encoder, model=None, run_id="r", round=None)
 
-    # 8 windows -> 64 token rows: at 2 windows (16 rows) idest's regression is
-    # underpowered and legitimately NaN on the random batch.
-    reports = check(bundle, {"shard_path": shard, "n_windows": 8})
+    # labelfree_n_windows, not the shared n_windows, sizes this check's draw:
+    # 2 pooled rows cannot carry idest's regression.
+    reports = check(
+        bundle, {"shard_path": shard, "n_windows": 2, "labelfree_n_windows": 64}
+    )
 
+    assert len(draws) == 3
+    assert {d["n_windows"] for d in draws} == {64}
+    assert len({d["seed"] for d in draws}) == 3
     assert reports.keys() == {"diag_labelfree_real", "diag_labelfree_random"}
-    seen_seed_sets = set()
     for kind, report in reports.items():
         assert report.meta["input_kind"] == kind.removeprefix("diag_labelfree_")
-        assert report.metrics.keys() == {"rankme", "alpha_req", "idest"}
+        # idest may legitimately degenerate on a tiny encoder's pooled rows
+        # (the fake clips are near-identical solid colours); its finiteness on
+        # real structure is pinned by the subspace ground-truth test.
+        assert {"rankme", "alpha_req"} <= report.metrics.keys()
         for metric_value in report.metrics.values():
             assert metric_value.n == 3
-            assert len(set(metric_value.seeds)) == 3
-            seen_seed_sets.add(metric_value.seeds)
-    # Distinct metric/input-kind combinations must not all replay one fixed
-    # window set under the hood -- at least some seed sets differ.
-    assert len(seen_seed_sets) >= 2
+            assert set(metric_value.seeds) == {d["seed"] for d in draws}
 
 
 def test_check_records_nan_metric_as_degenerate_instead_of_crashing(
@@ -409,7 +469,7 @@ def test_check_records_nan_metric_as_degenerate_instead_of_crashing(
     encoder = VideoMAEEncoder(_tiny_model_cfg()).eval()
     bundle = DiagBundle(encoder=encoder, model=None, run_id="r", round=None)
 
-    reports = check(bundle, {"shard_path": shard, "n_windows": 2})
+    reports = check(bundle, {"shard_path": shard, "labelfree_n_windows": 4})
 
     for report in reports.values():
         assert report.metrics.keys() == {"rankme", "alpha_req"}

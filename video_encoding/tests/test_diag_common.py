@@ -831,6 +831,19 @@ def test_load_ladder_rung_random_init_needs_no_checkpoint(tmp_path):
     assert bundle.encoder is not None
 
 
+def test_load_ladder_rung_random_init_is_seeded():
+    """Unseeded, rung 0 was a different network in every job (the probe
+    control drifted 0.066-0.097 across jobs), so the floor itself moved."""
+
+    def state(seed):
+        bundle = load_ladder_rung(Rung.RANDOM_INIT, _tiny_model_cfg(), seed=seed)
+        return bundle.encoder.state_dict()
+
+    a, b, c = state(0), state(0), state(1)
+    assert all(torch.equal(a[k], b[k]) for k in a)
+    assert any(not torch.equal(a[k], c[k]) for k in a)
+
+
 def test_load_ladder_rung_without_a_run_id_raises_rather_than_defaulting(tmp_path):
     with pytest.raises(ValueError, match="ladder_run_ids"):
         load_ladder_rung(Rung.ROUND, _tiny_model_cfg(), mesh_shared=tmp_path)

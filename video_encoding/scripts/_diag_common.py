@@ -149,8 +149,9 @@ def replicate(fn: Callable[[int], float], n: int = 3, seed: int = 0) -> MetricVa
 # The ladder version every DiagReport is stamped with. Tier A/B/C mean what the
 # ladder of that revision made them mean, so a report whose tiers cannot be
 # attributed to a revision cannot be compared with a later one. Bump this
-# whenever LADDER's membership, order, or tier thresholds change.
-LADDER_REVISION = "2026-09-08.1"
+# whenever LADDER's membership, order, or tier thresholds change, or a scored
+# metric's definition does (2026-10-02.1: label-free metrics clip-pooled).
+LADDER_REVISION = "2026-10-02.1"
 
 
 @dataclass(frozen=True)
@@ -470,10 +471,13 @@ def paired_inputs(
     windows = load_sample_windows(
         Path(shard_path), n_windows, num_frames, image_size, seed
     )
-    real = torch.cat(
-        [preprocess_window(frames, num_frames, image_size) for _, frames in windows],
-        dim=0,
-    )
+    # Filled in place rather than torch.cat over a list: a 256-window draw is
+    # ~2.5 GB, and the list plus its concatenation would hold it twice.
+    first = preprocess_window(windows[0][1], num_frames, image_size)
+    real = torch.empty((len(windows), *first.shape[1:]), dtype=first.dtype)
+    real[0] = first[0]
+    for i, (_, frames) in enumerate(windows[1:], start=1):
+        real[i] = preprocess_window(frames, num_frames, image_size)[0]
     generator = torch.Generator().manual_seed(seed)
     random_batch = torch.randn(real.shape, generator=generator)
     return real, random_batch
@@ -1095,13 +1099,15 @@ def load_ladder_rung(
     model_cfg,
     *,
     mesh_shared: "Path | str | None" = None,
-    ladder_run_ids: dict[Rung, str] | None = None,
+    ladder_run_ids: dict[Rung, "str | dict"] | None = None,
     full_model: bool = False,
     public_videomaev2_ckpt_path: "Path | str | None" = None,
     supervised_va_ckpt_path: "Path | str | None" = None,
     supervised_va_model_cfg=None,
+    seed: int | None = None,
 ) -> DiagBundle:
-    """Build one ladder rung, or raise naming what is missing.
+    """Build one ladder rung, or raise naming what is missing. `seed` pins
+    `RANDOM_INIT`'s weights, so the floor is the same network in every job.
 
     Never falls back to a default run: a rung silently built from the wrong
     checkpoint is worse than an absent rung, which `ladder_tau` already handles
@@ -1113,7 +1119,7 @@ def load_ladder_rung(
             "that builds it, not a ladder rung to load"
         )
     if rung is Rung.RANDOM_INIT:
-        return random_init_bundle(model_cfg, full_model=full_model)
+        return random_init_bundle(model_cfg, full_model=full_model, seed=seed)
     if rung is Rung.PUBLIC_VIDEOMAEV2:
         return _load_public_videomaev2_rung(model_cfg, public_videomaev2_ckpt_path)
     if rung is Rung.SUPERVISED_VA:

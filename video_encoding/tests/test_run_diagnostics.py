@@ -19,6 +19,8 @@ from video_encoding.scripts import run_diagnostics
 from video_encoding.scripts.render_report import render
 from video_encoding.scripts._diag_common import (
     LADDER_REVISION,
+    LADDER_RUN_IDS,
+    RungUnavailable,
     DiagReport,
     MetricValue,
     Rung,
@@ -446,6 +448,34 @@ def test_run_into_the_ladder_dir_leaves_ladder_json_untouched(ladder_dir, tmp_pa
 def test_ladder_run_ids_parse_to_rungs():
     parsed = run_diagnostics.parse_ladder_run_ids("round=a, overfit=b")
     assert parsed == {Rung.ROUND: "a", Rung.OVERFIT: "b"}
+
+
+def test_ladder_run_ids_resolve_the_recorded_solo_route():
+    """Rung 2 is a merge=false run with no master.pt; a bare run id would load
+    a file that does not exist, so its recorded route is substituted."""
+    parsed = run_diagnostics.parse_ladder_run_ids("overfit=ssl-diag-overfit50")
+    assert parsed == {Rung.OVERFIT: LADDER_RUN_IDS[Rung.OVERFIT]}
+    assert parsed[Rung.OVERFIT]["node"] == "node030"
+
+
+def test_run_ladder_seeds_the_random_init_rung(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_load(rung, model_cfg, **kw):
+        seen[rung] = kw.get("seed")
+        raise RungUnavailable("stub")
+
+    monkeypatch.setattr(run_diagnostics, "load_ladder_rung", fake_load)
+    run_diagnostics.run_ladder(
+        checks=[],
+        mesh_shared=tmp_path,
+        shard_path=tmp_path / "shard-000000.tar",
+        model_cfg=_tiny_model_cfg(),
+        out_dir=tmp_path / "out",
+        ladder_run_ids={},
+        seed=7,
+    )
+    assert seen[Rung.RANDOM_INIT] == 7
 
 
 def test_ladder_run_ids_reject_an_unknown_rung():

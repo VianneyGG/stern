@@ -95,7 +95,9 @@ def alpha_req(embeddings) -> float:
     embeddings = np.asarray(embeddings, dtype=np.float64)
     x = embeddings - embeddings.mean(axis=0, keepdims=True)
     cov = (x.T @ x) / max(x.shape[0] - 1, 1)
-    eigvals = np.linalg.eigvalsh(cov)[::-1]
+    # N samples span at most N-1 directions; the rest are numerical zeros
+    # whose clipped log would dominate the fit whenever N <= D (pooled draws).
+    eigvals = np.linalg.eigvalsh(cov)[::-1][: max(x.shape[0] - 1, 1)]
     eigvals = np.clip(eigvals, 1e-12, None)
     k = np.arange(1, len(eigvals) + 1)
     slope, _ = np.polyfit(np.log(k), np.log(eigvals), 1)
@@ -145,37 +147,65 @@ def lidar(views_a, views_b, eps: float = 1e-7) -> float:
 _METRIC_REGISTRY = {"rankme": rankme, "alpha_req": alpha_req, "idest": idest}
 
 
+# Windows per draw. RankMe and IdEst are defined over one embedding per
+# sample, and their rank is capped at the sample count, so a draw needs far
+# more windows than the shared `n_windows` the other checks forward at once.
+# Still below embed_dim (768): comparable across rungs at a fixed count, not
+# against published absolute values.
+LABELFREE_N_WINDOWS = 256
+
+
+def pooled_embeddings(
+    bundle: DiagBundle,
+    pixel_values: torch.Tensor,
+    blocks: Iterable[int],
+    chunk: int = 16,
+) -> dict[int, np.ndarray]:
+    """One `(n_windows, D)` embedding matrix per block: each window's patch
+    tokens mean-pooled, registers stripped first -- huge-norm register tokens
+    would dominate the pool and read as collapse. Forwarded `chunk` windows at
+    a time so a large draw fits in memory."""
+    blocks = list(blocks)
+    pooled: dict[int, list[np.ndarray]] = {i: [] for i in blocks}
+    with torch.no_grad():
+        for batch in torch.split(pixel_values, chunk):
+            states = forward_with_hidden_states(bundle.encoder, batch)
+            for i in blocks:
+                tokens = bundle.encoder.registers.strip(states[i + 1])
+                pooled[i].append(tokens.mean(dim=1).cpu().numpy())
+    return {i: np.concatenate(parts) for i, parts in pooled.items()}
+
+
+def _score(metric_name: str, embeddings: np.ndarray) -> float:
+    fn = _METRIC_REGISTRY[metric_name]
+    if metric_name == "idest":
+        n = embeddings.shape[0]
+        sizes = sorted({s for s in (max(4, n // 4), max(6, n // 2), n) if s >= 2})
+        return fn(embeddings, subsample_sizes=sizes)
+    return fn(embeddings)
+
+
 def by_block(
     bundle: DiagBundle,
     pixel_values: torch.Tensor,
     metric_name: str,
     blocks: Iterable[int] | None = None,
+    chunk: int = 16,
 ) -> dict[int, float]:
     """`metric_name` at each of `blocks`' outputs (default: every block),
     dispatched against an explicit name registry (never `__name__`/identity)
-    -- see design.md. Scored over patch tokens only: huge-norm register
-    tokens would dominate the spectrum and read as collapse."""
+    -- see design.md. Scored over one pooled embedding per window
+    (`pooled_embeddings`), the per-sample representation these metrics are
+    defined on."""
     if metric_name not in _METRIC_REGISTRY:
         raise ValueError(
             f"unknown metric_name {metric_name!r}; choose from "
             f"{sorted(_METRIC_REGISTRY)}"
         )
-    fn = _METRIC_REGISTRY[metric_name]
-    states = forward_with_hidden_states(bundle.encoder, pixel_values)
     if blocks is None:
         blocks = range(len(bundle.encoder.blocks))
-
-    result: dict[int, float] = {}
-    for i in blocks:
-        tokens = bundle.encoder.registers.strip(states[i + 1]).detach().cpu().numpy()
-        flat = tokens.reshape(-1, tokens.shape[-1])
-        if metric_name == "idest":
-            n = flat.shape[0]
-            sizes = sorted({s for s in (max(4, n // 4), max(6, n // 2), n) if s >= 2})
-            result[i] = fn(flat, subsample_sizes=sizes)
-        else:
-            result[i] = fn(flat)
-    return result
+    embeddings = pooled_embeddings(bundle, pixel_values, blocks, chunk)
+    return {i: _score(metric_name, e) for i, e in embeddings.items()}
 
 
 _CHECK_METRIC_NAMES = ("rankme", "alpha_req", "idest")
@@ -192,8 +222,9 @@ class _DegenerateSample(Exception):
 
 def check(bundle: DiagBundle, inputs: dict) -> dict[str, DiagReport]:
     """Scores `rankme`, `alpha_req`, and `idest` at the final block, each
-    replicated over three independently-drawn windows, for both `"real"` and
-    `"random"` input kinds -- one report per kind, keyed
+    replicated over three independently-drawn sets of
+    `inputs["labelfree_n_windows"]` windows (default `LABELFREE_N_WINDOWS`),
+    for both `"real"` and `"random"` input kinds -- one report per kind, keyed
     `diag_labelfree_<kind>`. Requires `inputs["shard_path"]` -- see design.md's
     documented follow-up for threading it through Plan 5's orchestrator.
 
@@ -208,39 +239,48 @@ def check(bundle: DiagBundle, inputs: dict) -> dict[str, DiagReport]:
     That is not wired here; a `lidar_pair` helper is a follow-up.
     """
     shard_path = inputs["shard_path"]
-    n_windows = int(inputs.get("n_windows", 4))
+    n_windows = int(inputs.get("labelfree_n_windows", LABELFREE_N_WINDOWS))
     base_seed = int(inputs.get("seed", 0))
     num_frames = bundle.encoder.num_frames
     image_size = bundle.encoder.image_size
     final_block = len(bundle.encoder.blocks) - 1
 
+    # One draw per replicate seed, embedded for both kinds and shared by every
+    # metric: the three metrics then describe one sample, and each window is
+    # forwarded once rather than once per metric.
+    draws: dict[int, dict[str, np.ndarray]] = {}
+
+    def _embedded(window_seed: int) -> dict[str, np.ndarray]:
+        if window_seed not in draws:
+            real, random_batch = paired_inputs(
+                shard_path,
+                n_windows=n_windows,
+                num_frames=num_frames,
+                image_size=image_size,
+                seed=window_seed,
+            )
+            draws[window_seed] = {
+                kind: pooled_embeddings(bundle, batch, [final_block])[final_block]
+                for kind, batch in (("real", real), ("random", random_batch))
+            }
+        return draws[window_seed]
+
     reports: dict[str, DiagReport] = {}
-    for kind_idx, kind in enumerate(("real", "random")):
+    for kind in ("real", "random"):
         metrics = {}
         meta = {"LADDER_REVISION": LADDER_REVISION, "input_kind": kind}
-        for metric_idx, metric_name in enumerate(_CHECK_METRIC_NAMES):
+        for metric_name in _CHECK_METRIC_NAMES:
 
             def _sample(
                 window_seed: int, kind: str = kind, metric_name: str = metric_name
             ) -> float:
-                real, random_batch = paired_inputs(
-                    shard_path,
-                    n_windows=n_windows,
-                    num_frames=num_frames,
-                    image_size=image_size,
-                    seed=window_seed,
-                )
-                pixel_values = real if kind == "real" else random_batch
-                value = by_block(
-                    bundle, pixel_values, metric_name, blocks=[final_block]
-                )[final_block]
+                value = _score(metric_name, _embedded(window_seed)[kind])
                 if np.isnan(value):
                     raise _DegenerateSample(window_seed)
                 return value
 
-            metric_seed = base_seed + kind_idx * 1000 + metric_idx * 100
             try:
-                metrics[metric_name] = replicate(_sample, n=3, seed=metric_seed)
+                metrics[metric_name] = replicate(_sample, n=3, seed=base_seed)
             except _DegenerateSample as exc:
                 meta[f"{metric_name}_degenerate"] = (
                     f"NaN at window seed {exc.window_seed}"

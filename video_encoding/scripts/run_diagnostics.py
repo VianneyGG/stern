@@ -32,6 +32,7 @@ from video_encoding.scripts import (
 from video_encoding.scripts._diag_common import (
     LADDER,
     LADDER_REVISION,
+    LADDER_RUN_IDS,
     DiagBundle,
     DiagReport,
     MetricValue,
@@ -648,7 +649,7 @@ def run_ladder(
     shard_path: Path,
     model_cfg,
     out_dir: Path,
-    ladder_run_ids: dict[Rung, str],
+    ladder_run_ids: dict[Rung, "str | dict"],
     public_videomaev2_ckpt_path: Path | None = None,
     supervised_va_ckpt_path: Path | None = None,
     supervised_va_model_cfg=None,
@@ -699,6 +700,7 @@ def run_ladder(
                 public_videomaev2_ckpt_path=public_videomaev2_ckpt_path,
                 supervised_va_ckpt_path=supervised_va_ckpt_path,
                 supervised_va_model_cfg=supervised_va_model_cfg,
+                seed=seed,
             )
         except (RungUnavailable, NotImplementedError, FileNotFoundError) as exc:
             rung_status.append(
@@ -741,9 +743,13 @@ def run_ladder(
     )
 
 
-def parse_ladder_run_ids(text: str) -> dict[Rung, str]:
-    """`round=r7,overfit=ssl-diag-overfit50` -> `{Rung.ROUND: "r7", ...}`."""
-    parsed: dict[Rung, str] = {}
+def parse_ladder_run_ids(text: str) -> dict[Rung, "str | dict"]:
+    """`round=r7,overfit=ssl-diag-overfit50` -> `{Rung.ROUND: "r7", ...}`.
+
+    A run id matching a recorded solo route in `LADDER_RUN_IDS` resolves to
+    that route: a merge=false run writes no master.pt, so a bare id would
+    name a file that does not exist."""
+    parsed: dict[Rung, "str | dict"] = {}
     for pair in filter(None, (p.strip() for p in text.split(","))):
         name, _, run_id = pair.partition("=")
         try:
@@ -753,7 +759,11 @@ def parse_ladder_run_ids(text: str) -> dict[Rung, str]:
                 f"unknown rung {name.strip()!r} in --ladder-run-ids; valid: "
                 f"{[r.name.lower() for r in LADDER]}"
             ) from None
-        parsed[rung] = run_id.strip()
+        route = LADDER_RUN_IDS.get(rung)
+        if route is not None and route["run_id"] == run_id.strip():
+            parsed[rung] = dict(route)
+        else:
+            parsed[rung] = run_id.strip()
     return parsed
 
 
