@@ -21,6 +21,7 @@ from video_encoding.scripts._diag_common import (
     MetricValue,
     random_init_bundle,
 )
+from video_encoding.scripts import diag_probe
 from video_encoding.scripts.diag_probe import (
     PROBE_FIT_LR,
     AttentiveProbe,
@@ -319,6 +320,29 @@ def test_probe_by_depth_final_block_reference_present(tmp_path):
 
     assert set(per_layer.keys()) == {1}
     assert isinstance(final_block_reference, MetricValue)
+
+
+def test_probe_by_depth_reuses_a_requested_final_block_as_its_reference(
+    tmp_path, monkeypatch
+):
+    # One probed layer costs ~1h on AFEW-VA: refitting the final block for the
+    # reference when it was already requested costs a third of the run.
+    manifest_path = _write_probe_manifest(tmp_path, n_identities=10, n_frames=40)
+    fits = []
+    real = diag_probe._fit_and_score_probe
+
+    def counting(*args, **kwargs):
+        fits.append(kwargs["seed"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(diag_probe, "_fit_and_score_probe", counting)
+    per_layer, final_block_reference = probe_by_depth(
+        _tiny_bundle(), _random_init_bundle(), manifest_path, layers=[2],
+        n_seeds=3, epochs=1,
+    )
+
+    assert len(fits) == 6  # 2 arms x 3 seeds, no third arm for the reference
+    assert final_block_reference == per_layer[2][0]
 
 
 def test_probe_by_depth_random_init_vs_itself_is_null(tmp_path):

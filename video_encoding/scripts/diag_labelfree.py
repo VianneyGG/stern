@@ -167,9 +167,11 @@ def pooled_embeddings(
     a time so a large draw fits in memory."""
     blocks = list(blocks)
     pooled: dict[int, list[np.ndarray]] = {i: [] for i in blocks}
+    # The check draws its own windows (on CPU), so they follow the encoder.
+    device = next(bundle.encoder.parameters()).device
     with torch.no_grad():
         for batch in torch.split(pixel_values, chunk):
-            states = forward_with_hidden_states(bundle.encoder, batch)
+            states = forward_with_hidden_states(bundle.encoder, batch.to(device))
             for i in blocks:
                 tokens = bundle.encoder.registers.strip(states[i + 1])
                 pooled[i].append(tokens.mean(dim=1).cpu().numpy())

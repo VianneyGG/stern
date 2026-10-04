@@ -304,7 +304,10 @@ def load_encoder_state(
     """
     state_dict = dict(state_dict)
     w = state_dict.get("patch_embed.proj.weight")
-    target_w = encoder.patch_embed.proj.weight
+    # Some encoders (LeVJEPAEncoder) have no top-level patch_embed attribute
+    # at all -- only reach for it once w confirms there's actually something
+    # to inflate/truncate.
+    target_w = encoder.patch_embed.proj.weight if w is not None else None
     if w is not None and target_w.shape[1] != w.shape[1]:
         if target_w.shape[1] > w.shape[1]:
             extra = torch.zeros(

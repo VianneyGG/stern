@@ -524,3 +524,87 @@ def test_epochs_run_counts_only_the_epochs_this_call_ran(tmp_path, monkeypatch):
     )
 
     assert result["epochs_run"] == 2
+
+
+def test_extract_encoder_state_strips_encoder_prefix_for_videomae():
+    """VideoMAE's Stage-1 checkpoint wraps VideoMAEForPreTraining, whose
+    encoder submodule keys are checkpointed under an 'encoder.' prefix."""
+    state = {"encoder.blocks.0.weight": 1, "decoder.blocks.0.weight": 2}
+    result = train_mod._extract_encoder_state(state, encoder_kind="videomae")
+    assert result == {"blocks.0.weight": 1}
+
+
+def test_extract_encoder_state_passes_through_unprefixed_for_levjepa():
+    """LeVJEPA's single-node checkpoint (pretrain_levjepa.py) saves the
+    encoder directly (base_payload(model=encoder, ...)), so its keys have no
+    'encoder.' prefix -- stripping one would silently drop every key and
+    load nothing."""
+    state = {"blocks.0.weight": 1, "tubelet_embed.proj.weight": 2}
+    result = train_mod._extract_encoder_state(state, encoder_kind="levjepa")
+    assert result == {"blocks.0.weight": 1, "tubelet_embed.proj.weight": 2}
+
+
+def test_extract_encoder_state_strips_encoder_prefix_for_levjepa_mesh_checkpoint():
+    """The DiLoCo mesh path's _LeVJEPAPretrainModule wraps encoder+projector
+    as submodules, so mesh_round.py's base_payload(model=wrapper, ...) saves
+    'encoder.'/'projector.'-prefixed keys -- unlike the single-node path.
+    Passing this shape through unprefixed (the old unconditional levjepa
+    branch) would match zero keys against a bare LeVJEPAEncoder and silently
+    load nothing."""
+    state = {
+        "encoder.blocks.0.weight": 1,
+        "encoder.tubelet_embed.proj.weight": 2,
+        "projector.fc1.weight": 3,
+    }
+    result = train_mod._extract_encoder_state(state, encoder_kind="levjepa")
+    assert result == {"blocks.0.weight": 1, "tubelet_embed.proj.weight": 2}
+
+
+def test_run_train_stage_builds_levjepa_backbone_when_encoder_is_levjepa(
+    tmp_path, monkeypatch
+):
+    """cfg.model.encoder == 'levjepa' must build a LeVJEPAEncoder-backed
+    VideoMAEVARegressor, not the default VideoMAEEncoder-backed one --
+    verified by spying on both constructors, mirroring how mesh_round.py's
+    _build_pretrain_model dispatch is already tested."""
+    rng = np.random.default_rng(0)
+    _write_clip(tmp_path / "001", 24, rng)
+    _write_clip(tmp_path / "002", 24, rng)
+    manifest_path = build(tmp_path, tmp_path)
+
+    calls = {"levjepa": 0}
+
+    class _StubLeVJEPAEncoder(nn.Module):
+        def __init__(self, model_cfg):
+            super().__init__()
+            calls["levjepa"] += 1
+            self.dummy = nn.Linear(1, 1)
+
+        def forward(self, pixel_values):
+            return torch.zeros(pixel_values.shape[0], 1, 1)
+
+    captured_backbones = []
+
+    class _SpyRegressor(nn.Module):
+        def __init__(self, model_cfg, backbone=None):
+            super().__init__()
+            captured_backbones.append(backbone)
+            self.backbone = backbone
+            self.head = nn.Linear(1, 2)
+
+        def forward(self, pixel_values):
+            feat = self.backbone(pixel_values).mean(dim=1)
+            return torch.tanh(self.head(feat))
+
+    monkeypatch.setattr(train_mod, "LeVJEPAEncoder", _StubLeVJEPAEncoder)
+    monkeypatch.setattr(train_mod, "VideoMAEVARegressor", _SpyRegressor)
+
+    cfg = _cfg(tmp_path, manifest_path)
+    cfg.model.encoder = "levjepa"
+
+    train_mod.run_train_stage(
+        cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+    )
+
+    assert calls == {"levjepa": 1}
+    assert isinstance(captured_backbones[0], _StubLeVJEPAEncoder)

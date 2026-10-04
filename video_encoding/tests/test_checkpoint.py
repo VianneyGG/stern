@@ -442,3 +442,28 @@ class TestLoadCheckpointFileRemapsLegacyKeys:
         assert torch.equal(
             loaded["optimizer_state_dict"]["state"][0]["exp_avg"], torch.tensor([4.0])
         )
+
+
+def test_load_encoder_state_works_on_a_target_without_patch_embed():
+    """Some encoders (LeVJEPAEncoder) have no top-level patch_embed attribute
+    at all (they use tubelet_embed instead) -- load_encoder_state must not
+    unconditionally reach for encoder.patch_embed.proj.weight before checking
+    whether the state dict even has a patch_embed-shaped key to inflate."""
+    import torch.nn as nn
+
+    class _NoPatchEmbedEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tubelet_embed = nn.Module()
+            self.tubelet_embed.proj = nn.Conv3d(3, 4, kernel_size=1)
+
+    encoder = _NoPatchEmbedEncoder()
+    donor_state = {
+        "tubelet_embed.proj.weight": torch.zeros(4, 3, 1, 1, 1),
+        "tubelet_embed.proj.bias": torch.zeros(4),
+    }
+
+    missing, unexpected = load_encoder_state(encoder, donor_state)
+
+    assert missing == []
+    assert unexpected == []

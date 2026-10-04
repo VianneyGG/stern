@@ -1577,6 +1577,7 @@ def _bootstrap_master(pending_dir: Path, run_id: str, master_path: Path) -> None
         {
             "model_state_dict": model_state_dict,
             "master_version": BOOTSTRAP_MASTER_VERSION,
+            "init_seed": payload.get("init_seed"),
         },
     )
 

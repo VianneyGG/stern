@@ -38,6 +38,7 @@ from video_encoding.data.loaders import (
 )
 from video_encoding.data.probe_windows import VAWindowDataset, make_temporal_transform
 from video_encoding.models import VideoMAEVARegressor
+from video_encoding.models.levjepa.encoder import LeVJEPAEncoder
 from video_encoding.models.levjepa_hf import HFLeVJEPAVARegressor
 from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.ddp.ddp import setup_ddp, teardown_ddp, wrap_ddp
@@ -54,6 +55,34 @@ def _temporal_transform(cfg: DictConfig):
     return make_temporal_transform(
         str(cfg.train.get("temporal_condition", "normal")), int(cfg.train.seed)
     )
+
+
+def _extract_encoder_state(state: dict, *, encoder_kind: str) -> dict:
+    """Isolate the encoder's own state-dict keys from a Stage-1 checkpoint.
+
+    VideoMAE's checkpoint wraps `VideoMAEForPreTraining`, whose `encoder`
+    submodule keys are saved under an `"encoder."` prefix -- strip it.
+    LeVJEPA has two checkpoint shapes: the single-node path
+    (`pretrain_levjepa.py`'s `_payload` -> `checkpoint.base_payload(model=
+    encoder, ...)`) saves the encoder directly with no prefix, but the
+    DiLoCo mesh path (`mesh_round.py`'s `_LeVJEPAPretrainModule`) wraps
+    encoder+projector as submodules, so its checkpoint keys are
+    `"encoder."`/`"projector."`-prefixed. Detect which shape this is by
+    whether any key already starts with `"encoder."` -- stripping
+    unconditionally would match zero keys and silently load nothing for the
+    single-node shape.
+    """
+    if encoder_kind == "levjepa":
+        if any(k.startswith("encoder.") for k in state):
+            return {
+                k[len("encoder.") :]: v
+                for k, v in state.items()
+                if k.startswith("encoder.")
+            }
+        return dict(state)
+    return {
+        k[len("encoder.") :]: v for k, v in state.items() if k.startswith("encoder.")
+    }
 
 
 def run_train_stage(
@@ -94,20 +123,29 @@ def run_train_stage(
             **loader_kwargs,
         )
 
-    is_hf = str(cfg.model.get("encoder", "videomae")) == "levjepa_hf"
-    model_cls = HFLeVJEPAVARegressor if is_hf else VideoMAEVARegressor
-    model = model_cls(cfg.model).to(device)
-    model_name = "levjepa_hf_va_regressor" if is_hf else "videomae_va_regressor"
+    encoder_kind = str(cfg.model.get("encoder", "videomae"))
+    if encoder_kind == "levjepa_hf":
+        model = HFLeVJEPAVARegressor(cfg.model).to(device)
+    elif encoder_kind == "levjepa":
+        # LeVJEPAEncoder deliberately has no patch_embed/pos_embed attrs, so
+        # VideoMAEVARegressor._backbone_tokens's hasattr check routes to its
+        # self.backbone(pixel_values=...) fallback -- a drop-in Stage-2
+        # backbone with zero changes to the regressor itself.
+        model = VideoMAEVARegressor(cfg.model, backbone=LeVJEPAEncoder(cfg.model)).to(
+            device
+        )
+    else:
+        model = VideoMAEVARegressor(cfg.model).to(device)
+    model_name = {
+        "levjepa_hf": "levjepa_hf_va_regressor",
+        "levjepa": "levjepa_va_regressor",
+    }.get(encoder_kind, "videomae_va_regressor")
 
     pretrain_encoder_path = cfg.train.get("pretrain_encoder_path", None)
     if pretrain_encoder_path:
         ckpt = ckpt_io.load_checkpoint_file(pretrain_encoder_path)
         state = ckpt.get("model_state_dict", ckpt)
-        encoder_state = {
-            k[len("encoder.") :]: v
-            for k, v in state.items()
-            if k.startswith("encoder.")
-        }
+        encoder_state = _extract_encoder_state(state, encoder_kind=encoder_kind)
         missing, unexpected = ckpt_io.load_encoder_state(model.backbone, encoder_state)
         if rank == 0:
             print(

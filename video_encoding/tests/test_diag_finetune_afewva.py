@@ -445,6 +445,22 @@ def test_cache_written_under_other_parameters_is_refused(tmp_path, changed, matc
     assert fake.calls == []
 
 
+@pytest.mark.parametrize("key, value", [("lr", 1e-4), ("head_bounded", True)])
+def test_cache_written_under_another_recipe_is_refused(tmp_path, key, value):
+    # ssl-diag-08 job 362 collapsed at lr 1e-4 with a bounded head; numbers
+    # cached under that recipe must never be mixed with the fixed one's.
+    cache = tmp_path / "cache"
+    arms = _arms()
+    _gate(arms, _FakeFinetune(arms, _SCRIPTED), cache)
+    params = cache / "gate_params.json"
+    params.write_text(json.dumps({**json.loads(params.read_text()), key: value}))
+
+    fake = _FakeFinetune(arms, _SCRIPTED)
+    with pytest.raises(ValueError, match=key):
+        _gate(arms, fake, cache)
+    assert fake.calls == []
+
+
 def test_cache_written_under_another_split_is_refused(tmp_path):
     cache = tmp_path / "cache"
     arms = _arms()

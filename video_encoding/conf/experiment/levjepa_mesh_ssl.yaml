@@ -1,0 +1,30 @@
+# @package _global_
+defaults:
+  - override /model: levjepa_lean
+  - override /train: levjepa
+
+experiment:
+  name: levjepa_mesh_ssl
+  description: "Decentralized mesh SIGReg SSL pretraining for LeVJEPA -- consumes MESH_* env vars, bypasses cfg.dataset entirely (see training/diloco/mesh_round.py)."
+  stage: pretrain
+
+mesh:
+  rounds: 10
+  steps_per_round: 9600
+  merge: true
+  outer_lr: 0.7
+  outer_momentum: 0.9
+  sync_timeout_s: 1800.0
+  round_budget_s: 750.0
+  step_floor_frac: 0.25
+  step_ceil_frac: 2.0
+  subnet: "/254"
+  # SIGReg and the projector's BatchNorm are batch statistics: the default
+  # micro_batch_size=1 made SIGReg a single-sample term minimised at z=0.
+  # eff_batch = micro_batch_size(16) * accum_steps(4) = 64, as before.
+  micro_batch_size: 16
+  lr_warmup_frac: 0.05   # = mesh_round default; under 30 rounds round 0 runs at peak LR
+
+train:
+  accum_steps: 4
+  grad_clip: 0.0          # mesh_round reads train.grad_clip, not grad_clip_norm

@@ -1447,7 +1447,7 @@ def test_append_round_metrics_includes_slurm_job_id_from_environ(tmp_path, monke
     assert record["lr"] == 0.0015
 
 
-def _run_with_step_capture(tmp_path, monkeypatch, *, mesh_cfg, rates):
+def _run_with_step_capture(tmp_path, monkeypatch, *, mesh_cfg, rates, seed=None):
     """Run `run_mesh_pretrain_stage` with training stubbed out, returning the
     `steps_per_round` it asked for on each round plus the checkpoint root.
 
@@ -1483,6 +1483,7 @@ def _run_with_step_capture(tmp_path, monkeypatch, *, mesh_cfg, rates):
                 "grad_clip": 0.0,
                 "weight_decay": 0.0,
                 "learning_rate": 1e-3,
+                **({} if seed is None else {"seed": seed}),
             },
             "preprocess": {"window": {"overlap": 0.0}},
             "mesh": mesh_cfg,
@@ -1985,3 +1986,21 @@ def test_run_mesh_pretrain_stage_dispatches_on_model_encoder_field(monkeypatch):
     cfg_videomae = _minimal_mesh_cfg(encoder="videomae")
     mod._build_pretrain_model(cfg_videomae, device=torch.device("cpu"))
     assert calls == {"levjepa": 0, "videomae": 1}
+
+
+@pytest.mark.parametrize("seed, expected", [(None, 42), (0, 0)])
+def test_payload_records_the_seed_the_model_was_initialised_from(
+    tmp_path, monkeypatch, seed, expected
+):
+    """delta_from_init only trusts a random init it can prove is the run's
+    own (ssl-diag-01 task 8.1), so the checkpoint names the seed -- the
+    default 42 when cfg.train.seed is unset, as the manual_seed call uses."""
+    _, checkpoint_root = _run_with_step_capture(
+        tmp_path,
+        monkeypatch,
+        mesh_cfg=dict(_BUDGET_MESH_CFG),
+        rates=[10.0, 10.0],
+        seed=seed,
+    )
+    payload = torch.load(checkpoint_root / "run1.pt", weights_only=False)
+    assert payload["init_seed"] == expected

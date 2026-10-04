@@ -1,0 +1,31 @@
+# @package _global_
+defaults:
+  - override /dataset: afewva
+  - override /model: videomae_base
+
+# Ladder rung 4 (supervised ceiling): rung 3's public VideoMAEv2 ViT-B
+# fine-tuned end-to-end on AFEW-VA with the gate's recipe (identity split 0.2,
+# lr 1e-5, unbounded head), the arm the live gate already measured at CCC
+# 0.376. The lean LeVJEPA (ssl_diag_rung4_levjepa_lean) was tried first and
+# peaked at 0.081, below rung 3 -- not a ceiling. Same ViT-B geometry as rungs
+# 0-3, so every check reads it block for block.
+#
+# pretrain_encoder_path is rung 3's encoder as _load_public_videomaev2_rung
+# builds it (fixed sin-cos pos_embed included), saved with an "encoder."
+# prefix. best.pt is selected on the identity-disjoint scored split -- the
+# split the gate scores on; acceptable for an upper reference, stated here.
+experiment:
+  name: ssl_diag_rung4_public_videomae
+  description: "Ladder rung 4: public VideoMAEv2 ViT-B fine-tuned end-to-end on AFEW-VA with the gate's recipe."
+  stage: va_finetune
+
+model:
+  head_bounded: false
+
+train:
+  pretrain_encoder_path: ${oc.env:RUNG4_ENCODER_INIT,???}
+  freeze_backbone: false
+  split: identity
+  split_fraction: 0.2
+  learning_rate: 1.0e-5
+  epochs: 10

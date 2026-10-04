@@ -41,3 +41,23 @@ def test_finetune_experiments_default_to_no_freezing_and_select_their_dataset():
 
     cfg = _compose("videomae_va_finetune_veatic")
     assert cfg.dataset.name == "veatic"
+
+
+def test_levjepa_mesh_ssl_selects_the_lean_model_and_levjepa_train_group():
+    cfg = _compose("levjepa_mesh_ssl")
+    assert cfg.model.name == "levjepa_lean"
+    assert (cfg.model.depth, cfg.model.num_heads, cfg.model.mlp_ratio) == (7, 16, 2.0)
+    assert cfg.experiment.stage == "pretrain"
+    assert "grad_clip_norm" in cfg.train  # only conf/train/levjepa.yaml has this field
+
+
+@pytest.mark.parametrize(
+    "experiment", sorted(p.stem for p in (CONF_DIR / "experiment").glob("*.yaml"))
+)
+def test_every_in_house_levjepa_experiment_uses_the_lean_model(experiment):
+    # The lean geometry is the default for in-house LeVJEPA runs; only the
+    # released HF ViT-L (levjepa_hf_large) may deviate.
+    cfg = _compose(experiment)
+    if cfg.model.get("encoder") != "levjepa" or cfg.model.name == "levjepa_hf_large":
+        pytest.skip("not an in-house LeVJEPA experiment")
+    assert cfg.model.name == "levjepa_lean"

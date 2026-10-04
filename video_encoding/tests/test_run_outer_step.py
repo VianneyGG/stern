@@ -1519,3 +1519,27 @@ def test_all_stale_checkpoints_report_the_version_mismatch(tmp_path):
             round_num=28,
             allow_missing_momentum=True,
         )
+
+
+@pytest.mark.parametrize("init_seed", [0, None])
+def test_merge_round_carries_the_masters_init_seed(tmp_path, init_seed):
+    """Round snapshots copy master.pt, so the merge must not drop the seed
+    the bootstrap recorded -- nor invent one for a run that never had it."""
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    master_path = tmp_path / "master.pt"
+    torch.save({"model_state_dict": _sd(1.0), "init_seed": init_seed}, master_path)
+    _write_worker(pending_dir / "run1_3_a.pt", 0.5, n_samples=100)
+
+    merge_round(
+        pending_dir,
+        master_path,
+        tmp_path / "momentum.pt",
+        run_id="run1",
+        lr=0.7,
+        momentum=0.9,
+        round_num=3,
+        allow_missing_momentum=True,
+    )
+
+    assert torch.load(master_path, weights_only=False)["init_seed"] == init_seed

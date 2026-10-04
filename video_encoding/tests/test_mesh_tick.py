@@ -44,12 +44,13 @@ def _local_merge_root(tmp_path_factory, monkeypatch):
 _NODES = ["node001", "node002", "node003"]
 
 
-def _write_pending_checkpoint(path, *, n_samples: int = 100) -> None:
+def _write_pending_checkpoint(path, *, n_samples: int = 100, **extra) -> None:
     """Real torch checkpoint (not `.write_text("x")`) -- _do_merging now
     reads pending files with torch.load when master.pt is missing, to
     bootstrap the initial master (see _bootstrap_master)."""
     torch.save(
-        {"model_state_dict": {"w": torch.zeros(2)}, "n_samples": n_samples}, path
+        {"model_state_dict": {"w": torch.zeros(2)}, "n_samples": n_samples, **extra},
+        path,
     )
 
 
@@ -963,6 +964,37 @@ def test_merging_bootstraps_master_from_pending_when_missing(tmp_path):
     # completed merge by merge_round's already-merged recovery.
     assert payload["master_version"] == BOOTSTRAP_MASTER_VERSION
     assert BOOTSTRAP_MASTER_VERSION < 0
+    # Pending files written before init_seed was recorded carry none.
+    assert payload["init_seed"] is None
+
+
+def test_merging_bootstrap_carries_the_workers_init_seed(tmp_path):
+    """The first master is a promoted worker checkpoint: it keeps the seed
+    that worker was initialised from, which every later merge then carries."""
+    mesh_shared = tmp_path / "mesh_shared"
+    pending_dir = mesh_shared / "checkpoints" / "pending"
+    pending_dir.mkdir(parents=True)
+    for node in _NODES:
+        _write_pending_checkpoint(pending_dir / f"RUN1_0_{node}.pt", init_seed=7)
+
+    run_config = _run_config()
+    state = WatcherState()
+    state.run("RUN1").status = "MERGING"
+
+    master_path = mesh_shared / "checkpoints" / "RUN1" / "master.pt"
+    fake = MagicMock(returncode=0, stdout="", stderr="")
+    with patch("video_encoding.watcher.mesh_tick.subprocess.run", return_value=fake):
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=mesh_shared,
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
+
+    payload = torch.load(master_path, map_location="cpu", weights_only=False)
+    assert payload["init_seed"] == 7
 
 
 def test_merging_bootstraps_master_upcasts_fp16_pending_to_fp32(tmp_path):

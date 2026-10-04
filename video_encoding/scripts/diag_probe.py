@@ -591,6 +591,9 @@ def probe_by_depth(
         )
         per_layer[layer] = (checkpoint_value, control_value)
 
+    if final_layer in per_layer:
+        # Same tokens, labels, and seeds: refitting would cost a third arm.
+        return per_layer, per_layer[final_layer][0]
     final_block_reference = _arm_metric(
         ckpt_fit_tokens[final_layer],
         ckpt_fit_labels,

@@ -225,13 +225,15 @@ def make_fake_shard(tmp_path, clip_frame_counts: dict[str, int]):
     return shard_path
 
 
-def write_checkpoint(mesh_shared, run_id: str, model_cfg, *, filename="master.pt"):
+def write_checkpoint(
+    mesh_shared, run_id: str, model_cfg, *, filename="master.pt", **extra
+):
     """Save a real VideoMAEForPreTraining state dict, as the mesh writes it."""
     torch.manual_seed(0)
     model = VideoMAEForPreTraining(model_cfg)
     path = mesh_shared / "checkpoints" / run_id / filename
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_state_dict": model.state_dict()}, path)
+    torch.save({"model_state_dict": model.state_dict(), **extra}, path)
     return model
 
 
@@ -653,9 +655,10 @@ def test_forward_with_hidden_states_returns_unnormed_stream():
 
     hidden = forward_with_hidden_states(encoder, x)
 
-    n_patches = encoder.pos_embed.shape[1]
+    # depth 2 -> 3 states; 8 patches + 2 registers; embed_dim 16.
+    assert len(hidden) == 3
     for state in hidden:
-        assert state.shape[1] == n_patches + encoder.registers.num_registers
+        assert tuple(state.shape) == (1, 10, 16)
     last = hidden[-1]
     assert not torch.allclose(last, encoder.norm(last), atol=1e-6)
 
@@ -749,9 +752,9 @@ def test_ladder_tau_ties_are_band_based_not_exact_equality():
 
 
 def test_ladder_tau_deterministic_rungs_compared_exactly():
-    """A deterministic value has no sampling error, so any difference is real.
-
-    This is what lets a weights-only metric reach a high tier at all.
+    """A deterministic value has no sampling error, so any difference is real
+    -- which is also why the gap half of Tier A is free for it, and the tier
+    is capped at B: a perfect deterministic ordering earns B, never A.
     """
     values = {
         rung: MetricValue.deterministic_value(mean)
@@ -759,13 +762,53 @@ def test_ladder_tau_deterministic_rungs_compared_exactly():
     }
     result = ladder_tau(values)
     assert result.tau == pytest.approx(1.0)
-    assert result.tier is Tier.A
+    assert result.tier is Tier.B
 
     tied = {
         rung: MetricValue.deterministic_value(mean)
         for rung, mean in zip(LADDER[:4], (1.0, 1.0, 3.0, 4.0))
     }
     assert ladder_tau(tied).tau < 1.0
+
+
+def test_ladder_tau_scores_a_falling_metric_in_its_own_direction():
+    """A metric that improves by falling ranks the ladder perfectly when it
+    falls monotonically: tau is reported in the declared direction."""
+    result = ladder_tau(_rung_values(4.0, 3.0, 2.0, 1.0, 0.0), direction="falling")
+    assert result.tau == pytest.approx(1.0)
+    assert result.tier is Tier.A
+    assert result.inverted is False
+
+
+@pytest.mark.parametrize(
+    "means, direction",
+    [((4.0, 3.0, 2.0, 1.0, 0.0), "rising"), ((0.0, 1.0, 2.0, 3.0, 4.0), "falling")],
+)
+def test_ladder_tau_flags_a_firm_ordering_against_the_declared_direction(
+    means, direction
+):
+    """attention_entropy on the live ladder: declared rising, falls cleanly.
+    That is a suspect declaration, not merely a weak metric -- Tier C alone
+    would hide the difference."""
+    result = ladder_tau(_rung_values(*means), direction=direction)
+    assert result.tau == pytest.approx(-1.0)
+    assert result.tier is Tier.C
+    assert result.inverted is True
+
+
+def test_ladder_tau_does_not_flag_noise_as_inverted():
+    result = ladder_tau(_rung_values(4.0, 3.0, 2.0, 1.0, 0.0, sd=10.0))
+    assert result.inverted is False
+
+
+def test_ladder_tau_does_not_flag_inversion_below_four_rungs():
+    result = ladder_tau(_rung_values(2.0, 1.0, 0.0))
+    assert result.inverted is False
+
+
+def test_ladder_tau_rejects_an_unknown_direction():
+    with pytest.raises(ValueError, match="direction"):
+        ladder_tau(_rung_values(0.0, 1.0, 2.0, 3.0), direction="up")
 
 
 def test_ladder_tau_raises_on_mixed_deterministic_and_sampled():
@@ -986,9 +1029,58 @@ def test_missing_rung4_checkpoint_raises(tmp_path):
         )
 
 
-def test_rung4_refuses_the_ladders_vit_b_model_cfg(tmp_path):
-    """Without its own model config, rung 4 must not guess an architecture."""
+def test_rung4_refuses_a_model_cfg_that_disagrees_with_the_checkpoint(tmp_path):
+    """The checkpoint names its architecture; rung 4 must not load an HF
+    LeVJEPA regressor into the ladder's ViT-B, nor guess around it."""
+    ckpt = tmp_path / "best.pt"
+    torch.save({"model_name": "levjepa_hf_va_regressor", "model_state_dict": {}}, ckpt)
     with pytest.raises(ValueError, match="levjepa_hf"):
+        load_ladder_rung(
+            Rung.SUPERVISED_VA, _tiny_model_cfg(), supervised_va_ckpt_path=ckpt
+        )
+
+
+def _rung4_vit_cfg():
+    # The VA head's attention pool has 12 heads, so embed_dim must divide by 12.
+    return _tiny_model_cfg(embed_dim=24)
+
+
+def _save_videomae_rung4_checkpoint(path: Path):
+    """A videomae_va_regressor checkpoint shaped exactly as train.py writes one."""
+    from video_encoding.models import VideoMAEVARegressor
+    from video_encoding.training.train import _payload
+
+    torch.manual_seed(5)
+    regressor = VideoMAEVARegressor(_rung4_vit_cfg())
+    torch.save(
+        _payload(
+            model=regressor,
+            optimizer=torch.optim.SGD(regressor.parameters(), lr=0.1),
+            epoch=0,
+            best_ccc=0.3,
+            model_name="videomae_va_regressor",
+        ),
+        path,
+    )
+    return regressor
+
+
+def test_rung4_loads_a_videomae_regressor_backbone_on_the_ladder_cfg(tmp_path):
+    ckpt = tmp_path / "rung4_public" / "best.pt"
+    ckpt.parent.mkdir()
+    regressor = _save_videomae_rung4_checkpoint(ckpt)
+    bundle = load_ladder_rung(
+        Rung.SUPERVISED_VA, _rung4_vit_cfg(), supervised_va_ckpt_path=ckpt
+    )
+    loaded = bundle.encoder.state_dict()
+    expected = regressor.backbone.state_dict()
+    assert loaded.keys() == expected.keys()
+    assert all(torch.equal(loaded[k], expected[k]) for k in expected)
+    assert bundle.run_id == "supervised_va:rung4_public"
+
+
+def test_rung4_refuses_a_directory_as_checkpoint(tmp_path):
+    with pytest.raises(RungUnavailable, match="not found"):
         load_ladder_rung(
             Rung.SUPERVISED_VA, _tiny_model_cfg(), supervised_va_ckpt_path=tmp_path
         )
@@ -1021,9 +1113,9 @@ def test_rung4_rejects_a_checkpoint_of_another_model(tmp_path):
     ckpt = tmp_path / "best.pt"
     _save_rung4_checkpoint(snapshot, ckpt)
     payload = torch.load(ckpt, weights_only=False)
-    payload["model_name"] = "videomae_va_regressor"
+    payload["model_name"] = "videomae_pretrain"
     torch.save(payload, ckpt)
-    with pytest.raises(RungUnavailable, match="videomae_va_regressor"):
+    with pytest.raises(RungUnavailable, match="videomae_pretrain"):
         _load_supervised_va_rung(_rung4_model_cfg(snapshot), ckpt)
 
 
@@ -1250,3 +1342,16 @@ def test_patch_tokens_drops_only_the_hf_cls_token(tmp_path):
 
     assert tokens.shape == (2, 4 * 2 * 2, 32)
     assert torch.equal(tokens, hidden[:, 1:])
+
+
+@pytest.mark.parametrize("full_model", [False, True])
+def test_load_bundle_reads_the_recorded_init_seed(tmp_path, full_model):
+    """Task 8.1: a captured checkpoint names its init seed, so delta_from_init's
+    same-recorded-init path is reachable without a CLI override; a checkpoint
+    from before the field existed loads with none."""
+    cfg = _tiny_model_cfg()
+    write_checkpoint(tmp_path, "seeded", cfg, init_seed=0)
+    write_checkpoint(tmp_path, "legacy", cfg)
+
+    assert load_bundle("seeded", tmp_path, cfg, full_model=full_model).init_seed == 0
+    assert load_bundle("legacy", tmp_path, cfg, full_model=full_model).init_seed is None

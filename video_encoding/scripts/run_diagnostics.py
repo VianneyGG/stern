@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import pickle
 import re
 import traceback
 from pathlib import Path
@@ -47,10 +49,11 @@ from video_encoding.scripts._diag_common import (
     run_hyperparams,
 )
 from video_encoding.scripts.render_report import (
-    BAD_DIRECTION,
     CONTROLLED,
     NO_VERDICT,
     PANEL_OF,
+    bad_direction,
+    good_direction,
     metric_key,
 )
 
@@ -119,6 +122,10 @@ PAIRED: frozenset[str] = frozenset({"attention_entropy_by_block", "labelfree"})
 WEIGHTS_ONLY: frozenset[str] = frozenset(
     {"residual_branch_norm", "delta_from_init", "layerscale_gamma"}
 )
+
+# Registry keys that read no drawn window: the probe fits on AFEW-VA, so a
+# second input draw repeats the identical (multi-hour) fit.
+DRAW_INDEPENDENT: frozenset[str] = frozenset({"probe_by_depth"})
 
 # Registry keys that always run, whatever `--checks` says: no checkpoint is
 # accepted on intrinsic diagnostics alone.
@@ -446,7 +453,7 @@ def stamp_verdicts(envelopes: list[dict], ladder_tiers: dict) -> None:
                 m["verdict"] = "INCONCLUSIVE"
                 continue
             m["verdict"] = "SEPARATED"
-            bad = BAD_DIRECTION.get(e["check"])
+            bad = bad_direction(e["check"], name)
             below_nearest = m["mean"] < nearest["mean"]
             m["red"] = entry["tier"] in ("A", "B") and (
                 (bad == "low" and below_nearest)
@@ -465,7 +472,8 @@ def write_plots(
     envelopes: list[dict], arrays: list[dict], plots_dir: Path
 ) -> list[dict]:
     """One PNG per plottable array: 2-D as a heatmap, `(N, 2)` as a scatter,
-    1-D as a line. Sets `meta["plot"]` (the file names) and `meta["panel"]`;
+    1-D as a line, 3-D `(K, H, W)` as its K heatmaps side by side (the mask-
+    ratio grid: one panel per ratio). Sets `meta["plot"]` (the file names) and `meta["panel"]`;
     returns a `skipped` entry for each array of any other shape. PNG metadata
     is pinned, so identical arrays give identical bytes."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -476,6 +484,8 @@ def write_plots(
         plots = []
         for array_name in sorted(named):
             arr = np.asarray(named[array_name])
+            if arr.ndim == 3:
+                arr = np.concatenate(list(arr), axis=1)
             if arr.ndim not in (1, 2):
                 skipped.append(
                     {
@@ -540,8 +550,8 @@ def run(
     configs_path: Path | None = None,
     seed: int = 0,
     n_windows: int = 4,
-    min_epochs: int = 10,
-    gate_seeds: int = 3,
+    min_epochs: int = diag_finetune_afewva.GATE_MIN_EPOCHS,
+    gate_seeds: int = diag_finetune_afewva.GATE_SEEDS,
     gate_cache_dir: Path | None = None,
     public_videomaev2_ckpt: Path | None = None,
 ) -> None:
@@ -621,17 +631,26 @@ def _ladder_tiers(per_rung: dict[Rung, list[dict]]) -> dict:
     """Each metric's ladder_tau over the rungs that produced it, with the
     per-rung values kept so a later cell can be bracketed between them."""
     values: dict[str, dict[Rung, dict]] = {}
+    directions: dict[str, str] = {}
     for rung, envelopes in per_rung.items():
         for e in envelopes:
             for name, entry in e["metrics"].items():
                 key = metric_key(e["check"], e["input_kind"], name)
                 values.setdefault(key, {})[rung] = entry
+                directions[key] = good_direction(e["check"], name)
     tiers = {}
     for key, by_rung in values.items():
-        result = ladder_tau({r: _metric_value(v) for r, v in by_rung.items()})
+        direction = directions[key]
+        result = ladder_tau(
+            {r: _metric_value(v) for r, v in by_rung.items()},
+            direction=direction or "rising",
+        )
         tiers[key] = {
             "tau": result.tau,
             "tier": result.tier.value,
+            "direction": direction or "undeclared",
+            # With no declared direction there is nothing to be inverted against.
+            "inverted": result.inverted and direction is not None,
             "present_rungs": result.present_rungs,
             "rungs": {
                 r.name.lower(): {k: v[k] for k in ("mean", "sd", "n", "deterministic")}
@@ -640,6 +659,95 @@ def _ladder_tiers(per_rung: dict[Rung, list[dict]]) -> dict:
             },
         }
     return tiers
+
+
+def _merge_metric(entries: list[dict], seeds: list[int]) -> dict:
+    """One metric's value over independent input draws.
+
+    Identical deterministic values read weights only and stay deterministic.
+    Deterministic values that move with the input become a sampled value over
+    the draws -- the band they never had. A sampled value already carries its
+    own band and keeps the first draw's: its replicate seeds (and, for the
+    probe, its data) repeat across draws, so pooling would count copies as
+    independent samples and narrow the band.
+    """
+    if not all(e["deterministic"] for e in entries):
+        if any(e["deterministic"] for e in entries):
+            raise ValueError("a metric cannot be deterministic in one draw only")
+        return dict(entries[0])
+    means = np.array([e["mean"] for e in entries], dtype=float)
+    if np.all(means == means[0]):
+        return dict(entries[0])
+    return {
+        "mean": float(means.mean()),
+        "sd": float(means.std(ddof=1)),
+        "n": len(entries),
+        "seeds": list(seeds),
+        "deterministic": False,
+        "replicated": True,
+    }
+
+
+def _redrawn(checks: list[str], first: list[dict]) -> list[str]:
+    """The registry keys worth another input draw: those that emitted a
+    deterministic metric read off activations. A sampled metric has its own
+    band, and a weights-only one would return the same number again."""
+    needs = {
+        e["check"]
+        for e in first
+        if e["check"] not in WEIGHTS_ONLY | DRAW_INDEPENDENT
+        and any(m["deterministic"] for m in e["metrics"].values())
+    }
+    return [k for k in checks if EMITS.get(k, frozenset({k})) & needs]
+
+
+def _merge_draws(
+    first: list[dict],
+    arrays: list[dict],
+    extra: list[list[dict]],
+    redrawn: set[str],
+    seeds: list[int],
+) -> tuple[list[dict], list[dict]]:
+    """A rung's envelopes merged over its input draws, with `arrays` (the
+    first draw's, the ones plotted) kept aligned.
+
+    Only envelopes whose emitted check is in `redrawn` are merged. One that
+    some extra draw lacks -- its check raised there -- is dropped, as is a
+    metric some draw lacks (labelfree omits a degenerate one): the rung is
+    then absent for that metric, rather than a single-draw value mixed into
+    a ladder whose other rungs carry three.
+    """
+
+    def key(e: dict) -> tuple:
+        return e["check"], e["input_kind"]
+
+    by_key = [{key(e): e for e in draw} for draw in extra]
+    merged, kept_arrays = [], []
+    for e, arr in zip(first, arrays):
+        if e["check"] not in redrawn:
+            merged.append(e)
+            kept_arrays.append(arr)
+            continue
+        matches = [e] + [d.get(key(e)) for d in by_key]
+        if any(m is None for m in matches):
+            continue
+        metrics = {
+            name: _merge_metric([m["metrics"][name] for m in matches], seeds)
+            for name in e["metrics"]
+            if all(name in m["metrics"] for m in matches)
+        }
+        merged.append({**e, "metrics": metrics})
+        kept_arrays.append(arr)
+    return merged, kept_arrays
+
+
+def _to_device(bundle: DiagBundle, device: str) -> DiagBundle:
+    """The bundle with its modules on `device` (moved in place, as nn.Module
+    does). Every check derives its own tensors from the inputs' device."""
+    bundle.encoder.to(device)
+    if bundle.model is not None:
+        bundle.model.to(device)
+    return bundle
 
 
 def run_ladder(
@@ -656,6 +764,11 @@ def run_ladder(
     n_replicates: int = 3,
     seed: int = 0,
     n_windows: int = 4,
+    n_draws: int = 3,
+    ladder_init_seeds: dict[Rung, int] | None = None,
+    device: str = "cpu",
+    probe_layers: list[int] | None = None,
+    max_new_rungs: int | None = None,
 ) -> None:
     """The ladder axis: score every buildable rung on identical inputs and
     write `ladder.json` -- and only that, so no later run/round invocation in
@@ -663,7 +776,22 @@ def run_ladder(
     that cannot be built is recorded as unavailable with its reason and left
     out of tau, never silently dropped."""
     checks = _resolve_checks(checks, n_replicates)
+    if n_draws < 1 or n_draws == 2:
+        # Two draws would make a sampled value with n=2, which MetricValue
+        # rejects: one draw is the unbanded reading, three the minimum band.
+        raise ValueError(f"n_draws must be 1 or >= 3, got {n_draws}")
     out_dir = Path(out_dir)
+    # Each finished rung is cached, so a rerun after a walltime kill resumes at
+    # the first unfinished one. The settings key keeps a rerun with other
+    # settings from reusing a stale rung.
+    rung_dir = out_dir / "rungs"
+    rung_dir.mkdir(parents=True, exist_ok=True)
+    settings = repr(
+        (checks, seed, n_windows, n_draws, n_replicates, device, probe_layers)
+    )
+    # A walltime-bound job computes at most this many rungs and exits without
+    # ladder.json, rather than dying inside a rung it cannot finish.
+    new_rungs = 0
 
     per_rung: dict[Rung, list[dict]] = {}
     rung_status: list[dict] = []
@@ -691,10 +819,30 @@ def run_ladder(
                 }
             )
             continue
+        cache = rung_dir / f"{name}.pkl"
+        key = repr(
+            (settings, ladder_run_ids.get(rung), (ladder_init_seeds or {}).get(rung))
+        )
+        if cache.exists():
+            done = pickle.loads(cache.read_bytes())
+            if done["settings"] == key:
+                rung_status.append({"rung": name, "status": "built"})
+                per_rung[rung] = done["envelopes"]
+                envelopes += done["envelopes"]
+                arrays += done["arrays"]
+                errors += done["errors"]
+                skipped += done["skipped"]
+                print(f"rung {name}: cached", flush=True)
+                continue
+        n_errors, n_skipped = len(errors), len(skipped)
         try:
+            # full_model: a rung whose checkpoint carries the MAE decoder
+            # (random init, round, overfit) gets diag_qualitative's
+            # mask-ratio grid; public and supervised rungs stay encoder-only.
             bundle = load_ladder_rung(
                 rung,
                 model_cfg,
+                full_model=True,
                 mesh_shared=mesh_shared,
                 ladder_run_ids=ladder_run_ids,
                 public_videomaev2_ckpt_path=public_videomaev2_ckpt_path,
@@ -707,23 +855,77 @@ def run_ladder(
                 {"rung": name, "status": "unavailable", "reason": str(exc)}
             )
             continue
+        if max_new_rungs is not None and new_rungs >= max_new_rungs:
+            print(f"rung {name}: left for the next run", flush=True)
+            return
         rung_status.append({"rung": name, "status": "built"})
-        inputs = build_inputs(
-            bundle,
-            shard_path=shard_path,
-            model_cfg=model_cfg,
-            seed=seed,
-            n_windows=n_windows,
-            ref_bundle=None,
+        init_seed = (ladder_init_seeds or {}).get(rung)
+        if init_seed is not None:
+            bundle = dataclasses.replace(bundle, init_seed=init_seed)
+        # Every rung is read against a random init: its own when the seed is
+        # known (delta_from_init then measures how far training moved it),
+        # the floor's otherwise (residual_branch_norm only needs an untrained
+        # reference; delta_from_init refuses one that is not the rung's own).
+        ref = random_init_bundle(
+            model_cfg, seed=bundle.init_seed if bundle.init_seed is not None else seed
         )
-        e, a, err, sk = call_checks(
-            bundle, inputs, checks, run_id=bundle.run_id, rung=name
+        bundle, ref = _to_device(bundle, device), _to_device(ref, device)
+        # n_draws independent input draws (windows, controls, check seeds):
+        # a value read off one fixed batch has no band, so any difference
+        # between rungs would count as separated.
+        draw_seeds = [seed + d for d in range(n_draws)]
+        first: list[dict] = []
+        extra: list[list[dict]] = []
+        redrawn: list[str] = checks
+        for d, draw_seed in enumerate(draw_seeds):
+            inputs = build_inputs(
+                bundle,
+                shard_path=shard_path,
+                model_cfg=model_cfg,
+                seed=draw_seed,
+                n_windows=n_windows,
+                ref_bundle=ref,
+            )
+            for kind in ("real", "random"):
+                inputs[kind] = inputs[kind].to(device)
+            inputs["control_bundle"] = _to_device(inputs["control_bundle"], device)
+            if probe_layers is not None:
+                inputs["layers"] = list(probe_layers)
+            e, a, err, sk = call_checks(
+                bundle, inputs, redrawn, run_id=bundle.run_id, rung=name
+            )
+            errors += [{**x, "draw": d} for x in err]
+            if d == 0:
+                first, first_arrays = e, a
+                skipped += sk
+                redrawn = _redrawn(checks, first)
+                if not redrawn:
+                    break
+            else:
+                extra.append(e)
+        e, a = _merge_draws(
+            first,
+            first_arrays,
+            extra,
+            {c for k in redrawn for c in EMITS.get(k, frozenset({k}))},
+            draw_seeds,
         )
+        arrays += a
         per_rung[rung] = e
         envelopes += e
-        arrays += a
-        errors += err
-        skipped += sk
+        cache.write_bytes(
+            pickle.dumps(
+                {
+                    "settings": key,
+                    "envelopes": e,
+                    "arrays": a,
+                    "errors": errors[n_errors:],
+                    "skipped": skipped[n_skipped:],
+                }
+            )
+        )
+        new_rungs += 1
+        print(f"rung {name}: done", flush=True)
 
     ladder_tiers = _ladder_tiers(per_rung)
     stamp_verdicts(envelopes, ladder_tiers)
@@ -741,6 +943,10 @@ def run_ladder(
             "skipped": skipped,
         },
     )
+    # ladder.json is the only output; the rung cache only bridges reruns.
+    for cache in rung_dir.glob("*.pkl"):
+        cache.unlink()
+    rung_dir.rmdir()
 
 
 def parse_ladder_run_ids(text: str) -> dict[Rung, "str | dict"]:
@@ -926,6 +1132,36 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--n-replicates", type=int, default=3)
     parser.add_argument("--n-windows", type=int, default=4)
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="ladder axis: where rungs and inputs live (e.g. cuda); the CPU "
+        "ladder takes ~30 h at three draws",
+    )
+    parser.add_argument(
+        "--ladder-init-seeds",
+        default="",
+        help="ladder axis: the train.seed each trained rung was initialised "
+        "from, e.g. round=0,overfit=0 -- lets delta_from_init read them",
+    )
+    parser.add_argument(
+        "--ladder-draws",
+        type=int,
+        default=3,
+        help="ladder axis: independent input draws merged into each rung's values",
+    )
+    parser.add_argument(
+        "--probe-layers",
+        default="",
+        help="ladder axis: probe_by_depth's layers, e.g. 12 (default: its sweep)",
+    )
+    parser.add_argument(
+        "--ladder-max-new-rungs",
+        type=int,
+        default=None,
+        help="ladder axis: compute at most N uncached rungs, then exit; rerun "
+        "to resume (one rung per walltime-bound job)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mesh-run-configs", type=Path, default=None)
     parser.add_argument(
@@ -949,10 +1185,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--min-epochs",
         type=int,
-        default=10,
+        default=diag_finetune_afewva.GATE_MIN_EPOCHS,
         help="run axis: AFEW-VA gate fine-tune length, identical for every arm",
     )
-    parser.add_argument("--gate-seeds", type=int, default=3)
+    parser.add_argument(
+        "--gate-seeds", type=int, default=diag_finetune_afewva.GATE_SEEDS
+    )
     parser.add_argument(
         "--gate-cache-dir",
         type=Path,
@@ -987,6 +1225,14 @@ def main(argv: list[str] | None = None) -> None:
             ladder_run_ids=parse_ladder_run_ids(args.ladder_run_ids),
             public_videomaev2_ckpt_path=args.public_videomaev2_ckpt,
             supervised_va_ckpt_path=args.supervised_va_ckpt,
+            n_draws=args.ladder_draws,
+            device=args.device,
+            probe_layers=[int(x) for x in _csv(args.probe_layers)] or None,
+            max_new_rungs=args.ladder_max_new_rungs,
+            ladder_init_seeds={
+                Rung[k.strip().upper()]: int(v)
+                for k, _, v in (p.partition("=") for p in _csv(args.ladder_init_seeds))
+            },
             supervised_va_model_cfg=(
                 OmegaConf.load(args.supervised_va_model_config)
                 if args.supervised_va_model_config

@@ -10,6 +10,7 @@ from video_encoding.scripts._diag_common import (
     DiagBundle,
     MUTILATION_BLOCK,
     MUTILATION_TARGET_KEY,
+    random_init_bundle,
 )
 from video_encoding.scripts.diag_depth import (
     branch_norm_ratio,
@@ -228,6 +229,42 @@ def test_delta_from_init_raises_on_unrelated_reference():
     ref_bundle = _bundle(_cfg(), run_id="b")
     with pytest.raises(ValueError, match="init"):
         delta_from_init(bundle, ref_bundle)
+
+
+def test_mutilation_constants_are_pinned_by_the_spec():
+    """specs/ssl-diag-depth-checks pins both values; fixtures size off
+    MUTILATION_BLOCK, so a silent change would fail as an IndexError far
+    from its cause. Change the requirement first, then this test."""
+    assert MUTILATION_BLOCK == 0
+    assert MUTILATION_TARGET_KEY == "blocks.0.mlp.net.3.weight"
+    encoder = VideoMAEEncoder(_cfg(depth=MUTILATION_BLOCK + 1))
+    assert MUTILATION_TARGET_KEY in dict(encoder.named_parameters())
+
+
+def _trained_from(cfg, seed: int, *, init_seed: int) -> DiagBundle:
+    """A run initialised from `seed`, lightly trained, declaring `init_seed`."""
+    init = random_init_bundle(cfg, seed=seed)
+    encoder = copy.deepcopy(init.encoder)
+    _perturb_every_block(encoder, sigma=0.002, seed=1)
+    return DiagBundle(
+        encoder=encoder, model=None, run_id="r", round=None, init_seed=init_seed
+    )
+
+
+def test_delta_from_init_accepts_the_rebuilt_init_of_the_declared_seed():
+    cfg = _cfg()
+    trained = _trained_from(cfg, seed=7, init_seed=7)
+    result = delta_from_init(trained, random_init_bundle(cfg, seed=7))
+    assert all(v > 0.0 for v in result.values())
+
+
+def test_delta_from_init_refuses_a_declared_seed_the_weights_contradict():
+    """A mistyped seed rebuilds an independent init, about sqrt(2) away in
+    relative terms: matching seeds alone must not be taken on trust."""
+    cfg = _cfg()
+    trained = _trained_from(cfg, seed=8, init_seed=7)
+    with pytest.raises(ValueError, match="init"):
+        delta_from_init(trained, random_init_bundle(cfg, seed=7))
 
 
 def _perturb_every_block(encoder, sigma: float, seed: int) -> None:

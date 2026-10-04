@@ -52,6 +52,16 @@ SPLIT_FRACTION = 0.2
 # ~7 within 20 steps, pinning every output at +-1 (CCC exactly 0 on every arm).
 # An unbounded readout at the probe's lr (ssl-diag-03) keeps the gradient alive.
 GATE_LR = 1e-5
+GATE_HEAD_BOUNDED = False
+# The live gate (ssl-diag-08 jobs 446, 485-489) scored the 10th epoch, but
+# job 446's held-out CCC peaks at epoch 1 and then only overfits, so the last
+# epoch read every weak arm at its overfit worst. One epoch scores the peak
+# without selecting on the scored split. Ten seeds (the most `_T975` tabulates)
+# take the paired interval's MDE from 0.25 at n=3 to roughly a quarter of it;
+# a 1-epoch fine-tune costs about a tenth of a 10-epoch one, so the run is
+# cheaper than the old gate despite the extra seeds.
+GATE_MIN_EPOCHS = 1
+GATE_SEEDS = 10
 
 # Arm label -> cache directory name. The checkpoint's key adds its run id.
 _CONTROL_KEY = "random_init"
@@ -103,7 +113,7 @@ def finetune_ccc(
             )
         with open_dict(cfg):
             cfg.model = OmegaConf.create(OmegaConf.to_container(model_cfg))
-            cfg.model.head_bounded = False
+            cfg.model.head_bounded = GATE_HEAD_BOUNDED
         result = train_mod.run_train_stage(
             cfg, rank=0, world_size=1, local_rank=0, device=_resolve_device()
         )
@@ -241,6 +251,8 @@ def gate(
             "min_epochs": min_epochs,
             "gate_seeds": n_seeds,
             "split_fraction": SPLIT_FRACTION,
+            "lr": GATE_LR,
+            "head_bounded": GATE_HEAD_BOUNDED,
         },
     )
     arms = [

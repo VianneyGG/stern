@@ -531,7 +531,13 @@ def merge_round(
 
     _atomic_save(
         master_path,
-        {"model_state_dict": broadcast_sd, "master_version": round_num},
+        {
+            "model_state_dict": broadcast_sd,
+            "master_version": round_num,
+            # Carried from the bootstrap so every merged (and captured) master
+            # still names the seed its run was initialised from.
+            "init_seed": master_payload.get("init_seed"),
+        },
     )
     _atomic_save(momentum_path, {"momentum_buf": new_buf})
 

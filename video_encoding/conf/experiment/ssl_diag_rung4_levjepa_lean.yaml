@@ -1,0 +1,31 @@
+# @package _global_
+defaults:
+  - override /dataset: afewva
+  - override /model: levjepa_lean
+
+# Ladder rung 4 (supervised ceiling), replacing the released ViT-L of
+# ssl_diag_rung4_levjepa_hf: the in-house lean LeVJEPA ("Leaner Transformers",
+# arXiv 2505.20802 -- depth 7, 16 heads, mlp_ratio 2.0 on levjepa_base's 768-d
+# width), initialised from the lev-sigfix-cars-20r mesh run and fine-tuned
+# end-to-end on AFEW-VA. The recipe is the gate's (diag_finetune_afewva.py):
+# same identity-disjoint split and fraction, same lr and unbounded head, so the
+# ceiling and the gate arms differ in the encoder, not in the fine-tune.
+#
+# best.pt is selected on the identity-disjoint scored split. That is the split
+# the gate scores on, which is acceptable for a ceiling (it is an upper
+# reference by construction) and is stated here rather than hidden.
+experiment:
+  name: ssl_diag_rung4_levjepa_lean
+  description: "Ladder rung 4: lean LeVJEPA (depth 7) from lev-sigfix-cars-20r, fine-tuned end-to-end on AFEW-VA with the gate's recipe."
+  stage: va_finetune
+
+model:
+  head_bounded: false
+
+train:
+  pretrain_encoder_path: ${oc.env:STERN_MESH_SHARED,???}/checkpoints/lev-sigfix-cars-20r/master.pt
+  freeze_backbone: false
+  split: identity
+  split_fraction: 0.2
+  learning_rate: 1.0e-5
+  epochs: 10

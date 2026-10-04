@@ -150,8 +150,9 @@ def replicate(fn: Callable[[int], float], n: int = 3, seed: int = 0) -> MetricVa
 # ladder of that revision made them mean, so a report whose tiers cannot be
 # attributed to a revision cannot be compared with a later one. Bump this
 # whenever LADDER's membership, order, or tier thresholds change, or a scored
-# metric's definition does (2026-10-02.1: label-free metrics clip-pooled).
-LADDER_REVISION = "2026-10-02.1"
+# metric's definition does (2026-10-02.1: label-free metrics clip-pooled;
+# 2026-10-03.1: direction-aware tau, values over three input draws).
+LADDER_REVISION = "2026-10-03.1"
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,11 @@ class DiagBundle:
     model: "VideoMAEForPreTraining | None"
     run_id: str
     round: int | None
+    # The torch seed the run's weights were initialised from, when known: set
+    # by random_init_bundle, and by the ladder from --ladder-init-seeds (mesh
+    # workers seed init with train.seed). Lets delta_from_init accept the
+    # rebuilt init as the run's own reference.
+    init_seed: int | None = None
 
 
 @dataclass
@@ -401,6 +407,7 @@ def _bundle_from_checkpoint(
                 model=model.eval(),
                 run_id=run_id,
                 round=round,
+                init_seed=payload.get("init_seed"),
             )
 
         # The mesh saves a VideoMAEForPreTraining state dict (encoder+decoder),
@@ -416,7 +423,11 @@ def _bundle_from_checkpoint(
         result = encoder.load_state_dict(encoder_sd, strict=False)
         _raise_on_real_mismatch(result, encoder, run_id)
         return DiagBundle(
-            encoder=encoder.eval(), model=None, run_id=run_id, round=round
+            encoder=encoder.eval(),
+            model=None,
+            run_id=run_id,
+            round=round,
+            init_seed=payload.get("init_seed"),
         )
     except RuntimeError as exc:
         # load_state_dict reports shape mismatches (e.g. a differing register
@@ -444,14 +455,23 @@ def random_init_bundle(
                 model=None,
                 run_id="",
                 round=None,
+                init_seed=seed,
             )
         if full_model:
             model = VideoMAEForPreTraining(model_cfg)
             return DiagBundle(
-                encoder=model.encoder.eval(), model=model.eval(), run_id="", round=None
+                encoder=model.encoder.eval(),
+                model=model.eval(),
+                run_id="",
+                round=None,
+                init_seed=seed,
             )
         return DiagBundle(
-            encoder=VideoMAEEncoder(model_cfg).eval(), model=None, run_id="", round=None
+            encoder=VideoMAEEncoder(model_cfg).eval(),
+            model=None,
+            run_id="",
+            round=None,
+            init_seed=seed,
         )
 
 
@@ -599,6 +619,9 @@ class LadderResult:
     tau: float
     tier: Tier
     present_rungs: int
+    # Ordered against its declared direction as firmly as Tier B would demand
+    # in the declared one: the declaration, not the checkpoint, is suspect.
+    inverted: bool = False
 
 
 def _tied(a: MetricValue, b: MetricValue, k: float) -> bool:
@@ -652,7 +675,10 @@ def _kendall_tau_b(
 
 
 def ladder_tau(
-    values: dict[Rung, MetricValue], k: float = DEFAULT_SEPARATION_K
+    values: dict[Rung, MetricValue],
+    k: float = DEFAULT_SEPARATION_K,
+    *,
+    direction: str = "rising",
 ) -> LadderResult:
     """Score a metric's values across ladder rungs, and tier its confidence.
 
@@ -665,7 +691,14 @@ def ladder_tau(
 
     Rungs absent from `values` are simply absent; below four present rungs the
     result is Tier C regardless, and `present_rungs` records why.
+
+    `direction` is how the metric moves as rungs improve; tau is reported in
+    it, so +1 always means "ranks the ladder correctly". A metric whose every
+    rung is deterministic is capped at Tier B: with no sampling band, any
+    difference counts as separated, so the gap half of Tier A is free.
     """
+    if direction not in ("rising", "falling"):
+        raise ValueError(f"direction must be 'rising' or 'falling', got {direction!r}")
     present = [rung for rung in LADDER if rung in values]
     ordered = [values[rung] for rung in present]
     if len(ordered) < 2:
@@ -680,11 +713,14 @@ def ladder_tau(
         _tied(ordered[i], ordered[i + 1], k)
 
     tau = _kendall_tau_b(ordered, tied)
+    if direction == "falling":
+        tau = -tau
     separated = [not tied(i, i + 1) for i in range(len(ordered) - 1)]
     all_separated = all(separated)
     majority_separated = sum(separated) * 2 > len(separated)
 
-    if len(ordered) < MIN_RUNGS_FOR_TIER_AB:
+    enough_rungs = len(ordered) >= MIN_RUNGS_FOR_TIER_AB
+    if not enough_rungs:
         tier = Tier.C
     elif tau >= TIER_A_TAU and all_separated:
         tier = Tier.A
@@ -692,7 +728,12 @@ def ladder_tau(
         tier = Tier.B
     else:
         tier = Tier.C
-    return LadderResult(tau=tau, tier=tier, present_rungs=len(ordered))
+    if tier is Tier.A and all(v.deterministic for v in ordered):
+        tier = Tier.B
+    inverted = enough_rungs and tau <= -TIER_B_TAU and majority_separated
+    return LadderResult(
+        tau=tau, tier=tier, present_rungs=len(ordered), inverted=inverted
+    )
 
 
 class RungUnavailable(Exception):
@@ -1036,27 +1077,37 @@ def patch_tokens(encoder, hidden: "torch.Tensor") -> "torch.Tensor":
 def _load_supervised_va_rung(
     model_cfg, ckpt_path: "Path | str | None" = None
 ) -> DiagBundle:
-    """Load rung 4 -- the `HFLeVJEPAVARegressor` fine-tuned by
-    `experiment=ssl_diag_rung4_levjepa_hf` -- as its encoder alone, or raise.
+    """Load rung 4 -- a Stage-2 VA regressor fine-tuned end-to-end on AFEW-VA
+    -- as its encoder alone, or raise.
 
-    The architecture comes from `model_cfg.weights_path`'s `config.json` (the
-    released weights themselves are not read: every tensor is overwritten), the
-    tensors from the checkpoint's `backbone.*` subtree. The `head.*` subtree is
-    dropped by design; any other key, a missing key, or a shape mismatch raises
-    before anything is loaded -- never a partial load, never a fallback path.
+    The checkpoint's `model_name` picks the architecture, and `model_cfg` must
+    agree with it: a `videomae_va_regressor` (rung 3 fine-tuned,
+    `experiment=ssl_diag_rung4_public_videomae`) takes the ladder's ViT-B
+    config; a `levjepa_hf_va_regressor` takes `conf/model/levjepa_hf_large.yaml`
+    (its tensors overwrite an architecture read from `weights_path`'s
+    `config.json`). The tensors come from the `backbone.*` subtree. The
+    `head.*` subtree is dropped by design; any other key, a missing key, or a
+    shape mismatch raises before anything is loaded -- never a partial load,
+    never a fallback path.
     """
-    if str(model_cfg.get("encoder", "")) != "levjepa_hf":
-        raise ValueError(
-            "rung 4 is an HFLeVJEPAVARegressor checkpoint; pass its model config "
-            f"(conf/model/levjepa_hf_large.yaml), got encoder={model_cfg.get('encoder')!r}"
-        )
-    if ckpt_path is None or not Path(ckpt_path).exists():
+    if ckpt_path is None or not Path(ckpt_path).is_file():
         raise RungUnavailable(f"supervised_va checkpoint not found at {ckpt_path}")
     payload = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-    if payload.get("model_name") != "levjepa_hf_va_regressor":
+    model_name = payload.get("model_name")
+    expected_encoder = {
+        "videomae_va_regressor": "videomae",
+        "levjepa_hf_va_regressor": "levjepa_hf",
+    }.get(model_name)
+    if expected_encoder is None:
         raise RungUnavailable(
-            f"{ckpt_path} is a {payload.get('model_name')!r} checkpoint, not "
-            "levjepa_hf_va_regressor"
+            f"{ckpt_path} is a {model_name!r} checkpoint, not a videomae or "
+            "levjepa_hf VA regressor"
+        )
+    encoder_kind = str(model_cfg.get("encoder", "videomae"))
+    if encoder_kind != expected_encoder:
+        raise ValueError(
+            f"rung 4 checkpoint is a {model_name}; pass a model config with "
+            f"encoder={expected_encoder}, got encoder={encoder_kind!r}"
         )
     state = {
         k.removeprefix("module.").removeprefix("_orig_mod."): v
@@ -1071,7 +1122,10 @@ def _load_supervised_va_rung(
         if k.startswith("backbone.")
     }
 
-    encoder = _hf_levjepa_from_config(model_cfg)
+    if expected_encoder == "levjepa_hf":
+        encoder = _hf_levjepa_from_config(model_cfg)
+    else:
+        encoder = VideoMAEEncoder(model_cfg)
     target = encoder.state_dict()
     missing = sorted(set(target) - set(backbone_state))
     unexpected = sorted(set(backbone_state) - set(target))
@@ -1082,7 +1136,7 @@ def _load_supervised_va_rung(
     )
     if missing or unexpected or mismatched:
         raise RungUnavailable(
-            f"supervised_va backbone does not match {model_cfg.weights_path}: "
+            f"supervised_va backbone does not match {model_cfg.get('name')}: "
             f"missing={missing} unexpected={unexpected} shape_mismatch={mismatched}"
         )
     encoder.load_state_dict(backbone_state, strict=True)
@@ -1123,8 +1177,8 @@ def load_ladder_rung(
     if rung is Rung.PUBLIC_VIDEOMAEV2:
         return _load_public_videomaev2_rung(model_cfg, public_videomaev2_ckpt_path)
     if rung is Rung.SUPERVISED_VA:
-        # Rung 4 is a different architecture from the ladder's ViT-B (design.md),
-        # so it takes its own model config; the ladder's is rejected, loudly.
+        # Rung 4's checkpoint names its architecture; a levjepa_hf one takes its
+        # own model config, and a config that disagrees is rejected, loudly.
         return _load_supervised_va_rung(
             supervised_va_model_cfg or model_cfg, supervised_va_ckpt_path
         )
@@ -1165,9 +1219,9 @@ def load_ladder_rung(
     return load_bundle(entry, mesh_shared, model_cfg, full_model=full_model)
 
 
-# The rung-2 submission as actually run on 2026-09-08, not a description of
-# one: these flags are operational and drift, so the next person reproduces
-# the rung by re-running this, not by re-deriving it.
+# The rung-2 submission as actually run, not a description of one: these
+# flags are operational and drift, so the next person reproduces the rung by
+# re-running this, not by re-deriving it.
 #
 # The 50-clip set was carved from the built 8fps corpus rather than encoded
 # fresh -- a straight WebDataset member copy (one `.pickle` per clip) out of
@@ -1175,43 +1229,44 @@ def load_ladder_rung(
 # are bit-identical to what every other rung trained on. Re-encoding would
 # have made the rung differ from rung 1 in the data as well as the training,
 # which is exactly the confound the ladder exists to avoid.
+#
+# The first build (ssl-diag-overfit50, 2026-09-08, node030, 4 rounds) was not
+# an overfit: a round on 50 clips is ~331 micro-batches, ~5 optimizer steps,
+# so it ended at train loss 0.95 and read as random init on every check. The
+# rebuild runs 300 rounds from rung 1's init seed (train.seed=0), so rungs 0-2
+# share one initialisation. It runs on node114, where the subset lives (node-to-
+# node rsync to node030 is refused since the key-auth change), with
+# MESH_ROOT pointed at the subset. A merge=false run pushes a 183 MB pending
+# file per round and never prunes them -- 300 rounds overran the 30 GB NFS
+# quota once -- so the wrapper keeps only the newest two.
 LADDER_RUNG2_ROUTE = {
-    "run_id": "ssl-diag-overfit50",
-    "node": "node030",
-    "slurm_job_id": 5243,
-    "submitted_from": "login-node:~/stern",
+    "run_id": "ssl-diag-overfit50-v2",
+    "node": "node114",
+    "slurm_job_id": 1064,
+    "submitted_from": "login-node:~/stern-ladder",
     "shard_subset": "node114:/Data/$USER/overfit50_shards (50 train + 10 val clips)",
-    "seed_cmd": (
-        "python -m video_encoding.scripts.seed_mesh --nodes node030 "
-        "--source-node node114 --shards-dir /Data/$USER/overfit50_shards "
-        "--shard-map /Data/$USER/overfit50_shard_map.json "
-        "--dataset-gb 0.06 --replication 1 --min-free-gb 5"
-    ),
-    # MESH_SHARD_MAP is overridden because run_mesh_worker.sh's default,
-    # ${MESH_SHARED}/metadata/shard_map.json, is a single GLOBAL file shared
-    # by every run -- writing this subset's map there would have repointed
-    # the live lev-window-1400 run at a 1-shard corpus. MESH_ASSIGNMENTS is
-    # already per-run, so only the map needed scoping.
+    # Per-run files, written by hand: shard_assignments_<run>.json is
+    # {"node114": ["shard-000000.tar"]}; shard_map_<run>.json is the 2026-09-08
+    # map with node030 replaced by node114. The global shard_map.json is shared
+    # by every run and must not be repointed.
     "sbatch_cmd": (
-        "sbatch --nodes=1 --ntasks=1 --nodelist=node030 "
-        "--export=ALL,MESH_SHARD_MAP=$HOME/stern_mesh/metadata/"
-        "shard_map_ssl-diag-overfit50.json "
-        "video_encoding/slurm/mesh_train.sbatch videomae_mesh_ssl "
-        "ssl-diag-overfit50 +run_tag=ab-single_node ++mesh.merge=false "
-        "++mesh.rounds=4"
+        "sbatch rung2_overfit.sbatch  # --nodelist=node114; exports "
+        "MESH_SHARD_MAP=$HOME/stern_mesh/metadata/"
+        "shard_map_ssl-diag-overfit50-v2.json "
+        "MESH_ROOT=/Data/$USER/overfit50_shards; runs "
+        "video_encoding/scripts/run_mesh_worker.sh videomae_mesh_ssl "
+        "ssl-diag-overfit50-v2 +run_tag=ab-single_node ++mesh.merge=false "
+        "++mesh.rounds=300 ++train.seed=0, pruning pending files every 20 s"
     ),
-    # mesh_ab.sh:46-50 writes `+mesh.merge=false`; `merge` and `rounds` are
-    # already defined in conf/experiment/videomae_mesh_ssl.yaml, where Hydra's
-    # `+` raises on an existing key, so both take `++`.
-    "deviation_from_mesh_ab": "++ instead of + for merge/rounds (pre-existing keys)",
+    "init_seed": 0,
 }
 
 # Rung 2 is loaded through the solo route: a merge=false run writes no
-# master.pt (see load_solo_bundle). Round 3 is the last of the four (0-based).
+# master.pt (see load_solo_bundle). Round 299 is the last of the 300 (0-based).
 LADDER_RUN_IDS = {
     Rung.OVERFIT: {
         "run_id": LADDER_RUNG2_ROUTE["run_id"],
         "node": LADDER_RUNG2_ROUTE["node"],
-        "round": 3,
+        "round": 299,
     },
 }

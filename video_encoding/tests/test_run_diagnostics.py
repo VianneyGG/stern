@@ -14,10 +14,12 @@ import re
 
 import numpy as np
 import pytest
+import torch
 
-from video_encoding.scripts import run_diagnostics
+from video_encoding.scripts import render_report, run_diagnostics
 from video_encoding.scripts.render_report import render
 from video_encoding.scripts._diag_common import (
+    LADDER,
     LADDER_REVISION,
     LADDER_RUN_IDS,
     RungUnavailable,
@@ -453,9 +455,13 @@ def test_ladder_run_ids_parse_to_rungs():
 def test_ladder_run_ids_resolve_the_recorded_solo_route():
     """Rung 2 is a merge=false run with no master.pt; a bare run id would load
     a file that does not exist, so its recorded route is substituted."""
-    parsed = run_diagnostics.parse_ladder_run_ids("overfit=ssl-diag-overfit50")
+    parsed = run_diagnostics.parse_ladder_run_ids("overfit=ssl-diag-overfit50-v2")
     assert parsed == {Rung.OVERFIT: LADDER_RUN_IDS[Rung.OVERFIT]}
-    assert parsed[Rung.OVERFIT]["node"] == "node030"
+    assert parsed[Rung.OVERFIT] == {
+        "run_id": "ssl-diag-overfit50-v2",
+        "node": "node114",
+        "round": 299,
+    }
 
 
 def test_run_ladder_seeds_the_random_init_rung(tmp_path, monkeypatch):
@@ -476,6 +482,63 @@ def test_run_ladder_seeds_the_random_init_rung(tmp_path, monkeypatch):
         seed=7,
     )
     assert seen[Rung.RANDOM_INIT] == 7
+
+
+def test_run_ladder_reads_each_rung_against_its_own_init(tmp_path, monkeypatch):
+    cfg = _tiny_model_cfg()
+    trained = random_init_bundle(cfg, seed=3)
+    seen = {}
+
+    def fake_load(rung, model_cfg, **kw):
+        if rung is Rung.ROUND:
+            return trained
+        raise RungUnavailable("stub")
+
+    def fake_call(bundle, inputs, checks, **kw):
+        seen.setdefault("pairs", []).append(
+            (bundle.init_seed, inputs["ref_bundle"].init_seed)
+        )
+        return [], [], [], []
+
+    monkeypatch.setattr(run_diagnostics, "load_ladder_rung", fake_load)
+    monkeypatch.setattr(run_diagnostics, "call_checks", fake_call)
+    monkeypatch.setattr(
+        run_diagnostics, "paired_inputs", lambda *a, **k: (torch.zeros(1), torch.zeros(1))
+    )
+    run_diagnostics.run_ladder(
+        checks=[],
+        mesh_shared=tmp_path,
+        shard_path=tmp_path / "shard-000000.tar",
+        model_cfg=cfg,
+        out_dir=tmp_path / "out",
+        ladder_run_ids={Rung.ROUND: "r"},
+        ladder_init_seeds={Rung.ROUND: 0},
+        n_draws=1,
+    )
+    # The round rung declares seed 0 and is read against init(0), not the
+    # floor's seed or no reference at all.
+    assert seen["pairs"] == [(0, 0)]
+
+
+def test_ladder_runs_the_mask_ratio_grid_on_rungs_with_a_decoder(tmp_path):
+    # 8 temporal tokens, as in the real 16-frame geometry: fewer leave the
+    # grid's 90% ratio no keep set -- a toy-geometry failure, not the wiring.
+    cfg = _tiny_model_cfg(embed_dim=32, num_heads=4, num_frames=16)
+    write_checkpoint(tmp_path / "mesh", "round-fixture", cfg)
+    run_diagnostics.run_ladder(
+        checks=["diag_qualitative"],
+        mesh_shared=tmp_path / "mesh",
+        shard_path=make_fake_shard(tmp_path, {"c0": 16, "c1": 16, "c2": 16}),
+        model_cfg=cfg,
+        out_dir=tmp_path / "out",
+        ladder_run_ids={Rung.ROUND: "round-fixture"},
+        n_windows=2,
+        n_draws=1,
+    )
+    reports = json.loads((tmp_path / "out" / "ladder.json").read_text())["reports"]
+    quals = {r["rung"]: r["meta"] for r in reports if r["check"] == "diag_qualitative"}
+    assert set(quals) == {"random_init", "round"}
+    assert all("mask_ratio_grid_skipped" not in m for m in quals.values())
 
 
 def test_ladder_run_ids_reject_an_unknown_rung():
@@ -718,6 +781,18 @@ def test_write_plots_draws_a_heatmap_deterministically(tmp_path):
     again = _envelope(_sampled(1.0), check="cka_matrix")
     run_diagnostics.write_plots([again], [{"cka_full": np.eye(3)}], tmp_path / "b")
     assert (tmp_path / "b" / name).read_bytes() == first
+
+
+def test_write_plots_draws_a_3d_grid_as_panels_side_by_side(tmp_path):
+    # The mask-ratio grid is (n_ratios, h_p, w_p); it used to be skipped.
+    envelope = _envelope(_sampled(1.0), check="diag_qualitative")
+    grid = np.stack([np.full((2, 2), r) for r in (0.0, 1.0, 2.0)])
+    skipped = run_diagnostics.write_plots(
+        [envelope], [{"mask_ratio_grid": grid}], tmp_path
+    )
+    assert skipped == []
+    (name,) = envelope["meta"]["plot"]
+    assert (tmp_path / name).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
 def test_write_plots_skips_an_unsupported_shape(tmp_path):
@@ -1180,3 +1255,340 @@ def test_cli_threads_the_gate_flags(tmp_path, monkeypatch):
     assert seen["min_epochs"] == 7 and seen["gate_seeds"] == 4
     assert seen["gate_cache_dir"] == tmp_path / "cache"
     assert seen["public_videomaev2_ckpt"] == tmp_path / "v2.pth"
+
+
+def test_ladder_tiers_score_each_metric_in_its_declared_direction(monkeypatch):
+    # Directions are per metric: under a falling rule a clean fall is a
+    # perfect ordering, the same fall on a rising metric is an inversion, and
+    # a sibling metric no rule matches is neither. The falling rule is
+    # patched in -- none is declared today (render_report.DIRECTION_RULES).
+    monkeypatch.setattr(
+        render_report,
+        "DIRECTION_RULES",
+        (("branch_norm_ratio", r"_ratio$", "falling"),)
+        + render_report.DIRECTION_RULES,
+    )
+    falling = [4.0, 3.0, 2.0, 1.0]
+    per_rung = {
+        rung: [
+            _env(
+                "branch_norm_ratio",
+                block_0_attn_ratio=_sampled(v, sd=0.01),
+                block_0_attn=_sampled(v, sd=0.01),
+            ),
+            _env("residual_branch_norm", block_0_attn=_sampled(v, sd=0.01)),
+        ]
+        for rung, v in zip(LADDER[:4], falling)
+    }
+    tiers = run_diagnostics._ladder_tiers(per_rung)
+    ratio = tiers["branch_norm_ratio.real.block_0_attn_ratio"]
+    assert (ratio["direction"], ratio["tau"], ratio["tier"]) == ("falling", 1.0, "A")
+    assert ratio["inverted"] is False
+    norm = tiers["residual_branch_norm.real.block_0_attn"]
+    assert (norm["direction"], norm["tau"], norm["tier"]) == ("rising", -1.0, "C")
+    assert norm["inverted"] is True
+    absolute = tiers["branch_norm_ratio.real.block_0_attn"]
+    assert absolute["direction"] == "undeclared"
+    assert absolute["inverted"] is False
+
+
+@pytest.mark.parametrize(
+    "check, metric",
+    [
+        ("branch_norm_ratio", "block_4_attn_ratio"),
+        ("attention_entropy_by_block", "block1"),
+    ],
+)
+def test_metrics_the_ladder_contradicted_are_undeclared(check, metric):
+    # Both rose (ratio) or fell (entropy) cleanly against their declared
+    # direction on the 2026-10-03 ladder, and neither is monotone in quality.
+    per_rung = {
+        rung: [_env(check, **{metric: _sampled(v, sd=0.01)})]
+        for rung, v in zip(LADDER[:4], [1.0, 2.0, 3.0, 4.0])
+    }
+    entry = run_diagnostics._ladder_tiers(per_rung)[f"{check}.real.{metric}"]
+    assert entry["direction"] == "undeclared"
+    assert entry["inverted"] is False
+
+
+def _det(mean):
+    return {
+        "mean": mean,
+        "sd": None,
+        "n": None,
+        "seeds": [],
+        "deterministic": True,
+        "replicated": False,
+    }
+
+
+def test_merge_keeps_a_weights_only_value_deterministic():
+    merged = run_diagnostics._merge_metric([_det(2.0)] * 3, [0, 1, 2])
+    assert merged["deterministic"] is True and merged["mean"] == 2.0
+
+
+def test_merge_turns_an_input_dependent_value_into_a_sampled_one():
+    merged = run_diagnostics._merge_metric(
+        [_det(1.0), _det(2.0), _det(4.0)], [0, 1, 2]
+    )
+    assert merged["deterministic"] is False
+    assert merged["n"] == 3 and merged["seeds"] == [0, 1, 2]
+    assert merged["mean"] == pytest.approx(7 / 3)
+    assert merged["sd"] == pytest.approx(np.std([1.0, 2.0, 4.0], ddof=1))
+    MetricValue(  # the merged entry satisfies the sampled-value invariant
+        mean=merged["mean"], sd=merged["sd"], n=merged["n"],
+        seeds=tuple(merged["seeds"]), deterministic=False,
+    )
+
+
+def test_merge_keeps_a_sampled_value_s_own_band():
+    # decode_from_depth and the probe reuse fixed replicate seeds across draws;
+    # pooling those copies as independent samples would narrow the band.
+    first = _sampled(1.0, sd=0.5)
+    merged = run_diagnostics._merge_metric(
+        [first, _sampled(1.0, sd=0.5), _sampled(1.0, sd=0.5)], [0, 1, 2]
+    )
+    assert merged == first
+
+
+def _env(check, **metrics):
+    return {**_envelope(None, check=check), "metrics": metrics}
+
+
+def test_merge_draws_drops_a_metric_one_draw_lacks():
+    # labelfree omits a metric whose replicate was degenerate; merging used to
+    # raise KeyError and lose the whole ladder.
+    first = [_env("labelfree", rankme=_det(1.0), idest=_det(5.0))]
+    extra = [
+        [_env("labelfree", rankme=_det(2.0))],
+        [_env("labelfree", rankme=_det(3.0), idest=_det(6.0))],
+    ]
+    merged, arrays = run_diagnostics._merge_draws(
+        first, [{}], extra, {"labelfree"}, [0, 1, 2]
+    )
+    assert set(merged[0]["metrics"]) == {"rankme"}
+    assert merged[0]["metrics"]["rankme"]["n"] == 3
+    assert arrays == [{}]
+
+
+def test_merge_draws_drops_an_envelope_one_draw_lacks_keeping_arrays_aligned():
+    first = [
+        _env("attention_entropy_by_block", m=_det(1.0)),
+        _env("branch_norm_ratio", m=_det(1.0)),
+    ]
+    extra = [
+        [_env("attention_entropy_by_block", m=_det(2.0))],
+        [_env("attention_entropy_by_block", m=_det(3.0))],
+    ]
+    merged, arrays = run_diagnostics._merge_draws(
+        first,
+        [{"a": 1}, {"b": 2}],
+        extra,
+        {"attention_entropy_by_block", "branch_norm_ratio"},
+        [0, 1, 2],
+    )
+    assert [e["check"] for e in merged] == ["attention_entropy_by_block"]
+    assert arrays == [{"a": 1}]
+
+
+def test_a_rung_missing_a_draw_is_absent_not_mixed_into_the_tier():
+    # One rung's check raised in a later draw: before, its single-draw
+    # deterministic value met the other rungs' sampled ones and ladder_tau
+    # raised, losing every rung's compute.
+    per_rung = {}
+    for i, rung in enumerate(LADDER[:4]):
+        first = [_env("attention_entropy_by_block", m=_det(float(i)))]
+        extra = [
+            [_env("attention_entropy_by_block", m=_det(i + 0.1 * d))] for d in (1, 2)
+        ]
+        if rung is Rung.OVERFIT:
+            extra[1] = []
+        per_rung[rung], _ = run_diagnostics._merge_draws(
+            first, [{}], extra, {"attention_entropy_by_block"}, [0, 1, 2]
+        )
+    tiers = run_diagnostics._ladder_tiers(per_rung)
+    entry = tiers["attention_entropy_by_block.real.m"]
+    assert entry["present_rungs"] == 3
+    assert "overfit" not in entry["rungs"]
+
+
+def test_only_checks_with_activation_read_deterministic_metrics_are_redrawn():
+    first = [
+        _env("attention_entropy_by_block", m=_det(1.0)),
+        _env("decode_from_depth", m=_sampled(1.0)),
+        _env("delta_from_init", m=_det(1.0)),
+        _env("labelfree", m=_sampled(1.0)),
+    ]
+    checks = ["attention_entropy_by_block", "diag_depth", "labelfree"]
+    assert run_diagnostics._redrawn(checks, first) == ["attention_entropy_by_block"]
+
+
+def test_the_probe_is_never_redrawn():
+    # The probe fits on AFEW-VA, not on the drawn windows: a second draw
+    # repeats the identical multi-hour fit (jobs 1075/1077 timed out on it).
+    first = [_env("probe_by_depth", layer_1_diff=_det(0.1))]
+    assert run_diagnostics._redrawn(["probe_by_depth"], first) == []
+
+
+def _resumable_ladder(root, out_dir, **kw):
+    run_diagnostics.run_ladder(
+        checks=["attention_entropy_by_block"],
+        mesh_shared=root / "mesh",
+        shard_path=_shard(root),
+        model_cfg=_cfg(),
+        out_dir=out_dir,
+        ladder_run_ids={Rung.ROUND: "round-fixture", Rung.OVERFIT: "overfit-fixture"},
+        n_windows=2,
+        n_draws=1,
+        **kw,
+    )
+
+
+def _rungs_called(monkeypatch, fail_on=None, real=run_diagnostics.call_checks):
+    called = []
+
+    def spy(bundle, inputs, checks, **kw):
+        if kw["rung"] == fail_on:
+            raise RuntimeError("walltime")
+        called.append(kw["rung"])
+        return real(bundle, inputs, checks, **kw)
+
+    monkeypatch.setattr(run_diagnostics, "call_checks", spy)
+    return called
+
+
+def test_an_interrupted_ladder_resumes_at_the_first_unfinished_rung(
+    tmp_path, monkeypatch
+):
+    write_checkpoint(tmp_path / "mesh", "round-fixture", _cfg())
+    write_checkpoint(tmp_path / "mesh", "overfit-fixture", _cfg())
+    _resumable_ladder(tmp_path, tmp_path / "whole")
+
+    _rungs_called(monkeypatch, fail_on="overfit")
+    with pytest.raises(RuntimeError, match="walltime"):
+        _resumable_ladder(tmp_path, tmp_path / "resumed")
+    assert not (tmp_path / "resumed" / "ladder.json").exists()
+
+    called = _rungs_called(monkeypatch)
+    _resumable_ladder(tmp_path, tmp_path / "resumed")
+
+    assert called == ["overfit"]
+    resumed = json.loads((tmp_path / "resumed" / "ladder.json").read_text())
+    whole = json.loads((tmp_path / "whole" / "ladder.json").read_text())
+    assert resumed["ladder_tiers"] == whole["ladder_tiers"]
+    assert resumed["rung_status"] == whole["rung_status"]
+    assert resumed["reports"] == whole["reports"]
+    assert sorted(p.name for p in (tmp_path / "resumed").iterdir()) == ["ladder.json"]
+
+
+def test_a_ladder_rerun_with_other_settings_recomputes_every_rung(
+    tmp_path, monkeypatch
+):
+    write_checkpoint(tmp_path / "mesh", "round-fixture", _cfg())
+    write_checkpoint(tmp_path / "mesh", "overfit-fixture", _cfg())
+    _rungs_called(monkeypatch, fail_on="overfit")
+    with pytest.raises(RuntimeError, match="walltime"):
+        _resumable_ladder(tmp_path, tmp_path / "out")
+
+    called = _rungs_called(monkeypatch)
+    _resumable_ladder(tmp_path, tmp_path / "out", seed=1)
+
+    assert called == ["random_init", "round", "overfit"]
+
+
+def test_a_ladder_capped_at_one_new_rung_finishes_over_one_run_per_rung(
+    tmp_path, monkeypatch
+):
+    # One SLURM job per rung: a job stops before a rung it cannot finish.
+    write_checkpoint(tmp_path / "mesh", "round-fixture", _cfg())
+    write_checkpoint(tmp_path / "mesh", "overfit-fixture", _cfg())
+    _resumable_ladder(tmp_path, tmp_path / "whole")
+
+    per_run = []
+    for _ in range(3):
+        called = _rungs_called(monkeypatch)
+        _resumable_ladder(tmp_path, tmp_path / "capped", max_new_rungs=1)
+        per_run.append(called)
+        if len(per_run) < 3:
+            assert not (tmp_path / "capped" / "ladder.json").exists()
+
+    assert per_run == [["random_init"], ["round"], ["overfit"]]
+    capped = json.loads((tmp_path / "capped" / "ladder.json").read_text())
+    whole = json.loads((tmp_path / "whole" / "ladder.json").read_text())
+    assert capped["ladder_tiers"] == whole["ladder_tiers"]
+
+
+def test_ladder_probe_layers_reach_the_checks(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_load(rung, model_cfg, **kw):
+        if rung is Rung.RANDOM_INIT:
+            return random_init_bundle(model_cfg, seed=0)
+        raise RungUnavailable("stub")
+
+    def fake_call(bundle, inputs, checks, **kw):
+        seen.append(inputs.get("layers"))
+        return [], [], [], []
+
+    monkeypatch.setattr(run_diagnostics, "load_ladder_rung", fake_load)
+    monkeypatch.setattr(run_diagnostics, "call_checks", fake_call)
+    monkeypatch.setattr(
+        run_diagnostics,
+        "paired_inputs",
+        lambda *a, **k: (torch.zeros(1), torch.zeros(1)),
+    )
+    for probe_layers in ((12,), None):
+        run_diagnostics.run_ladder(
+            checks=[],
+            mesh_shared=tmp_path,
+            shard_path=tmp_path / "shard-000000.tar",
+            model_cfg=_tiny_model_cfg(),
+            out_dir=tmp_path / "out",
+            ladder_run_ids={},
+            n_draws=1,
+            probe_layers=probe_layers,
+        )
+
+    assert seen == [[12], None]
+
+
+def test_cli_passes_probe_layers_and_rung_cap_to_the_ladder(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(run_diagnostics, "run_ladder", lambda **kw: seen.update(kw))
+    run_diagnostics.main(
+        [
+            "--ladder",
+            "--checks",
+            "probe_by_depth",
+            "--shard-path",
+            str(tmp_path / "shard-000000.tar"),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--probe-layers",
+            "4,12",
+            "--ladder-max-new-rungs",
+            "1",
+        ]
+    )
+    assert seen["probe_layers"] == [4, 12]
+    assert seen["max_new_rungs"] == 1
+
+
+def test_ladder_rejects_two_draws(tmp_path):
+    with pytest.raises(ValueError, match="n_draws"):
+        run_diagnostics.run_ladder(
+            checks=["attention_entropy_by_block"], mesh_shared=tmp_path,
+            shard_path=tmp_path / "x.tar", model_cfg=None, out_dir=tmp_path,
+            ladder_run_ids={}, n_draws=2,
+        )
+
+
+def test_ladder_gives_input_dependent_metrics_a_band(ladder_dir):
+    # Attention entropy is read off one batch per draw; over three draws it
+    # carries a real sd instead of comparing rungs on bitwise difference.
+    out_dir, _ = ladder_dir
+    tiers = json.loads((out_dir / "ladder.json").read_text())["ladder_tiers"]
+    rungs = tiers["attention_entropy_by_block.real.block0"]["rungs"]
+    assert {r["deterministic"] for r in rungs.values()} == {False}
+    assert {r["n"] for r in rungs.values()} == {3}
+    assert all(r["sd"] > 0 for r in rungs.values())

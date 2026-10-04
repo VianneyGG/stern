@@ -135,6 +135,31 @@ def layerscale_gamma(bundle: DiagBundle) -> dict[int, float] | None:
     return result
 
 
+# Two independent inits sit at a relative distance of about sqrt(2); a run's
+# trained weights stay well inside 1 of their own init (rung 1: 0.04-0.11 per
+# matrix against init(0), 1.41 against init(42) and init(43)).
+MAX_RELATIVE_DISTANCE_FROM_OWN_INIT = 1.0
+
+
+def _relative_distance(bundle: DiagBundle, ref_bundle: DiagBundle) -> float:
+    """Median over weight matrices of `||W - W_ref|| / ||W_ref||`.
+
+    Per matrix, not pooled: LayerNorm scales and a fixed sin-cos table are
+    identical across inits, and pooled into one norm they would hide the
+    sqrt(2) gap between two independent inits. Zero-initialised matrices
+    carry no init to compare against and are left out.
+    """
+    ref = ref_bundle.encoder.state_dict()
+    ratios = []
+    for key, value in bundle.encoder.state_dict().items():
+        if not value.dtype.is_floating_point or value.dim() < 2:
+            continue
+        ref_norm = ref[key].float().norm().item()
+        if ref_norm > 0.0:
+            ratios.append((value.float() - ref[key].float()).norm().item() / ref_norm)
+    return float(np.median(ratios))
+
+
 def _is_valid_init_reference(bundle: DiagBundle, ref_bundle: DiagBundle) -> bool:
     """`ref_bundle` is accepted only as the run's own recorded init or its
     round n-1 -- never an arbitrary bundle. At the round counts this project
@@ -143,17 +168,18 @@ def _is_valid_init_reference(bundle: DiagBundle, ref_bundle: DiagBundle) -> bool
     a plausible-looking, entirely meaningless depth curve with no signal in
     the output that would reveal the mistake.
 
-    `bundle.meta` does not exist on today's DiagBundle (the snapshotter
-    records no init_seed -- ssl-diag-01-foundation follow-up), so the
-    same-init path is unreachable on real bundles and only identity and
-    round n-1 work in production; `getattr` with a default keeps this ready
-    for the field once it lands, rather than requiring a second edit here.
+    A matching `init_seed` is not taken on trust: the seed is declared by the
+    caller, so the weights must also sit inside
+    `MAX_RELATIVE_DISTANCE_FROM_OWN_INIT` of the rebuilt init. A wrong seed
+    lands near sqrt(2) and is refused.
     """
     if ref_bundle is bundle:
         return True
-    own_seed = getattr(bundle, "meta", {}).get("init_seed")
-    ref_seed = getattr(ref_bundle, "meta", {}).get("init_seed")
-    if own_seed is not None and own_seed == ref_seed:
+    if (
+        bundle.init_seed is not None
+        and bundle.init_seed == ref_bundle.init_seed
+        and _relative_distance(bundle, ref_bundle) < MAX_RELATIVE_DISTANCE_FROM_OWN_INIT
+    ):
         return True
     return (
         bundle.round is not None
@@ -175,7 +201,7 @@ def delta_from_init(bundle: DiagBundle, ref_bundle: DiagBundle) -> dict[int, flo
     if not _is_valid_init_reference(bundle, ref_bundle):
         raise ValueError(
             f"{bundle.run_id}: delta_from_init's reference must be the run's "
-            "own recorded init (matching meta['init_seed']) or its round "
+            "own init (matching init_seed, and close enough to it) or its round "
             f"n-1, not {ref_bundle.run_id!r} at round {ref_bundle.round!r}"
         )
     result: dict[int, float] = {}
@@ -305,7 +331,7 @@ def _fit_depth_head(
     target_z = _z_target(pixel_values, bundle)
     out_dim = target_z.shape[-1]
 
-    head = nn.Linear(embed_dim, out_dim)
+    head = nn.Linear(embed_dim, out_dim).to(tokens.device)
     optimizer = torch.optim.Adam(head.parameters(), lr=1e-2)
 
     x_keep = tokens[:, keep, :].reshape(-1, embed_dim).detach()

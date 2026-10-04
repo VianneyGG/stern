@@ -703,6 +703,10 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             payload["round"] = round_num
             payload["samples_per_s"] = train_stats["samples_per_s_per_gpu"]
             payload["outer_lr"] = outer_lr
+            # The seed the model was cold-started from (the manual_seed above):
+            # diag_depth.delta_from_init only measures training against a
+            # random init it can prove is this run's own.
+            payload["init_seed"] = int(cfg.train.get("seed", 42))
             payload["outer_momentum"] = outer_momentum
 
             local_path = checkpoint_root / f"{run_id}.pt"

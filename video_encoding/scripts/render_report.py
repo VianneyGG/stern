@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import re
 from html import escape
 from pathlib import Path
 
@@ -64,19 +65,44 @@ PANEL_OF: dict[str, str] = {
     "counterfactual_sweep": "diloco",
 }
 
-# Emitted check name -> the direction in which a value reads as a worse
-# checkpoint. A Tier A/B metric separated from its nearest rung on this side is
-# a red cell; a check absent here is never red.
-BAD_DIRECTION: dict[str, str] = {
-    "residual_branch_norm": "low",
-    "delta_from_init": "low",
-    "layerscale_gamma": "low",
-    "branch_norm_ratio": "high",
-    "decode_from_depth": "low",
-    "attention_entropy_by_block": "low",
-    "labelfree": "low",
-    "probe_by_depth": "low",
-}
+
+# (check, metric-name regex, direction): how a metric moves as the rung
+# improves. Per metric, not per check -- one check emits metrics that disagree
+# (labelfree's rankme rises, alpha_req is best near 1). First match
+# wins. A metric no rule matches has no declared direction: tau is read
+# rising, and it is never flagged inverted nor painted red.
+# attention_entropy_by_block is deliberately undeclared: on the 2026-10-03
+# ladder it fell from random init (uniform) to the ceiling, but entropy is not
+# monotone in quality -- full collapse to one token is the low extreme too --
+# so declaring "falling" from that ladder would be circular.
+# branch_norm_ratio's ratios are undeclared for the same reason: declared
+# "falling" (a branch overwriting the stream is the collapse signature), they
+# rose from random init to the ceiling at nearly every block on that ladder --
+# branches start small at init and grow in healthy training too.
+DIRECTION_RULES: tuple[tuple[str, str, str], ...] = (
+    ("residual_branch_norm", r"", "rising"),
+    ("delta_from_init", r"", "rising"),
+    ("layerscale_gamma", r"", "rising"),
+    ("decode_from_depth", r"", "rising"),
+    ("labelfree", r"^rankme$", "rising"),
+    ("probe_by_depth", r"^layer_\d+_(checkpoint|diff)$", "rising"),
+)
+
+
+def good_direction(check: str, metric: str) -> str | None:
+    """`"rising"`/`"falling"` for a metric with a declared direction, else None."""
+    for rule_check, pattern, direction in DIRECTION_RULES:
+        if rule_check == check and re.search(pattern, metric):
+            return direction
+    return None
+
+
+def bad_direction(check: str, metric: str) -> str | None:
+    """The side on which a value reads as a worse checkpoint, derived from
+    `good_direction` so the red-cell rule and the tiering cannot disagree."""
+    good = good_direction(check, metric)
+    return None if good is None else ("low" if good == "rising" else "high")
+
 
 ROLLOUT_CAVEAT = (
     "Attention rollout is a heuristic approximation of information flow, "
@@ -234,9 +260,12 @@ def _ladder_panel(ladder_tiers: dict) -> str:
             f"{escape(rung)}={escape(format_value({**v, 'replicated': True}))}"
             for rung, v in t["rungs"].items()
         )
+        # .get: a ladder.json written before direction-aware tiering has
+        # neither key, and reads as it always did.
+        tier = t["tier"] + (" (inverted)" if t.get("inverted") else "")
         rows.append(
             f'<tr class="tier-{escape(t["tier"])}"><td>{escape(key)}</td>'
-            f"<td>{t['tau']:.3g}</td><td>{escape(t['tier'])}</td>"
+            f"<td>{t['tau']:.3g}</td><td>{escape(tier)}</td>"
             f"<td>{t['present_rungs']}</td><td>{rungs}</td></tr>"
         )
     return (
