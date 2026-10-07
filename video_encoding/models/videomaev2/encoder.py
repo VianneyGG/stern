@@ -20,6 +20,7 @@ oversight; expect a low CCC ceiling until more data (or pretraining) is added.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import numpy as np
@@ -28,7 +29,10 @@ from omegaconf import DictConfig
 from torch import nn
 
 from video_encoding.models.ViT.block import BlockConfig, ViTBlock
-from video_encoding.models.ViT.init import apply_weight_init
+from video_encoding.models.ViT.init import (
+    apply_cutting_skip_to_attention,
+    apply_weight_init,
+)
 from video_encoding.models.ViT.patch_embed import TubeletEmbed
 from video_encoding.models.ViT.registers import RegisterTokens
 
@@ -54,6 +58,7 @@ class VideoMAEEncoder(nn.Module):
             embed_dim=self.embed_dim,
             tubelet_size=tubelet_size,
             patch_size=patch_size,
+            norm=bool(model_cfg.get("embed_norm", False)),
         )
         n_tubelets = self.num_frames // tubelet_size
         grid = self.image_size // patch_size
@@ -80,6 +85,7 @@ class VideoMAEEncoder(nn.Module):
         layer_scale_init = (
             float(layer_scale_init) if layer_scale_init is not None else None
         )
+        layernorm_scaling = bool(model_cfg.get("layernorm_scaling", False))
         num_registers = int(model_cfg.get("num_registers", 0))
         self.registers = RegisterTokens(self.embed_dim, num_registers)
 
@@ -95,6 +101,7 @@ class VideoMAEEncoder(nn.Module):
                     mlp_type=mlp_type,
                     qk_norm=qk_norm,
                     layer_scale_init=layer_scale_init,
+                    ln_scale=1 / math.sqrt(i + 1) if layernorm_scaling else 1.0,
                 )
             )
             for i in range(depth)
@@ -108,29 +115,30 @@ class VideoMAEEncoder(nn.Module):
         # default as trunc_normal(std=0.02) while enabling the paper's
         # Cutting-the-Skip diagonal-dominant init as an explicit ablation axis.
         self.apply(self._init_weights)
+        self._init_attention_weights()
 
     def _init_weights(self, module: nn.Module) -> None:
         method = str(self.model_cfg.get("weight_init", "trunc_normal"))
-        alpha = float(self.model_cfg.get("weight_init_alpha", 0.1))
-        beta = float(self.model_cfg.get("weight_init_beta", 5.0))
-        c = float(self.model_cfg.get("weight_init_c", 0.5))
         std = float(self.model_cfg.get("weight_init_std", 0.02))
 
         if isinstance(module, nn.Linear):
-            if method == "cutting_skip":
-                apply_weight_init(
-                    module,
-                    method=method,
-                    alpha=alpha,
-                    beta=beta,
-                    c=c,
-                    std=std,
-                )
-            else:
-                apply_weight_init(module, method=method, std=std)
+            apply_weight_init(module, method=method, std=std)
         elif isinstance(module, nn.LayerNorm):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
+
+    def _init_attention_weights(self) -> None:
+        """Cutting-the-Skip couples Q with K and V with O and needs the whole
+        attention module at once (see apply_cutting_skip_to_attention), so it
+        runs here as a second pass over self.blocks rather than through the
+        per-nn.Linear self.apply() walk above, which cannot see that pairing."""
+        if str(self.model_cfg.get("weight_init", "trunc_normal")) != "cutting_skip":
+            return
+        alpha = float(self.model_cfg.get("weight_init_alpha", 1.8))
+        beta = float(self.model_cfg.get("weight_init_beta", 1.0))
+        c = float(self.model_cfg.get("weight_init_c", 3.0))
+        for block in self.blocks:
+            apply_cutting_skip_to_attention(block.attn, alpha=alpha, beta=beta, c=c)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """`pixel_values`: `(B, C, T, H, W)` -> `(B, embed_dim)` clip feature."""

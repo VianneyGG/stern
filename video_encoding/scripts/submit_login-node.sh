@@ -12,6 +12,10 @@
 # the best available tier (fish → birds → cars → countries → orchids).
 set -euo pipefail
 
+# Class-hours gate (class_hours.py): refuse to launch anything that would
+# run Mon-Fri 08:00-20:00 Europe/Paris. No override.
+python3 "$(dirname "${BASH_SOURCE[0]}")/class_hours.py" || exit 1
+
 EXPERIMENT="${1:?usage: submit_login-node.sh <experiment-name> <N> [hydra overrides...]}"
 N="${2:?usage: submit_login-node.sh <experiment-name> <N> [hydra overrides...]}"
 shift 2

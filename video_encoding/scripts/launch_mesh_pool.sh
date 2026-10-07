@@ -11,7 +11,11 @@
 #   [outer_momentum]   DiLoCo outer-optimizer momentum; default 0.9 (literature)
 #
 # Environment overrides: NEED (idle nodes to wait for), DATASET_HOLDER,
-# EXPECTED_SHARDS, QUORUM_K, WEIGHTING, SKIP_SEED_VALIDATION, CHUNK_ROUNDS,
+# EXPECTED_SHARDS, SHARDS_DIR (default /Data/voxceleb2_shards_8fps on node114;
+# point at a smaller subset dir -- e.g. symlinked shards + val/ -- for a lean
+# test run that shouldn't seed the full 841GB corpus), DATASET_GB (must match
+# SHARDS_DIR's actual size for plan_placement's capacity math; default 841),
+# QUORUM_K, WEIGHTING, SKIP_SEED_VALIDATION, CHUNK_ROUNDS,
 # EXPERIMENT (conf/experiment/<name>.yaml the workers compose; default
 # videomae_mesh_ssl), GRACE_S, REPLICATION (seed_mesh.py's --replication;
 # default 1 -- a dead node is replenished on demand by watcher/shard_transfer.py
@@ -112,16 +116,18 @@ echo "launch_mesh_pool: ${TIER} backup (seeded, not active)=[$(IFS=,; echo "${BA
 # are no backups here and replenishment goes through shard_transfer.py instead.
 printf '%s\n' "${READY[@]}" > "runs/state/mesh_pool_ready_${TIER}.txt"
 
-SOURCE_NODE="${POOL_SOURCE_NODE:-${ACTIVE[0]}}"
+# 2026-09-19: the 8fps corpus (800 shards) is the default; it lives only on
+# node114 (serve-only, outside the pool). The 2fps voxceleb2_shards set is retired.
+SOURCE_NODE="${POOL_SOURCE_NODE:-node114}"
 # Node holding the full 260-shard dataset that seed_mesh distributes from.
 # This was node089 until the 2026-08-17 reboot wiped node-local /Data there;
 # node001 is the node whose copy survived. Overridable because the holder is
 # a fact about the cluster today, not a property of any tier.
-DATASET_HOLDER="${DATASET_HOLDER:-node001}"
+DATASET_HOLDER="${DATASET_HOLDER:-node114}"
 # Ask the node what it actually has rather than trusting a hostname: several
 # tiers' first nodes already carry the full set, and reseeding one needlessly
 # drags 223 GB across a 1GbE link for nothing.
-EXPECTED_SHARDS="${EXPECTED_SHARDS:-260}"
+EXPECTED_SHARDS="${EXPECTED_SHARDS:-800}"
 HAVE=$(ssh -o ConnectTimeout=15 "${SOURCE_NODE}" \
   "ls /Data/$USER/voxceleb2_shards/*.tar 2>/dev/null | wc -l" || echo 0)
 if [[ "${SOURCE_NODE}" == "${DATASET_HOLDER}" || "${HAVE}" -ge "${EXPECTED_SHARDS}" ]]; then
@@ -138,9 +144,9 @@ uv run python -m video_encoding.scripts.seed_mesh \
   --nodes "${READY_CSV}" \
   --active-nodes "${ACTIVE_CSV}" \
   --source-node "${SOURCE_NODE}" \
-  --shards-dir /Data/$USER/voxceleb2_shards \
+  --shards-dir "${SHARDS_DIR:-/Data/voxceleb2_shards_8fps}" \
   --shard-map "${HOME}/stern_mesh/metadata/shard_map_${TIER}16.json" \
-  --dataset-gb 223 \
+  --dataset-gb "${DATASET_GB:-841}" \
   --replication "${REPLICATION:-1}"
 
 # Verify what actually landed on every node before anything trains against

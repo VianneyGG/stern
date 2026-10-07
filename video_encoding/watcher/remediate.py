@@ -17,12 +17,16 @@ already-synced environment without re-syncing per resubmit.
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 
+from video_encoding.scripts import class_hours
 from video_encoding.watcher.registry import JobRecord
 
 
 def remediate_dead_job(record: JobRecord, *, repo_root: Path) -> str | None:
+    if class_hours.blocked(time.time()) is not None:
+        return None  # no job may run Mon-Fri 08:00-20:00 (class_hours.py)
     n = len(record.nodelist.split(",")) if record.nodelist else 1
     cmd = ["sbatch", f"--nodes={n}", f"--ntasks={n}"]
     if record.nodelist:

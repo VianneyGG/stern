@@ -49,8 +49,8 @@ REMOTE_DIR="${REMOTE_DIR:-\$HOME/stern_factorial}"
 # node001 holds the full 260-shard VoxCeleb2 set plus manifest.json and val/;
 # the other three hold only their own mesh subsets, which is why the subset is
 # copied from node001 rather than reusing whatever each node happens to have.
-SOURCE_NODE="${SOURCE_NODE:-node001}"
-SOURCE_DATA="/Data/$USER/voxceleb2_shards"
+SOURCE_NODE="${SOURCE_NODE:-node114}"  # 8fps corpus holder, default since 2026-09-19
+SOURCE_DATA="/Data/voxceleb2_shards_8fps"
 NODES="${NODES:-node001 node002 node004 node007}"
 DATA_ROOT="/Data/$USER/factorial"
 SHARED_ROOT="/Data/$USER/factorial_shared"
@@ -142,6 +142,9 @@ fi
 if [[ "${ACTION}" == "submit" || "${ACTION}" == "all" ]]; then
   echo
   echo "--- 3. submit the four arms ---"
+  # Class-hours gate (class_hours.py): no job may run Mon-Fri 08:00-20:00
+  # Europe/Paris. A dry run submits nothing, so it is not gated.
+  [[ "${DRY_RUN}" == "1" ]] || python3 "$(dirname "${BASH_SOURCE[0]}")/class_hours.py" || exit 1
   set -- ${NODES}
   for mask_type in tube mixed; do
     for target_mode in time_avg per_frame; do

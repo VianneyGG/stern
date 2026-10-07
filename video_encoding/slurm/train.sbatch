@@ -36,6 +36,14 @@
 
 set -euo pipefail
 
+# Class-hours gate (video_encoding/scripts/class_hours.py): no job may run
+# Mon-Fri 08:00-20:00 Europe/Paris. Checked against this job's REMAINING
+# walltime, so it also stops a --requeue / scontrol requeue restart that
+# SLURM schedules on its own. Exits 0 so nothing retries it; an unreadable
+# time limit falls back to the 2h partition max (fails closed).
+python3 "${SLURM_SUBMIT_DIR:-$HOME/stern}/video_encoding/scripts/class_hours.py" \
+  --walltime "$(squeue -h -j "${SLURM_JOB_ID:-0}" -o %L 2>/dev/null || true)" || exit 0
+
 EXPERIMENT="${1:?usage: sbatch train.sbatch <experiment-name> [hydra overrides...]}"
 shift
 

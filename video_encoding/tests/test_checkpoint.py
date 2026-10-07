@@ -11,6 +11,8 @@ from omegaconf import OmegaConf
 from video_encoding.models.videomaev2.encoder import VideoMAEEncoder
 from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
 from video_encoding.training.checkpoint import (
+    ArchMismatchError,
+    encoder_arch_fingerprint,
     load,
     load_checkpoint_file,
     load_encoder_state,
@@ -22,8 +24,9 @@ from video_encoding.training.checkpoint import (
 pytestmark = pytest.mark.integration
 
 
-def _tiny_cfg(in_channels: int):
-    return OmegaConf.create(
+
+def _tiny_cfg(in_channels: int, **over):
+    cfg = OmegaConf.create(
         {
             "num_frames": 4,
             "image_size": 16,
@@ -37,6 +40,9 @@ def _tiny_cfg(in_channels: int):
             "dropout": 0.0,
         }
     )
+    for key, value in over.items():
+        cfg[key] = value
+    return cfg
 
 
 def test_load_encoder_state_inflates_extra_channels():
@@ -74,6 +80,64 @@ def test_load_encoder_state_same_channels_is_a_plain_load():
     load_encoder_state(encoder, donor.state_dict())
 
     assert torch.equal(encoder.patch_embed.proj.weight, donor.patch_embed.proj.weight)
+
+
+def test_load_encoder_state_rejects_a_different_depth():
+    """A geometry change must fail closed. `load_state_dict(strict=False)` silently
+    drops every block past the target's depth, so without this guard a 2-block
+    encoder "successfully" loads a 4-block checkpoint and trains on half-random
+    weights. The mismatch has to be an error, not a `missing_keys` entry nobody reads."""
+    encoder = VideoMAEEncoder(_tiny_cfg(3, depth=2))
+    donor = VideoMAEEncoder(_tiny_cfg(3, depth=4))
+
+    with pytest.raises(ArchMismatchError, match="depth"):
+        load_encoder_state(encoder, donor.state_dict())
+
+
+def test_load_encoder_state_rejects_a_different_mlp_ratio():
+    encoder = VideoMAEEncoder(_tiny_cfg(3, mlp_ratio=2.0))
+    donor = VideoMAEEncoder(_tiny_cfg(3, mlp_ratio=4.0))
+
+    with pytest.raises(ArchMismatchError, match="mlp_hidden"):
+        load_encoder_state(encoder, donor.state_dict())
+
+
+def test_load_encoder_state_arch_mismatch_can_be_forced():
+    """The escape hatch stays available for deliberate surgery, but it must be
+    opt-in per call rather than the default."""
+    encoder = VideoMAEEncoder(_tiny_cfg(3, depth=2))
+    donor = VideoMAEEncoder(_tiny_cfg(3, depth=4))
+
+    missing, unexpected = load_encoder_state(
+        encoder, donor.state_dict(), allow_arch_mismatch=True
+    )
+
+    # the donor's extra blocks (depth 4 vs 2) land here rather than raising
+    assert any(key.startswith("blocks.2.") for key in unexpected)
+    assert any(key.startswith("blocks.3.") for key in unexpected)
+
+
+def test_channel_inflation_still_works_under_the_arch_guard():
+    """in_channels is deliberately NOT part of the fingerprint: 3ch->6ch inflation
+    is a supported load, so the guard must not regress it."""
+    encoder = VideoMAEEncoder(_tiny_cfg(in_channels=6))
+    donor = VideoMAEEncoder(_tiny_cfg(in_channels=3))
+
+    missing, unexpected = load_encoder_state(encoder, donor.state_dict())
+
+    assert (missing, unexpected) == ([], [])
+
+
+def test_encoder_arch_fingerprint_reads_geometry_off_the_state_dict():
+    """Derived from tensor shapes alone, so it works on checkpoints written
+    before this guard existed -- no migration, no recorded metadata needed."""
+    donor = VideoMAEEncoder(_tiny_cfg(3, depth=3, embed_dim=32, mlp_ratio=2.0))
+
+    fp = encoder_arch_fingerprint(donor.state_dict())
+
+    assert fp["depth"] == 3
+    assert fp["embed_dim"] == 32
+    assert fp["mlp_hidden"] == 64
 
 
 def test_load_checkpoint_file_from_plain_file(tmp_path):

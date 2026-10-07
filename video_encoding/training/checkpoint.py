@@ -289,8 +289,68 @@ def remap_legacy_attention_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]
     return remapped
 
 
+class ArchMismatchError(RuntimeError):
+    """A checkpoint's encoder geometry disagrees with the model loading it."""
+
+
+_BLOCK_INDEX = re.compile(r"(?:^|\.)blocks\.(\d+)\.")
+
+
+def encoder_arch_fingerprint(state_dict: Mapping[str, Any]) -> dict[str, int]:
+    """Derive encoder geometry from tensor shapes alone.
+
+    Shape-derived rather than read from a recorded metadata field, so it works
+    on every checkpoint ever written by this repo without a migration.
+
+    `num_heads` is deliberately absent: `qkv` is (3*D, D) for any head count, so
+    a head-count change is invisible in the shapes and cannot be caught here.
+    `in_channels` is absent too -- 3ch<->6ch inflation is a *supported* load
+    (see `load_encoder_state`), so it must not trip the guard.
+    """
+    fp: dict[str, int] = {}
+    depth = -1
+    for key, value in state_dict.items():
+        m = _BLOCK_INDEX.search(key)
+        if m:
+            depth = max(depth, int(m.group(1)))
+        if key.endswith("pos_embed") and value.ndim == 3:
+            fp["num_tokens"] = int(value.shape[1])
+            fp["embed_dim"] = int(value.shape[2])
+        if key.endswith("blocks.0.mlp.net.0.weight") and value.ndim == 2:
+            fp["mlp_hidden"] = int(value.shape[0])
+    if depth >= 0:
+        fp["depth"] = depth + 1
+    return fp
+
+
+def check_encoder_arch(encoder: torch.nn.Module, state_dict: Mapping[str, Any]) -> None:
+    """Raise if the checkpoint's geometry differs from the target encoder's.
+
+    Without this, `load_state_dict(strict=False)` turns every geometry change
+    into a silent partial load: mismatched blocks land in `missing_keys`, the
+    run proceeds on randomly-initialised weights, and the loss curve is the
+    only hint. Fails closed, matching the module's `model_name` guard.
+    """
+    want = encoder_arch_fingerprint(encoder.state_dict())
+    got = encoder_arch_fingerprint(state_dict)
+    diffs = [
+        f"{k}: checkpoint={got[k]} model={want[k]}"
+        for k in sorted(want.keys() & got.keys())
+        if want[k] != got[k]
+    ]
+    if diffs:
+        raise ArchMismatchError(
+            "encoder geometry differs from the checkpoint: "
+            + "; ".join(diffs)
+            + ". Pass allow_arch_mismatch=True only if a partial load is intended."
+        )
+
+
 def load_encoder_state(
-    encoder: torch.nn.Module, state_dict: Mapping[str, Any]
+    encoder: torch.nn.Module,
+    state_dict: Mapping[str, Any],
+    *,
+    allow_arch_mismatch: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Load an encoder state dict, inflating/truncating patch_embed input
     channels when they differ from the target encoder's configured
@@ -301,7 +361,13 @@ def load_encoder_state(
     updates "activate" the new channel(s) during fine-tuning rather than
     corrupting what was already learned. Returns the `(missing, unexpected)`
     keys from the underlying `load_state_dict(strict=False)` call.
+
+    Raises `ArchMismatchError` when the checkpoint's transformer geometry
+    differs from the target's; set `allow_arch_mismatch` for deliberate
+    partial loads.
     """
+    if not allow_arch_mismatch:
+        check_encoder_arch(encoder, state_dict)
     state_dict = dict(state_dict)
     w = state_dict.get("patch_embed.proj.weight")
     # Some encoders (LeVJEPAEncoder) have no top-level patch_embed attribute

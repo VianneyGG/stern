@@ -2004,3 +2004,114 @@ def test_payload_records_the_seed_the_model_was_initialised_from(
     )
     payload = torch.load(checkpoint_root / "run1.pt", weights_only=False)
     assert payload["init_seed"] == expected
+
+
+def _tiny_levjepa_model_cfg() -> DictConfig:
+    return DictConfig(
+        {
+            "encoder": "levjepa",
+            "num_frames": 16,
+            "image_size": 32,
+            "local_image_size": 16,
+            "in_channels": 3,
+            "patch_size": 16,
+            "embed_dim": 12,
+            "depth": 1,
+            "num_heads": 2,
+            "mlp_ratio": 2.0,
+            "dropout": 0.0,
+            "drop_path_rate": 0.0,
+            "drop_ratio": 0.5,
+            "num_local_views": 2,
+            "sigreg_lambda": 0.02,
+            "sigreg_directions": 8,
+            "projector_hidden": 16,
+            "embed_dim_k": 8,
+            "polyak_decay": 0.9,
+            "polyak_update_every": 1,
+        }
+    )
+
+
+class _FakeRawIterableDataset(torch.utils.data.IterableDataset):
+    """Mimics MeshShardIterableDataset(raw_frames=True): streams (T, H, W,
+    3) uint8 clips, with a no-op set_round (real dataset has one too)."""
+
+    def __init__(self, n=4, num_frames=16, size=32):
+        self._n = n
+        self._num_frames = num_frames
+        self._size = size
+
+    def set_round(self, round_num: int) -> None:
+        pass
+
+    def __iter__(self):
+        for _ in range(self._n):
+            yield torch.randint(
+                0, 256, (self._num_frames, self._size, self._size, 3), dtype=torch.uint8
+            )
+
+
+def test_train_one_round_and_evaluate_val_loss_dispatch_to_levjepa(monkeypatch):
+    """train_one_round/evaluate_val_loss must route a _LeVJEPAPretrainModule
+    through _train_epoch_levjepa/_evaluate_val_loss_levjepa, never touching
+    the VideoMAE masker/token_grid/compute_loss path -- the exact crash the
+    prior dead-branch bug produced (encoder='levjepa' constructed a
+    _LeVJEPAPretrainModule but the round loop still assumed VideoMAE's
+    interface, so round 1 crashed immediately)."""
+    from video_encoding.training.diloco.mesh_round import (
+        LeVJEPAViewIterableDataset,
+        _LeVJEPAPretrainModule,
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("build_masker must not be called on the LeVJEPA path")
+
+    monkeypatch.setattr(mesh_round, "build_masker", _boom)
+
+    model_cfg = _tiny_levjepa_model_cfg()
+    model = _LeVJEPAPretrainModule(model_cfg)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    device = torch.device("cpu")
+
+    raw = _FakeRawIterableDataset(n=4, num_frames=16, size=32)
+    train_dataset = LeVJEPAViewIterableDataset(
+        raw, num_local=2, global_size=32, local_size=16
+    )
+
+    train_stats = train_one_round(
+        model,
+        optimizer,
+        device,
+        None,  # masker: unused on the LeVJEPA path
+        train_dataset,
+        steps_per_round=2,
+        amp="off",
+        accum_steps=1,
+        grad_clip=0.0,
+        round_num=0,
+        micro_batch_size=2,
+        sigreg_lambda=float(model_cfg.sigreg_lambda),
+        sigreg_directions=int(model_cfg.sigreg_directions),
+    )
+
+    assert train_stats["steps"] == 2
+    assert train_stats["samples"] == 4  # 2 steps x micro_batch_size=2
+    assert not math.isnan(train_stats["loss"])
+    assert not train_stats["abandoned"]
+
+    val_raw = _FakeRawIterableDataset(n=2, num_frames=16, size=32)
+    val_dataset = LeVJEPAViewIterableDataset(
+        val_raw, num_local=2, global_size=32, local_size=16
+    )
+    val_loss = evaluate_val_loss(
+        model,
+        val_dataset,
+        device,
+        None,
+        "off",
+        sigreg_lambda=float(model_cfg.sigreg_lambda),
+        sigreg_directions=int(model_cfg.sigreg_directions),
+    )
+    assert not math.isnan(val_loss)
+    assert model.training  # left in train mode, matching train_one_round's expectation

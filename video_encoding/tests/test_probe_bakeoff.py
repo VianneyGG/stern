@@ -392,3 +392,120 @@ def test_main_records_the_resolved_model_cfg_in_the_report(tmp_path, monkeypatch
     meta = json.loads(out.read_text())["meta"]
     assert meta["model_cfg"]["target_mode"] == "per_frame"
     assert meta["model_cfg"]["depth"] == _base_cfg().depth
+
+
+# --- single-arm mode ----------------------------------------------------------
+
+
+def _single_arm_argv(tmp_path, arm: str, *extra: str) -> list[str]:
+    experiment_dir = _write_experiment(tmp_path, "solo", "model: {}\n")
+    configs = tmp_path / "mesh_run_configs.json"
+    configs.write_text(json.dumps([{"run_id": "lev-run", "experiment": "solo"}]))
+    manifest = tmp_path / "manifest.csv"
+    manifest.write_text("")
+    return [
+        "--run-id",
+        "lev-run",
+        "--manifest",
+        str(manifest),
+        "--mesh-shared",
+        str(tmp_path),
+        "--configs",
+        str(configs),
+        "--model-cfg",
+        str(_tiny_base_cfg_file(tmp_path)),
+        "--experiment-dir",
+        str(experiment_dir),
+        "--layers",
+        "1,2",
+        "--arm",
+        arm,
+        "--out",
+        str(tmp_path / "report.json"),
+        *extra,
+    ]
+
+
+def _record_probe_ccc(monkeypatch):
+    calls: list[dict] = []
+
+    def _fake(bundle, manifest_path, *, layer, seed, **kwargs):
+        calls.append({"bundle": bundle, "layer": layer, "seed": seed})
+        return 0.1 * layer + (seed % 7) * 1e-3
+
+    monkeypatch.setattr(probe_bakeoff, "probe_ccc", _fake)
+    monkeypatch.setattr(
+        probe_bakeoff,
+        "probe_by_depth",
+        lambda *a, **k: pytest.fail("single-arm mode must not run the paired sweep"),
+    )
+    return calls
+
+
+def _replicate_seeds(base: int, n: int = 3) -> list[int]:
+    import random
+
+    rng = random.Random(base)
+    return [rng.randrange(2**32) for _ in range(n)]
+
+
+def test_control_arm_never_loads_the_checkpoint_and_writes_only_control_keys(
+    tmp_path, monkeypatch
+):
+    calls = _record_probe_ccc(monkeypatch)
+    monkeypatch.setattr(
+        probe_bakeoff,
+        "load_bundle",
+        lambda *a, **k: pytest.fail("the control arm must not read master.pt"),
+    )
+
+    assert probe_bakeoff.main(_single_arm_argv(tmp_path, "control")) == 0
+
+    payload = json.loads((tmp_path / "report.json").read_text())
+    assert set(payload["metrics"]) == {"probe_ccc_L1_control", "probe_ccc_L2_control"}
+    assert payload["meta"]["arm"] == "control"
+    assert payload["meta"]["run_id"] == "lev-run"
+    # The paired sweep's control seed base (1), so a split run reproduces it.
+    assert [c["seed"] for c in calls if c["layer"] == 1] == _replicate_seeds(1)
+    assert sorted({c["layer"] for c in calls}) == [1, 2]
+
+
+def test_checkpoint_arm_writes_only_checkpoint_keys_on_the_loaded_bundle(
+    tmp_path, monkeypatch
+):
+    calls = _record_probe_ccc(monkeypatch)
+    loaded = probe_bakeoff.random_init_bundle(_base_cfg())
+    monkeypatch.setattr(probe_bakeoff, "load_bundle", lambda *a, **k: loaded)
+
+    probe_bakeoff.main(_single_arm_argv(tmp_path, "checkpoint"))
+
+    payload = json.loads((tmp_path / "report.json").read_text())
+    assert set(payload["metrics"]) == {"probe_ccc_L1", "probe_ccc_L2"}
+    assert payload["metrics"]["probe_ccc_L2"]["n"] == 3
+    assert payload["meta"]["arm"] == "checkpoint"
+    assert all(c["bundle"] is loaded for c in calls)
+    assert [c["seed"] for c in calls if c["layer"] == 2] == _replicate_seeds(0)
+
+
+def test_control_encoder_is_identical_across_invocations():
+    """Split jobs each build their own control; they must all be the same
+    random encoder, or layer L and layer L' are scored against different
+    baselines."""
+    _, first = probe_bakeoff._arm_bundles(
+        "x", "/nonexistent", _base_cfg(), round=None, load=False
+    )
+    torch.randn(5)  # disturb the global RNG between the two builds
+    _, second = probe_bakeoff._arm_bundles(
+        "x", "/nonexistent", _base_cfg(), round=None, load=False
+    )
+
+    a, b = first.encoder.state_dict(), second.encoder.state_dict()
+    assert all(torch.equal(a[k], b[k]) for k in a)
+
+
+def test_single_arm_refuses_a_label_permutation(tmp_path, monkeypatch):
+    _record_probe_ccc(monkeypatch)
+    with pytest.raises(SystemExit, match="permute"):
+        probe_bakeoff.main(
+            _single_arm_argv(tmp_path, "control", "--permute-labels-seed", "3")
+        )

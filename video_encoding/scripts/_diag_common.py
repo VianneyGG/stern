@@ -28,6 +28,7 @@ import torch
 
 from video_encoding.mesh.outer_step import to_fp32_state_dict
 from video_encoding.mesh.pending_files import pending_filename
+from video_encoding.models.levjepa.encoder import LeVJEPAEncoder
 from video_encoding.models.videomaev2.encoder import (
     VideoMAEEncoder,
     preprocess_window,
@@ -398,7 +399,7 @@ def _bundle_from_checkpoint(
 
     try:
         if full_model:
-            model = VideoMAEForPreTraining(model_cfg)
+            model = _build_full_model(model_cfg)
             _check_patch_embed_channels(state_dict, model.encoder, run_id, "encoder.")
             result = model.load_state_dict(state_dict, strict=False)
             _raise_on_real_mismatch(result, model.encoder, run_id)
@@ -410,10 +411,10 @@ def _bundle_from_checkpoint(
                 init_seed=payload.get("init_seed"),
             )
 
-        # The mesh saves a VideoMAEForPreTraining state dict (encoder+decoder),
-        # so the encoder-only path selects its own subtree rather than loading
-        # the whole thing and discarding the decoder.
-        encoder = VideoMAEEncoder(model_cfg)
+        # The mesh saves a VideoMAEForPreTraining (encoder+decoder) or LeVJEPA
+        # (encoder+projector) state dict, so the encoder-only path selects its
+        # own subtree rather than loading the whole thing and discarding the rest.
+        encoder = _build_encoder(model_cfg)
         encoder_sd = {
             key.removeprefix("encoder."): tensor
             for key, tensor in state_dict.items()
@@ -458,7 +459,7 @@ def random_init_bundle(
                 init_seed=seed,
             )
         if full_model:
-            model = VideoMAEForPreTraining(model_cfg)
+            model = _build_full_model(model_cfg)
             return DiagBundle(
                 encoder=model.encoder.eval(),
                 model=model.eval(),
@@ -467,12 +468,33 @@ def random_init_bundle(
                 init_seed=seed,
             )
         return DiagBundle(
-            encoder=VideoMAEEncoder(model_cfg).eval(),
+            encoder=_build_encoder(model_cfg).eval(),
             model=None,
             run_id="",
             round=None,
             init_seed=seed,
         )
+
+
+def _is_levjepa(model_cfg) -> bool:
+    return str(model_cfg.get("encoder", "videomae")) == "levjepa"
+
+
+def _build_encoder(model_cfg):
+    """The encoder `model_cfg.encoder` names, as the mesh round builds it."""
+    if _is_levjepa(model_cfg):
+        return LeVJEPAEncoder(model_cfg)
+    return VideoMAEEncoder(model_cfg)
+
+
+def _build_full_model(model_cfg) -> VideoMAEForPreTraining:
+    """Full-model bundles exist for the MAE-reconstruction checks only."""
+    if _is_levjepa(model_cfg):
+        raise ValueError(
+            "full_model=True needs a VideoMAEForPreTraining; a LeVJEPA run has no "
+            "reconstruction head, so load it with full_model=False"
+        )
+    return VideoMAEForPreTraining(model_cfg)
 
 
 def paired_inputs(
@@ -546,6 +568,8 @@ def forward_with_hidden_states(
     """
     if is_hf_levjepa(encoder):
         return _hf_levjepa_hidden_states(encoder, pixel_values)
+    if isinstance(encoder, LeVJEPAEncoder):
+        return _levjepa_hidden_states(encoder, pixel_values)
     with torch.no_grad():
         x = encoder.patch_embed(pixel_values)
         if x.shape[1] != encoder.pos_embed.shape[1]:
@@ -559,6 +583,28 @@ def forward_with_hidden_states(
         states = [x]
         for block in encoder.blocks:
             x = block(x)
+            states.append(x)
+    return states
+
+
+def _levjepa_hidden_states(
+    encoder: LeVJEPAEncoder, pixel_values: "torch.Tensor"
+) -> list["torch.Tensor"]:
+    """`LeVJEPAEncoder.forward`'s global-view traversal with every token kept:
+    [cls] first, block-causal mask, 3D RoPE, no `final_norm`. Pinned against the
+    real forward by the same kind of parity test as the VideoMAE path."""
+    B, _, T, H, W = pixel_values.shape
+    with torch.no_grad():
+        x = encoder.tubelet_embed(pixel_values)
+        coords = encoder._patch_coords(T, H, W, pixel_values.device)
+        coords = coords.unsqueeze(0).expand(B, -1, 3)
+        cls_coords = torch.zeros(B, 1, 3, dtype=coords.dtype, device=coords.device)
+        cos, sin = encoder.rope(torch.cat([cls_coords, coords], dim=1))
+        attn_mask = encoder._block_causal_mask(coords[..., 0])
+        x = torch.cat([encoder.cls_token.expand(B, -1, -1), x], dim=1)
+        states = [x]
+        for block in encoder.blocks:
+            x = block(x, attn_mask=attn_mask, rotary=(cos, sin))
             states.append(x)
     return states
 
@@ -1068,8 +1114,8 @@ def encoder_geometry(encoder) -> tuple[int, int, int, int]:
 
 def patch_tokens(encoder, hidden: "torch.Tensor") -> "torch.Tensor":
     """`hidden` with the non-patch tokens removed: registers for VideoMAE, the
-    CLS token for HF LeVJEPA."""
-    if is_hf_levjepa(encoder):
+    leading CLS token for in-house and HF LeVJEPA."""
+    if is_hf_levjepa(encoder) or isinstance(encoder, LeVJEPAEncoder):
         return hidden[:, 1:]
     return encoder.registers.strip(hidden)
 

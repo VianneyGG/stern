@@ -41,6 +41,7 @@ from video_encoding.mesh.pending_files import (
 )
 from video_encoding.mesh.quorum import ready_for_merge
 from video_encoding.mesh.topology import NODE_GROUPS
+from video_encoding.scripts import class_hours
 from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.tb_logger import flush_final_tb_rounds
 from video_encoding.watcher.cluster import (
@@ -485,11 +486,27 @@ def advance_one_run(
     run = state.run(run_config.run_id)
     if run.target_pool_size == 0:
         run.target_pool_size = len(run_config.nodes)
+    # No job may run Mon-Fri 08:00-20:00 (class_hours.py), so while a fresh
+    # 2h job would overlap that window, skip every handler that submits one:
+    # chunk relaunch, ASSIGNING, _recover_pool. The run just waits in place.
+    # Merging and syncing still proceed -- a job launched before 06:00 may
+    # legitimately still be training -- and none of the held paths runs a
+    # timer, so nothing is charged against the nodes for the wait.
+    hold = class_hours.blocked(now)
+    if hold is not None:
+        if run.status == "ASSIGNING":
+            return _stall(run, f"{run_config.run_id}: launch held -- {hold}")
+        if run.status == "RUNNING":
+            return _do_running(run_config, run, mesh_shared)
     # Before dispatching: a chunked run whose workers have all exited needs
     # its next chunk submitted, and that is true in RUNNING and in
     # AWAITING_CHECKPOINTS alike, so it does not belong in either handler.
-    chunk_note = _relaunch_chunk_if_finished(
-        run_config, run, state, repo_root, mesh_shared, now
+    chunk_note = (
+        None
+        if hold is not None
+        else _relaunch_chunk_if_finished(
+            run_config, run, state, repo_root, mesh_shared, now
+        )
     )
     if chunk_note is not None:
         return chunk_note
@@ -573,7 +590,18 @@ def _submit_worker_job(
     The snapshot is per (run, node) rather than per job: a node only ever
     has one worker in flight for a run (every submit path checks first),
     so overwriting is safe and the file count stays bounded by the roster.
+
+    Refuses (returns None, no sbatch) during class hours whatever the caller
+    decided: advance_one_run already holds these paths, this catches any
+    caller that doesn't.
     """
+    held = class_hours.blocked(time.time())
+    if held is not None:
+        print(
+            f"_submit_worker_job: {node} ({run_config.run_id}) not submitted -- {held}",
+            file=sys.stderr,
+        )
+        return None
     # ALL is sbatch's default; naming it keeps the rest of the submitter
     # environment (PATH, MESH_ROOT, ...) propagating exactly as before while
     # overriding only the variables listed below.
@@ -1356,6 +1384,9 @@ def submit_replacement(
     gate replenishment; only a present file where excluded_node's own entry
     is absent or empty does.
     """
+    held = class_hours.blocked(time.time())
+    if held is not None:
+        return [], f"{run_config.run_id}: replacement for {excluded_node} held -- {held}"
     picked: list[str] = []
     replenish_note: str | None = None
 

@@ -25,20 +25,26 @@ import argparse
 import dataclasses
 from pathlib import Path
 
+import torch
 from omegaconf import DictConfig, OmegaConf
 
 from video_encoding.scripts._diag_common import (
     LADDER_REVISION,
     DiagBundle,
     DiagReport,
+    MetricValue,
     load_bundle,
     random_init_bundle,
+    replicate,
     run_hyperparams,
 )
 from video_encoding.scripts.diag_probe import (
+    _CHECKPOINT_SEED_BASE,
+    _CONTROL_SEED_BASE,
     DEFAULT_PROBE_DEPTH_LAYERS,
     permute_labels,
     probe_by_depth,
+    probe_ccc,
 )
 
 __all__ = ["main", "model_cfg_for_run", "permute_labels", "probe_by_depth"]
@@ -47,6 +53,11 @@ __all__ = ["main", "model_cfg_for_run", "permute_labels", "probe_by_depth"]
 # fine for a control embedded in another arm's report, but this CLI writes one
 # report per arm and an arm with no name cannot be merged with the others.
 RANDOM_INIT_RUN_ID = "random_init"
+
+# The control encoder's init seed. Pinned so that jobs splitting one arm's
+# layers across nodes (`--arm control`) all score against the same random
+# encoder rather than one per job.
+RANDOM_INIT_SEED = 0
 
 
 def _coerce(raw: str):
@@ -125,26 +136,54 @@ def _arm_bundles(
     model_cfg: DictConfig,
     *,
     round: int | None,
-) -> tuple[DiagBundle, DiagBundle]:
+    load: bool = True,
+) -> tuple["DiagBundle | None", DiagBundle]:
     """The arm under test and its control.
 
     For `random_init` the two are the same object, which is what makes that
     invocation the noise floor: `probe_by_depth` then runs the encoder once and
-    reports a difference that is pure probe-seed spread.
+    reports a difference that is pure probe-seed spread. `load=False` skips the
+    checkpoint (the `--arm control` job never reads it) and returns None for it.
     """
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(RANDOM_INIT_SEED)
+        control = random_init_bundle(model_cfg)
     if run_id == RANDOM_INIT_RUN_ID:
-        bundle = dataclasses.replace(
-            random_init_bundle(model_cfg), run_id=RANDOM_INIT_RUN_ID
-        )
+        bundle = dataclasses.replace(control, run_id=RANDOM_INIT_RUN_ID)
         return bundle, bundle
-    bundle = load_bundle(run_id, mesh_shared, model_cfg, round=round)
-    return bundle, random_init_bundle(model_cfg)
+    if not load:
+        return None, control
+    return load_bundle(run_id, mesh_shared, model_cfg, round=round), control
+
+
+def _single_arm(
+    bundle: DiagBundle,
+    manifest_path: Path,
+    layers: list[int],
+    *,
+    seed_base: int,
+    n_seeds: int,
+) -> dict[int, MetricValue]:
+    """One arm's CCC at each layer, fit-for-fit what `probe_by_depth` computes
+    for that arm (same split, standardisation, and seed base) but without the
+    other arm or the forced final block -- so a LeVJEPA probe, ~16 min per fit,
+    can be split into jobs that each fit a 2h walltime."""
+    return {
+        layer: replicate(
+            lambda s, layer=layer: probe_ccc(
+                bundle, manifest_path, layer=layer, seed=s
+            ),
+            n=n_seeds,
+            seed=seed_base,
+        )
+        for layer in layers
+    }
 
 
 def _report(
-    per_layer: dict,
-    final_block_reference,
+    metrics: dict,
     *,
+    arm: str,
     run_id: str,
     round: int | None,
     layers: list[int],
@@ -153,11 +192,6 @@ def _report(
     permute_labels_seed: int | None,
     model_cfg: DictConfig,
 ) -> DiagReport:
-    metrics = {}
-    for layer, (checkpoint_value, control_value) in per_layer.items():
-        metrics[f"probe_ccc_L{layer}"] = checkpoint_value
-        metrics[f"probe_ccc_L{layer}_control"] = control_value
-    metrics["probe_ccc_final_block"] = final_block_reference
     return DiagReport(
         metrics=metrics,
         arrays={},
@@ -165,6 +199,7 @@ def _report(
             "LADDER_REVISION": LADDER_REVISION,
             "input_kind": "real",
             "run_id": run_id,
+            "arm": arm,
             "round": round,
             "layers": layers,
             "n_seeds": n_seeds,
@@ -205,8 +240,20 @@ def main(argv: "list[str] | None" = None) -> int:
         help="negative control: break the token/label pairing before fitting, "
         "so a non-zero CCC means the protocol leaks",
     )
+    parser.add_argument(
+        "--arm",
+        choices=("paired", "checkpoint", "control"),
+        default="paired",
+        help="paired: both arms plus the final block, as one report; "
+        "checkpoint/control: that arm only, at exactly --layers",
+    )
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
+    if args.arm != "paired" and args.permute_labels_seed is not None:
+        raise SystemExit(
+            "--permute-labels-seed needs both arms under one permutation; "
+            "run it with --arm paired"
+        )
 
     layers = [int(part) for part in args.layers.split(",") if part.strip()]
     entry = run_hyperparams(args.run_id, args.configs)
@@ -221,10 +268,41 @@ def main(argv: "list[str] | None" = None) -> int:
         OmegaConf.load(args.model_cfg), entry, args.experiment_dir
     )
     bundle, control_bundle = _arm_bundles(
-        args.run_id, args.mesh_shared, model_cfg, round=args.round
+        args.run_id,
+        args.mesh_shared,
+        model_cfg,
+        round=args.round,
+        load=args.arm != "control",
     )
 
     manifest_path = Path(args.manifest)
+    if args.arm != "paired":
+        is_control = args.arm == "control"
+        values = _single_arm(
+            control_bundle if is_control else bundle,
+            manifest_path,
+            layers,
+            seed_base=_CONTROL_SEED_BASE if is_control else _CHECKPOINT_SEED_BASE,
+            n_seeds=args.n_seeds,
+        )
+        suffix = "_control" if is_control else ""
+        _report(
+            {f"probe_ccc_L{layer}{suffix}": value for layer, value in values.items()},
+            arm=args.arm,
+            run_id=args.run_id,
+            round=args.round,
+            layers=layers,
+            n_seeds=args.n_seeds,
+            manifest_path=manifest_path,
+            permute_labels_seed=None,
+            model_cfg=model_cfg,
+        ).to_json(args.out)
+        print(f"{args.run_id} [{args.arm}]: probe CCC over {args.n_seeds} seeds")
+        for layer, value in values.items():
+            print(f"  L{layer:<3} {value.mean:+.4f} +- {value.sd:.4f}")
+        print(f"wrote {args.out}")
+        return 0
+
     per_layer, final_block_reference = probe_by_depth(
         bundle,
         control_bundle,
@@ -234,9 +312,14 @@ def main(argv: "list[str] | None" = None) -> int:
         permute_labels_seed=args.permute_labels_seed,
     )
 
+    metrics = {}
+    for layer, (checkpoint_value, control_value) in per_layer.items():
+        metrics[f"probe_ccc_L{layer}"] = checkpoint_value
+        metrics[f"probe_ccc_L{layer}_control"] = control_value
+    metrics["probe_ccc_final_block"] = final_block_reference
     report = _report(
-        per_layer,
-        final_block_reference,
+        metrics,
+        arm=args.arm,
         run_id=args.run_id,
         round=args.round,
         layers=layers,

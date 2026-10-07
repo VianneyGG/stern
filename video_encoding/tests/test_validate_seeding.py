@@ -5,6 +5,8 @@ import json
 import pytest
 
 from video_encoding.scripts.validate_seeding import (
+    GOLDEN_DIR,
+    GOLDEN_HOST,
     build_manifest,
     parse_listing,
     scan_pool,
@@ -37,7 +39,7 @@ def test_parse_listing_of_an_empty_directory_is_an_empty_dict():
 
 
 def _golden_ssh(host, command):
-    assert host == "node001"
+    assert host in ("node001", GOLDEN_HOST)
     return GOLDEN_VAL if "/val" in command else GOLDEN_TRAIN
 
 
@@ -104,7 +106,7 @@ def _run_main(tmp_path, holdings, monkeypatch, *extra):
     def run_ssh(host, command):
         return (
             _golden_ssh(host, command)
-            if host == "node001" and "voxceleb2_shards" in command
+            if host == GOLDEN_HOST and GOLDEN_DIR in command
             else pool_ssh(host, command)
         )
 

@@ -16,11 +16,12 @@ from torch.utils.data import DataLoader, Dataset
 from video_encoding.data.loaders import build_ssl_loader
 from video_encoding.data.ssl_windows import SSLWindowDataset
 from video_encoding.models.levjepa.encoder import LeVJEPAEncoder
-from video_encoding.models.levjepa.losses import levjepa_loss
+from video_encoding.models.levjepa.losses import SigregOptions, levjepa_loss
 from video_encoding.models.levjepa.projector import Projector
-from video_encoding.models.levjepa.views import build_views
+from video_encoding.models.levjepa.views import build_views, derive_seed
 from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.loop_utils import WeightEMA
+from video_encoding.training.pretrain import _build_scheduler
 from video_encoding.training.tb_logger import make_writer, write_result_json
 
 
@@ -52,6 +53,59 @@ class LeVJEPAViewDataset(Dataset):
         )
 
 
+class LeVJEPAViewIterableDataset(torch.utils.data.IterableDataset):
+    """Iterable-dataset counterpart to `LeVJEPAViewDataset`, for wrapping a
+    streaming raw-frames source (e.g. `MeshShardIterableDataset(...,
+    raw_frames=True)`) that has no `__len__`/`__getitem__` -- only
+    `__iter__`. Builds the same `(global_view, local_views, crop_boxes)`
+    tuple per clip; DataLoader's default collation batches it the same way.
+    """
+
+    def __init__(
+        self,
+        raw_dataset: torch.utils.data.IterableDataset,
+        *,
+        num_local: int,
+        global_size: int,
+        local_size: int,
+        view_seed: int | None = None,
+    ):
+        self._raw = raw_dataset
+        self._num_local = num_local
+        self._global_size = global_size
+        self._local_size = local_size
+        # Opt-in (train.rng_split): views come from a private generator
+        # re-seeded from (view_seed, round) at every __iter__, so they do not
+        # depend on how much global RNG the model consumed, and a relaunched
+        # worker resumes a round with that round's views. None = global RNG.
+        self._view_seed = view_seed
+        self._round = 0
+
+    def set_round(self, round_num: int) -> None:
+        """Passthrough to the wrapped dataset, if it supports round-keyed
+        shuffling (MeshShardIterableDataset does) -- mesh_round.py's
+        train_one_round calls this unconditionally before each round."""
+        self._round = round_num
+        set_round = getattr(self._raw, "set_round", None)
+        if set_round is not None:
+            set_round(round_num)
+
+    def __iter__(self):
+        generator = None
+        if self._view_seed is not None:
+            generator = torch.Generator().manual_seed(
+                derive_seed(self._view_seed, "views", self._round)
+            )
+        for clip in self._raw:
+            yield build_views(
+                clip,
+                num_local=self._num_local,
+                global_size=self._global_size,
+                local_size=self._local_size,
+                generator=generator,
+            )
+
+
 def _build_levjepa_loader(cfg: DictConfig, rank: int, world_size: int) -> DataLoader:
     ssl_dataset_cfg = build_ssl_loader(cfg.dataset, cfg.preprocess.window)
     raw_dataset = SSLWindowDataset(
@@ -76,6 +130,7 @@ def _build_levjepa_loader(cfg: DictConfig, rank: int, world_size: int) -> DataLo
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
+        drop_last=True,  # a 1-clip tail batch would trip _levjepa_step's guard
     )
 
 
@@ -87,6 +142,8 @@ def _levjepa_step(
     *,
     sigreg_lambda: float,
     sigreg_directions: int,
+    sigreg_opts: SigregOptions | None = None,
+    sigreg_key: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Run one LeVJEPA forward pass over a batch already split into views.
 
@@ -94,11 +151,39 @@ def _levjepa_step(
     `LeVJEPAViewDataset`/`build_views`: `global_batch` is `(B, 3, T, H, W)`,
     `local_batch` is `(B, V, 3, T, h, w)`, `crop_boxes` is `(B, V, 4)`.
     """
+    z_global, z_locals = _levjepa_embed(batch, encoder, projector, device)
+    total, components = levjepa_loss(
+        z_global,
+        z_locals,
+        lam=sigreg_lambda,
+        num_directions=sigreg_directions,
+        opts=sigreg_opts,
+        key=sigreg_key,
+    )
+    components["z_global_norm"] = z_global.norm(dim=-1).mean().detach()
+    components["z_locals_norm"] = z_locals.norm(dim=-1).mean().detach()
+    return total, components
+
+
+def _levjepa_embed(
+    batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    encoder: LeVJEPAEncoder,
+    projector: Projector,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The forward half of `_levjepa_step`: (z_global (B, K), z_locals (B, V, K))."""
     global_batch, local_batch, crop_boxes = batch
     global_batch = global_batch.to(device)
     local_batch = local_batch.to(device)
     crop_boxes = crop_boxes.to(device)
     B, V = local_batch.shape[0], local_batch.shape[1]
+    if B < 2:
+        # SIGReg is a statistic over the batch (minimised at z=0 for a single
+        # sample) and the projector's BatchNorm would only see one clip's views.
+        raise ValueError(
+            f"LeVJEPA needs at least 2 clips per batch, got {B}; set "
+            "mesh.micro_batch_size / train.batch_size accordingly"
+        )
     local_flat = local_batch.reshape(B * V, *local_batch.shape[2:])
     crop_boxes_flat = crop_boxes.reshape(B * V, 4)
 
@@ -115,13 +200,7 @@ def _levjepa_step(
     all_z = projector(all_cls)
     z_global, z_locals_flat = all_z.split([B, B * V], dim=0)
     z_locals = z_locals_flat.reshape(B, V, -1)
-
-    total, components = levjepa_loss(
-        z_global, z_locals, lam=sigreg_lambda, num_directions=sigreg_directions
-    )
-    components["z_global_norm"] = z_global.norm(dim=-1).mean().detach()
-    components["z_locals_norm"] = z_locals.norm(dim=-1).mean().detach()
-    return total, components
+    return z_global, z_locals
 
 
 def _payload(
@@ -131,6 +210,7 @@ def _payload(
     ema: WeightEMA,
     epoch: int,
     total_loss: float,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> dict:
     payload = ckpt_io.base_payload(
         model=encoder,
@@ -142,6 +222,9 @@ def _payload(
     )
     payload["projector_state_dict"] = projector.state_dict()
     payload["ema_state_dict"] = ema.state_dict()
+    payload["scheduler_state_dict"] = (
+        scheduler.state_dict() if scheduler is not None else None
+    )
     return payload
 
 
@@ -179,6 +262,7 @@ def run_levjepa_pretrain_stage(
     )
     ema = WeightEMA(encoder, decay=float(cfg.model.get("polyak_decay", 0.9999)))
     polyak_update_every = int(cfg.model.get("polyak_update_every", 32))
+    scheduler = _build_scheduler(optimizer, cfg)
 
     start_epoch = 0
     disk_best = ckpt_io.peek_best(best_path) if rank == 0 else None
@@ -187,7 +271,7 @@ def run_levjepa_pretrain_stage(
             latest_path,
             model=encoder,
             optimizer=optimizer,
-            scheduler=None,
+            scheduler=scheduler,
             device=device,
             expected_model_name="levjepa_encoder",
             expected_optimizer_name="adamw",
@@ -252,9 +336,26 @@ def run_levjepa_pretrain_stage(
             writer.add_scalar("train/z_locals_norm", z_locals_norm, epoch)
             writer.flush()
 
+        # Step before the checkpoint save (not after, unlike pretrain.py's
+        # ordering): the saved scheduler snapshot must be the one the next
+        # (resumed) epoch should use. Stepping after save leaves the
+        # checkpoint holding the LR this epoch already consumed, so a
+        # resumed run would silently redo one step of warmup/decay instead
+        # of continuing where training left off. This reordering doesn't
+        # change the LR trajectory used for actual training in an
+        # uninterrupted run -- that's driven by the live optimizer object,
+        # not by when we snapshot it for checkpointing.
+        scheduler.step()
+
         if rank == 0:
             payload = _payload(
-                encoder, projector, optimizer, ema, epoch, last_result["total_loss"]
+                encoder,
+                projector,
+                optimizer,
+                ema,
+                epoch,
+                last_result["total_loss"],
+                scheduler=scheduler,
             )
             ckpt_io.save(latest_path, payload)
             _, disk_best = ckpt_io.save_best(

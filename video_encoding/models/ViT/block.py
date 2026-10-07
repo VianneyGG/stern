@@ -23,6 +23,10 @@ class BlockConfig:
     mlp_type: str = "gelu"
     qk_norm: bool = False
     layer_scale_init: float | None = None
+    use_skip: bool = True
+    # LayerNorm Scaling (Curse of Depth, arXiv 2502.05795): multiplies both
+    # pre-norm outputs by this; the encoder sets 1/sqrt(layer). 1.0 = off.
+    ln_scale: float = 1.0
 
 
 class ViTBlock(nn.Module):
@@ -34,6 +38,8 @@ class ViTBlock(nn.Module):
 
     def __init__(self, cfg: BlockConfig):
         super().__init__()
+        self.use_skip = cfg.use_skip
+        self.ln_scale = cfg.ln_scale
         self.norm1 = build_norm(cfg.norm_type, cfg.embed_dim)
         self.attn = SelfAttention(
             cfg.embed_dim, cfg.num_heads, dropout=cfg.dropout, qk_norm=cfg.qk_norm
@@ -58,10 +64,12 @@ class ViTBlock(nn.Module):
         attn_mask: torch.Tensor | None = None,
         rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        h = self.norm1(x)
+        h = self.norm1(x) * self.ln_scale
         attn_out, _ = self.attn(
             h, need_weights=False, attn_mask=attn_mask, rotary=rotary
         )
-        x = x + self.drop_path(self.layer_scale1(attn_out))
-        x = x + self.drop_path(self.layer_scale2(self.mlp(self.norm2(x))))
+        attn_out = self.drop_path(self.layer_scale1(attn_out))
+        x = x + attn_out if self.use_skip else attn_out
+        mlp_out = self.drop_path(self.layer_scale2(self.mlp(self.norm2(x) * self.ln_scale)))
+        x = x + mlp_out if self.use_skip else mlp_out
         return x

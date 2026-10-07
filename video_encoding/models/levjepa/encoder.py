@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from video_encoding.models.ViT.block import BlockConfig, ViTBlock
 from video_encoding.models.ViT.norm import build_norm
@@ -32,8 +33,16 @@ class LeVJEPAEncoder(nn.Module):
         qk_norm = model_cfg.get("qk_norm", False)
         in_channels = model_cfg.get("in_channels", 3)
 
+        self.num_frames = int(model_cfg.num_frames)
+        self.image_size = int(model_cfg.image_size)
+        self.embed_dim = int(embed_dim)
         self.patch_size = model_cfg.patch_size
         self.drop_ratio = model_cfg.get("drop_ratio", 0.95)
+        # Recompute each block in backward instead of storing its activations:
+        # lifts the per-GPU micro-batch (and so SIGReg's batch) at ~1 extra
+        # forward. Exact because token dropping happens before the blocks and
+        # the blocks draw no randomness (dropout/drop_path 0 in levjepa_lean).
+        self.grad_checkpoint = bool(model_cfg.get("grad_checkpoint", False))
         # Reference grid granularity for RoPE coordinates: local-view crops
         # are rescaled into this frame (see _patch_coords_for_crop) so a
         # crop's positional encoding reflects where it came from in the full
@@ -68,6 +77,15 @@ class LeVJEPAEncoder(nn.Module):
         self.final_norm = build_norm(norm_type, embed_dim)
 
         self._coord_cache: dict[tuple[int, int, int, str], torch.Tensor] = {}
+        # Opt-in (train.rng_split): token-drop scores come from this
+        # generator instead of the global RNG; see reseed_drop. None = global.
+        self.drop_generator: torch.Generator | None = None
+
+    def reseed_drop(self, seed: int) -> None:
+        """Draw token-drop scores from a private generator seeded with
+        `seed`, on the encoder's device."""
+        device = self.cls_token.device
+        self.drop_generator = torch.Generator(device=device).manual_seed(seed)
 
     def _patch_coords(
         self, T: int, H: int, W: int, device: torch.device
@@ -129,7 +147,15 @@ class LeVJEPAEncoder(nn.Module):
         num_keep = max(1, int(round(N * (1 - self.drop_ratio))))
         # Independent random ranking per batch element -> each sample keeps
         # its own subset, rather than one mask shared across the batch.
-        scores = torch.rand(B, N, device=tokens.device)
+        # No generator kwarg when unset: an explicit generator=None breaks
+        # torch.compile (train.levjepa_compile) once a second batch shape
+        # makes the graph dynamic.
+        if self.drop_generator is None:
+            scores = torch.rand(B, N, device=tokens.device)
+        else:
+            scores = torch.rand(
+                B, N, device=tokens.device, generator=self.drop_generator
+            )
         perm = scores.argsort(dim=1)[:, :num_keep]
         perm, _ = perm.sort(dim=1)
         kept_tokens = torch.gather(tokens, 1, perm.unsqueeze(-1).expand(-1, -1, D))
@@ -179,7 +205,10 @@ class LeVJEPAEncoder(nn.Module):
         attn_mask = self._block_causal_mask(kept_coords[..., 0])
 
         for block in self.blocks:
-            x = block(x, attn_mask=attn_mask, rotary=(cos, sin))
+            if self.grad_checkpoint and torch.is_grad_enabled():
+                x = checkpoint(block, x, attn_mask=attn_mask, rotary=(cos, sin), use_reentrant=False)
+            else:
+                x = block(x, attn_mask=attn_mask, rotary=(cos, sin))
         return self.final_norm(x)
 
     def forward_cls(

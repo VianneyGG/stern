@@ -17,14 +17,23 @@ drop_path_rate: 0.0   # stochastic depth, linearly scaled across blocks; 0.0 = o
 # --- block-internals ablation axes (all optional; defaults reproduce today's architecture) ---
 weight_init: trunc_normal    # trunc_normal | normal | xavier_uniform | kaiming_uniform | cutting_skip
 weight_init_std: 0.02        # for Gaussian-like initialisations
-weight_init_alpha: 0.1       # Cutting-the-Skip mimetic logits: alpha * Z + beta * I
-weight_init_beta: 5.0        # paper recommended diagonal-dominant setting
-weight_init_c: 0.5           # V/O scaling constant used in the SVD-based value/output init
+# Cutting-the-Skip (arxiv 2510.00345) attention init, only used when weight_init:
+# cutting_skip. Not yet the default here: the paper's stabilisation claim is for
+# SKIPLESS transformers (see BlockConfig.use_skip); with skip connections kept
+# (our case), measurement showed ~3.8x weaker encoder gradient at init vs
+# trunc_normal (docs/research -- Cutting-the-Skip validation, 2026-09-10), so
+# this is an ablation axis to test, not a default to ship. Values below are the
+# paper's ViT-S/self-supervised setting (the closest match to this arm).
+weight_init_alpha: 1.8       # mimetic logits: alpha * Z + beta * I
+weight_init_beta: 1.0
+weight_init_c: 3.0           # V/O scaling constant used in the SVD-based value/output init
 norm_type: layernorm       # layernorm | rmsnorm | centerednorm
 mlp_type: gelu              # gelu | swiglu
 qk_norm: false               # L2-normalise Q/K before the attention softmax
 layer_scale_init: null       # null = off; float (e.g. 1e-5) = LayerScale init value
 num_registers: 0             # extra learnable tokens (Darcet et al. 2023), encoder-internal only
+layernorm_scaling: false     # scale block l's pre-norm outputs by 1/sqrt(l) (arXiv 2502.05795)
+embed_norm: false            # LayerNorm on patch tokens before pos_embed
 # --- SSL pretraining (Stage 1) ---
 decoder_depth: 4
 decoder_embed_dim: 256

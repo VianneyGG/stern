@@ -1,0 +1,38 @@
+# @package _global_
+#
+# Smoke test for the "Leaner Transformers: More Heads, Less Depth" (arXiv
+# 2505.20802v1) architecture shift -- 1 node, no merge, frozen local-only
+# shard set (node007, see shard_assignments_leaner-smoke.json). Purpose is a
+# real forward/backward loss and gradient-norm reading at this geometry, not
+# a converged model. weight_init stays at the default (trunc_normal) so this
+# isolates the architecture change from the separate cutting_skip ablation.
+
+defaults:
+  - override /train: ssl
+
+experiment:
+  name: videomae_leaner_smoke
+  description: "1-node smoke test of depth=7/num_heads=16/mlp_ratio=2.0 against a real training step."
+  stage: pretrain
+
+model:
+  depth: 7
+  num_heads: 16
+  mlp_ratio: 2.0
+  embed_dim: 768
+
+mesh:
+  rounds: 1
+  steps_per_round: 20
+  merge: false
+  sync_timeout_s: 600.0
+  subnet: "/254"
+
+train:
+  accum_steps: 1
+  weight_decay: 0.05
+  base_lr: 1.5e-4
+  lr_mult: 1.0
+  warmup_epochs: 0
+  grad_clip: 1.0
+  amp: bf16

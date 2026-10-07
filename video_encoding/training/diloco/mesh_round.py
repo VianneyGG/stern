@@ -26,6 +26,7 @@ Each round:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -44,7 +45,17 @@ from video_encoding.data.mesh_shard_dataset import MeshShardIterableDataset
 from video_encoding.mesh.assignment import read_my_shards
 from video_encoding.mesh.shard_map import load_shard_map
 from video_encoding.models.levjepa.encoder import LeVJEPAEncoder
+from video_encoding.models.levjepa.losses import (
+    SigregOptions,
+    _no_tf32,
+    invariance_loss,
+    sample_directions,
+    sigreg_from_sums,
+    sigreg_sums,
+    view_directions,
+)
 from video_encoding.models.levjepa.projector import Projector
+from video_encoding.models.levjepa.views import derive_seed
 from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
 from video_encoding.models.videomaev2.masking import build_masker
 from video_encoding.mesh.topology import NODE_SUBNETS
@@ -56,6 +67,11 @@ from video_encoding.mesh.pacing import steps_for_budget, update_rate_ema
 from video_encoding.mesh.pending_files import pending_filename
 from video_encoding.mesh.quantize import quantize_with_error_feedback
 from video_encoding.training.pretrain import _scaled_lr, _train_epoch_ssl
+from video_encoding.training.pretrain_levjepa import (
+    LeVJEPAViewIterableDataset,
+    _levjepa_embed,
+    _levjepa_step,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +88,9 @@ _SYNC_POLL_INTERVAL_S = 5.0
 # accum_steps trades wall-clock for peak VRAM without changing the interface
 # train_one_round/evaluate_val_loss were specified with.
 _MESH_BATCH_SIZE = 1
+# LeVJEPA validation batch: SIGReg is a batch statistic, so scoring one clip
+# at a time (the VideoMAE convention above) would make val loss meaningless.
+_LEVJEPA_VAL_BATCH_SIZE = 16
 
 # Keys present in the full round payload (checkpoint.base_payload()) that are
 # dropped before the payload is pushed to the shared NFS pending/ dir.
@@ -308,6 +327,35 @@ class _LeVJEPAPretrainModule(torch.nn.Module):
         )
 
 
+def _sigreg_options(cfg: DictConfig) -> SigregOptions:
+    """model.sigreg_seed / sigreg_orthogonal / sigreg_moment_weight and
+    train.sigreg_pool; all absent -> the original SIGReg estimator."""
+    seed = cfg.model.get("sigreg_seed", None)
+    return SigregOptions(
+        seed=None if seed is None else int(seed),
+        orthogonal=bool(cfg.model.get("sigreg_orthogonal", False)),
+        moment_weight=float(cfg.model.get("sigreg_moment_weight", 0.0)),
+        pool=bool(cfg.train.get("sigreg_pool", False)),
+    )
+
+
+def _maybe_compile_levjepa_encoder(model: torch.nn.Module, cfg: DictConfig) -> None:
+    """train.levjepa_compile: compile the LeVJEPA encoder's forward_cls in place.
+
+    train.compile wraps the outer module, which _train_epoch_levjepa bypasses
+    (it calls core.encoder.forward_cls), so it is a no-op for LeVJEPA. The
+    compiled method is an instance attribute: state_dict keys are unchanged
+    and it survives every load_state_dict.
+    """
+    core = ckpt_io.unwrap(model)
+    if not bool(cfg.train.get("levjepa_compile", False)) or not isinstance(
+        core, _LeVJEPAPretrainModule
+    ):
+        return
+    mode = str(cfg.train.get("compile_mode", "default"))
+    core.encoder.forward_cls = torch.compile(core.encoder.forward_cls, mode=mode)
+
+
 def _build_pretrain_model(cfg: DictConfig, *, device: torch.device) -> torch.nn.Module:
     """Dispatch model construction on `cfg.model.encoder`.
 
@@ -380,6 +428,7 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     step_ceil = int(float(cfg.mesh.get("step_ceil_frac", 2.0)) * steps_per_round)
     rate_ema: float | None = None
 
+    encoder_kind = str(cfg.model.get("encoder", "videomae"))
     num_frames = int(cfg.model.num_frames)
     image_size = int(cfg.model.image_size)
     overlap = float(cfg.preprocess.window.overlap)
@@ -400,6 +449,7 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         frame_stride=frame_stride,
         augment=augment,
         seed=int(cfg.train.get("seed", 42)),
+        raw_frames=(encoder_kind == "levjepa"),
     )
 
     # Val shards are replicated in full to every node under mesh_root/val/
@@ -418,7 +468,54 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         image_size=image_size,
         overlap=overlap,
         frame_stride=frame_stride,
+        raw_frames=(encoder_kind == "levjepa"),
     )
+
+    # Opt-in (train.rng_split): views, val views and token drop each get a
+    # private generator, so an arm that changes model init (or any other
+    # global-RNG consumer) still sees the control's exact views and masks.
+    rng_split = bool(cfg.train.get("rng_split", False))
+    train_seed = int(cfg.train.get("seed", 42))
+    init_seed = cfg.model.get("init_seed", None)
+    if init_seed is not None and not rng_split:
+        raise ValueError(
+            "model.init_seed without train.rng_split=true would also reseed "
+            "views and token drop; set +train.rng_split=true"
+        )
+    if rng_split and encoder_kind != "levjepa":
+        # Views and token drop are only split on the LeVJEPA path; accepting
+        # the flag elsewhere would silently isolate nothing.
+        raise ValueError("train.rng_split is only implemented for model.encoder=levjepa")
+    if rng_split and cfg.model.get("sigreg_seed", None) is None:
+        # Unseeded SIGReg directions come from the global RNG, whose state
+        # after model build differs between init arms.
+        raise ValueError("train.rng_split=true requires +model.sigreg_seed")
+    if rng_split and bool(cfg.train.get("levjepa_compile", False)):
+        # The private drop generator fails inductor codegen once forward_cls
+        # recompiles with a dynamic batch dim (GPU, torch 2.11).
+        raise ValueError("train.rng_split is incompatible with train.levjepa_compile")
+
+    if encoder_kind == "levjepa":
+        # LeVJEPAViewIterableDataset wraps the raw-frames stream and builds
+        # the (global_view, local_views, crop_boxes) tuple per clip -- the
+        # same view-construction _levjepa_step expects, mirroring the
+        # single-node pretrain_levjepa.py path.
+        train_dataset = LeVJEPAViewIterableDataset(
+            train_dataset,
+            num_local=int(cfg.model.get("num_local_views", 4)),
+            global_size=image_size,
+            local_size=int(cfg.model.get("local_image_size", 96)),
+            view_seed=train_seed if rng_split else None,
+        )
+        # Val never calls set_round, so with rng_split every val pass (every
+        # round, every arm sharing train.seed) scores the same views.
+        val_dataset = LeVJEPAViewIterableDataset(
+            val_dataset,
+            num_local=int(cfg.model.get("num_local_views", 4)),
+            global_size=image_size,
+            local_size=int(cfg.model.get("local_image_size", 96)),
+            view_seed=derive_seed(train_seed, "val") if rng_split else None,
+        )
 
     # Production never seeds torch before this function runs (the only
     # manual_seed call in the whole training path is pretrain.py's Stage-2
@@ -427,14 +524,19 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     # to be in -- making cold-start runs statistically incomparable to each
     # other. Reseed from cfg.train.seed here, right before the first RNG
     # consumer, so two cold starts with the same cfg are reproducible.
-    torch.manual_seed(int(cfg.train.get("seed", 42)))
+    torch.manual_seed(train_seed if init_seed is None else int(init_seed))
     model = _build_pretrain_model(cfg, device=device)
     # No DDP on this path (single-GPU worker, see module docstring), so
     # compile happens directly on the raw model -- no wrap_ddp ordering to
     # worry about. Compiled once here; surviving every later master.pt
     # reload since load_state_dict mutates parameters in place.
     model = maybe_compile(model, cfg)
+    _maybe_compile_levjepa_encoder(model, cfg)
     amp = str(cfg.train.get("amp", "off")).lower()
+    if bool(cfg.train.get("tf32", False)) and device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    sigreg_opts = _sigreg_options(cfg)
     accum_steps = int(cfg.train.get("accum_steps", 1))
     grad_clip = float(cfg.train.get("grad_clip", 0.0))
     micro_batch_size = int(cfg.mesh.get("micro_batch_size", _MESH_BATCH_SIZE))
@@ -446,7 +548,15 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     # its own variable (not inlined into the AdamW call) so it can also be
     # reported alongside per-round metrics. It is the schedule's *peak*: the
     # per-round value is set from mesh_round_lr below, before each round runs.
-    peak_lr = _scaled_lr(cfg, world_size=1, local_batch=micro_batch_size)
+    # LeVJEPA's train config (conf/train/levjepa.yaml) has no base_lr/
+    # learning_rate linear-scaling-rule fields (it uses a flat `lr`, same as
+    # the single-node pretrain_levjepa.py path) -- _scaled_lr would raise
+    # looking for `cfg.train.learning_rate`.
+    peak_lr = (
+        float(cfg.train.lr)
+        if encoder_kind == "levjepa"
+        else _scaled_lr(cfg, world_size=1, local_batch=micro_batch_size)
+    )
     lr_warmup_frac = float(cfg.mesh.get("lr_warmup_frac", 0.05))
     lr_min = float(cfg.mesh.get("lr_min", 1e-5))
     optimizer = torch.optim.AdamW(
@@ -455,7 +565,10 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         betas=(0.9, 0.95),
         weight_decay=float(cfg.train.get("weight_decay", 0.0)),
     )
-    masker = build_masker(cfg.model)
+    # build_masker reads cfg.model.mask_ratio, which levjepa_base.yaml has no
+    # field for -- masker is unused on the LeVJEPA path anyway (train_one_
+    # round/evaluate_val_loss dispatch to _levjepa_step instead).
+    masker = build_masker(cfg.model) if encoder_kind != "levjepa" else None
 
     # Eval/checkpoint-only Polyak average of the weights (see WeightEMA
     # docstring) -- never fed into the trained model or the pushed
@@ -562,6 +675,10 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         # so max_steps=steps_per_round truncated at the identical windows
         # every round regardless of round_num.
         train_dataset.set_round(round_num)
+        if rng_split and encoder_kind == "levjepa":
+            ckpt_io.unwrap(model).encoder.reseed_drop(
+                derive_seed(train_seed, "drop", round_num)
+            )
         # rate_ema is None until a round has actually been timed, so the first
         # round this process runs is always the calibration round at the
         # configured step count -- there is nothing to pace against yet.
@@ -595,6 +712,9 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
                 else None
             ),
             ema=ema,
+            sigreg_lambda=float(cfg.model.get("sigreg_lambda", 0.02)),
+            sigreg_directions=int(cfg.model.get("sigreg_directions", 1024)),
+            sigreg_opts=sigreg_opts,
         )
         if train_stats.get("abandoned"):
             # The pool merged this round without us. Drop the partial round
@@ -658,7 +778,16 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         if observed_rate > 0:
             rate_ema = update_rate_ema(rate_ema, observed_rate)
 
-        val_loss = evaluate_val_loss(model, val_dataset, device, masker, amp)
+        val_loss = evaluate_val_loss(
+            model,
+            val_dataset,
+            device,
+            masker,
+            amp,
+            sigreg_lambda=float(cfg.model.get("sigreg_lambda", 0.02)),
+            sigreg_directions=int(cfg.model.get("sigreg_directions", 1024)),
+            sigreg_opts=sigreg_opts,
+        )
 
         val_loss_ema: float | None = None
         if ema is not None:
@@ -669,7 +798,16 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             core = ckpt_io.unwrap(model)
             live_sd = {k: v.detach().clone() for k, v in core.state_dict().items()}
             core.load_state_dict(ema.state_dict(), strict=False)
-            val_loss_ema = evaluate_val_loss(model, val_dataset, device, masker, amp)
+            val_loss_ema = evaluate_val_loss(
+                model,
+                val_dataset,
+                device,
+                masker,
+                amp,
+                sigreg_lambda=float(cfg.model.get("sigreg_lambda", 0.02)),
+                sigreg_directions=int(cfg.model.get("sigreg_directions", 1024)),
+                sigreg_opts=sigreg_opts,
+            )
             core.load_state_dict(live_sd, strict=False)
 
         if train_stats["samples"] == 0:
@@ -779,12 +917,361 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     }
 
 
+def _train_epoch_levjepa(
+    model,
+    loader,
+    optimizer,
+    device,
+    *,
+    accum_steps: int = 1,
+    grad_clip: float = 0.0,
+    max_steps: int = 0,
+    amp: str = "off",
+    progress_desc: str | None = None,
+    abandon_check: Callable[[], bool] | None = None,
+    abandon_check_every: int = 50,
+    ema: WeightEMA | None = None,
+    sigreg_lambda: float,
+    sigreg_directions: int,
+    sigreg_opts: SigregOptions | None = None,
+    sigreg_key: tuple[int, ...] = (),
+) -> dict:
+    """LeVJEPA counterpart to `_train_epoch_ssl` for one mesh round: same
+    accum/grad-clip/abandon-check/timing contract and return-dict shape, but
+    the per-batch forward is `_levjepa_step` (multi-view + shared-BN
+    projector + invariance/SIGReg loss) instead of `masker` + reconstruction
+    loss -- the two objectives' training steps differ too much to share a
+    per-batch body without an if/else that would obscure both.
+    """
+    model.train()
+    core = ckpt_io.unwrap(model)
+    is_cuda = device.type == "cuda"
+    autocast_enabled = amp in ("bf16", "fp16")
+    amp_dtype = torch.bfloat16 if amp == "bf16" else torch.float16
+    if is_cuda:
+        torch.cuda.reset_peak_memory_stats(device)
+    loss_sum = torch.zeros((), device=device)
+    count = 0
+    optimizer.zero_grad(set_to_none=True)
+    try:
+        num_steps = len(loader)
+    except TypeError:
+        num_steps = None
+    if max_steps > 0:
+        num_steps = max_steps if num_steps is None else min(num_steps, max_steps)
+
+    t_start: float | None = None
+    timing_warmup_steps = 10
+    timed_samples = 0
+    timed_steps = 0
+    executed_steps = 0
+    nan_steps = 0
+    abandoned = False
+    pool = sigreg_opts is not None and sigreg_opts.pool
+    window: list = []
+
+    def run_window(step: int) -> None:
+        nonlocal window, loss_sum, count, nan_steps
+        window_n = sum(b[0].shape[0] for b in window)
+        loss, components = _levjepa_pooled_window(
+            window,
+            core.encoder,
+            core.projector,
+            device,
+            lam=sigreg_lambda,
+            num_directions=sigreg_directions,
+            opts=sigreg_opts,
+            # Per optimizer step, so accum_steps=1 matches the unpooled
+            # path's per-step key.
+            key=(*sigreg_key, step // accum_steps),
+            accum_steps=accum_steps,
+            autocast_ctx=lambda: torch.autocast(
+                device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled
+            ),
+        )
+        window = []
+        if torch.isfinite(loss):
+            loss_sum += loss.detach() * window_n
+            count += window_n
+        else:
+            # Some micro-batches may already have backpropagated: drop the
+            # whole window rather than step on part of it.
+            nan_steps += 1
+            optimizer.zero_grad(set_to_none=True)
+            _warn_nonfinite(step, components, nan_steps)
+
+    iterable = loader
+    if progress_desc is not None:
+        from tqdm import tqdm
+
+        iterable = tqdm(loader, desc=progress_desc, total=num_steps)
+
+    for step, batch in enumerate(iterable):
+        if step == timing_warmup_steps:
+            if is_cuda:
+                torch.cuda.synchronize(device)
+            t_start = time.perf_counter()
+
+        batch_size = batch[0].shape[0]
+
+        is_boundary = (step + 1) % accum_steps == 0 or (
+            num_steps is not None and step + 1 == num_steps
+        )
+        no_sync_ctx = (
+            model.no_sync()
+            if not is_boundary and hasattr(model, "no_sync")
+            else contextlib.nullcontext()
+        )
+        if pool:
+            window.append(batch)
+            if is_boundary:
+                run_window(step)
+        else:
+            with no_sync_ctx:
+                with torch.autocast(
+                    device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled
+                ):
+                    loss, _components = _levjepa_step(
+                        batch,
+                        core.encoder,
+                        core.projector,
+                        device,
+                        sigreg_lambda=sigreg_lambda,
+                        sigreg_directions=sigreg_directions,
+                        sigreg_opts=sigreg_opts,
+                        sigreg_key=(*sigreg_key, step),
+                    )
+                    loss = loss / accum_steps
+                if not torch.isfinite(loss):
+                    nan_steps += 1
+                    _warn_nonfinite(step, _components, nan_steps)
+                else:
+                    loss.backward()
+
+            if torch.isfinite(loss):
+                loss_sum += loss.detach() * (accum_steps * batch_size)
+                count += batch_size
+        executed_steps += 1
+        if t_start is not None:
+            timed_samples += batch_size
+            timed_steps += 1
+
+        if is_boundary:
+            if grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if ema is not None:
+                ema.update(model)
+
+        if (
+            abandon_check is not None
+            and is_boundary
+            and executed_steps % abandon_check_every == 0
+            and abandon_check()
+        ):
+            abandoned = True
+            break
+
+        if max_steps > 0 and executed_steps >= max_steps:
+            break
+
+    if window:
+        # Loader ran out before a boundary: count and backprop the partial
+        # window like the unpooled path does its trailing micro-batches.
+        run_window(executed_steps - 1)
+
+    if is_cuda:
+        torch.cuda.synchronize(device)
+    elapsed = (time.perf_counter() - t_start) if t_start is not None else 0.0
+
+    samples_per_s = timed_samples / elapsed if elapsed > 0 else 0.0
+    step_time_ms = (elapsed / timed_steps * 1000.0) if timed_steps > 0 else 0.0
+    peak_vram_gb = torch.cuda.max_memory_allocated(device) / 1e9 if is_cuda else 0.0
+    loss_val = float(loss_sum.item()) / count if count > 0 else float("nan")
+    return {
+        "loss": loss_val,
+        "samples_per_s_per_gpu": samples_per_s,
+        "step_time_ms_mean": step_time_ms,
+        "peak_vram_gb": peak_vram_gb,
+        "steps": executed_steps,
+        "samples": count,
+        "nan_steps": nan_steps,
+        "abandoned": abandoned,
+    }
+
+
+def _warn_nonfinite(step: int, components: dict, nan_steps: int) -> None:
+    # Once per round: enough to tell which term (and whether z itself) blew
+    # up, without a line per skipped micro-batch.
+    if nan_steps == 1:
+        logger.warning(
+            "levjepa step %d: non-finite loss, skipped (%s)",
+            step,
+            ", ".join(f"{k}={float(v):.4g}" for k, v in components.items()),
+        )
+
+
+def _view_sums(views: torch.Tensor, dirs: torch.Tensor) -> dict[str, torch.Tensor]:
+    # views (B, V+1, K), dirs (V+1, K, M) -> sigreg_sums stacked over views.
+    per_view = [sigreg_sums(views[:, v], dirs[v]) for v in range(views.shape[1])]
+    return {k: torch.stack([s[k] for s in per_view]) for k in per_view[0]}
+
+
+def _levjepa_pooled_window(
+    batches: list,
+    encoder: LeVJEPAEncoder,
+    projector: Projector,
+    device: torch.device,
+    *,
+    lam: float,
+    num_directions: int,
+    opts: SigregOptions,
+    key: tuple[int, ...],
+    accum_steps: int,
+    autocast_ctx: Callable[[], contextlib.AbstractContextManager],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """One optimizer step's micro-batches with SIGReg on their union
+    (train.sigreg_pool); backpropagates and returns the window's loss.
+
+    SIGReg depends on the batch only through per-sample sums (ECF real/imag,
+    projection moments), so: pass 1 (no grad) adds up every micro-batch's
+    sums under one shared direction set per view and differentiates the
+    pooled SIGReg w.r.t. those sums; pass 2 re-forwards each micro-batch with
+    grad and backprops invariance / accum_steps + <dSIGReg/dsums, its sums>
+    (accum_steps, not len(batches): a short last window weighs its invariance
+    like the unpooled path does)
+    -- the exact pooled gradient without holding every micro-batch's graph.
+    CPU+CUDA RNG is replayed per micro-batch so in-model randomness matches
+    across passes.
+
+    Known approximation (flagged, not changed): the projector's BatchNorm
+    normalises with each micro-batch's statistics, not the pooled batch's,
+    and its running stats update in both passes.
+    """
+    is_cuda = device.type == "cuda"
+    states, total, n, dirs = [], None, 0, None
+    with torch.no_grad():
+        for batch in batches:
+            states.append(
+                (
+                    torch.get_rng_state(),
+                    torch.cuda.get_rng_state(device) if is_cuda else None,
+                )
+            )
+            with autocast_ctx():
+                z_global, z_locals = _levjepa_embed(batch, encoder, projector, device)
+            with torch.autocast(device_type=device.type, enabled=False), _no_tf32():
+                views = torch.cat([z_global.unsqueeze(1), z_locals], dim=1).float()
+                if dirs is None:
+                    V1, K = views.shape[1], views.shape[2]
+                    dirs = view_directions(
+                        opts, key, V1, K, num_directions, device
+                    ) or [
+                        sample_directions(K, num_directions, device) for _ in range(V1)
+                    ]
+                    dirs = torch.stack(dirs)
+                sums = _view_sums(views, dirs)
+            total = sums if total is None else {k: total[k] + sums[k] for k in sums}
+            n += views.shape[0]
+
+    leaves = {k: v.detach().requires_grad_() for k, v in total.items()}
+    with torch.autocast(device_type=device.type, enabled=False), _no_tf32():
+        sigreg = sigreg_from_sums(leaves, n, moment_weight=opts.moment_weight)
+    grads = dict(
+        zip(
+            leaves,
+            torch.autograd.grad(lam * sigreg, list(leaves.values()), allow_unused=True),
+        )
+    )
+    inv_sum = torch.zeros((), device=device)
+    for batch, (cpu_state, cuda_state) in zip(batches, states):
+        torch.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state(cuda_state, device)
+        with autocast_ctx():
+            z_global, z_locals = _levjepa_embed(batch, encoder, projector, device)
+        with torch.autocast(device_type=device.type, enabled=False), _no_tf32():
+            z_global, z_locals = z_global.float(), z_locals.float()
+            inv = invariance_loss(z_global, z_locals)
+            sums = _view_sums(torch.cat([z_global.unsqueeze(1), z_locals], dim=1), dirs)
+            surrogate = (1 - lam) * inv / accum_steps + sum(
+                (g * sums[k]).sum() for k, g in grads.items() if g is not None
+            )
+        if torch.isfinite(surrogate):
+            surrogate.backward()
+        inv_sum += inv.detach()
+    inv_mean = inv_sum / len(batches)
+    sigreg = sigreg.detach()
+    return (1 - lam) * inv_mean + lam * sigreg, {
+        "invariance": inv_mean,
+        "sigreg": sigreg,
+    }
+
+
+def _evaluate_val_loss_levjepa(
+    model,
+    val_dataset,
+    device,
+    amp: str,
+    *,
+    max_windows: int = 2000,
+    sigreg_lambda: float,
+    sigreg_directions: int,
+    sigreg_opts: SigregOptions | None = None,
+) -> float:
+    """LeVJEPA counterpart to evaluate_val_loss: same no-grad/max_windows/
+    model.train()-on-exit contract, using _levjepa_step instead of masker +
+    reconstruction loss."""
+    model.eval()
+    core = ckpt_io.unwrap(model)
+    autocast_enabled = amp in ("bf16", "fp16")
+    amp_dtype = torch.bfloat16 if amp == "bf16" else torch.float16
+
+    loader = DataLoader(val_dataset, batch_size=_LEVJEPA_VAL_BATCH_SIZE, num_workers=0)
+    loss_sum = torch.zeros((), device=device)
+    finite_count = 0
+    windows_seen = 0
+    try:
+        with torch.no_grad():
+            for i, batch in enumerate(loader):
+                if windows_seen >= max_windows:
+                    break
+                batch_size = batch[0].shape[0]
+                if batch_size < 2:  # 1-clip tail: _levjepa_step rejects it
+                    break
+                windows_seen += batch_size
+
+                with torch.autocast(
+                    device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled
+                ):
+                    loss, _components = _levjepa_step(
+                        batch,
+                        core.encoder,
+                        core.projector,
+                        device,
+                        sigreg_lambda=sigreg_lambda,
+                        sigreg_directions=sigreg_directions,
+                        # Round-independent key: with a seed, every round's
+                        # val pass sees the same directions per batch.
+                        sigreg_opts=sigreg_opts,
+                        sigreg_key=(-1, i),
+                    )
+                if torch.isfinite(loss):
+                    loss_sum += loss.detach()
+                    finite_count += 1
+    finally:
+        model.train()
+
+    return float(loss_sum.item()) / finite_count if finite_count > 0 else float("nan")
+
+
 def train_one_round(
     model,
     optimizer,
     device,
     masker,
-    dataset: MeshShardIterableDataset,
+    dataset,
     *,
     steps_per_round: int,
     amp: str,
@@ -794,16 +1281,45 @@ def train_one_round(
     micro_batch_size: int = _MESH_BATCH_SIZE,
     abandon_check: Callable[[], bool] | None = None,
     ema: WeightEMA | None = None,
+    sigreg_lambda: float | None = None,
+    sigreg_directions: int | None = None,
+    sigreg_opts: SigregOptions | None = None,
 ) -> dict:
-    """Thin wrapper around _train_epoch_ssl for one mesh round.
+    """Thin wrapper around _train_epoch_ssl (VideoMAE) / _train_epoch_levjepa
+    (LeVJEPA) for one mesh round, dispatched on the unwrapped model's type.
 
     Builds a DataLoader over `dataset` (num_workers=0 -- MeshShardIterableDataset's
     own prefetch thread is the concurrency; a second DataLoader worker layer
-    would race it for the same cache dir), calls _train_epoch_ssl with
-    max_steps=steps_per_round and progress_desc=f"round {round_num}", and
-    returns its stats dict unchanged.
+    would race it for the same cache dir), calls the matching per-batch loop
+    with max_steps=steps_per_round and progress_desc=f"round {round_num}",
+    and returns its stats dict unchanged.
     """
-    loader = DataLoader(dataset, batch_size=micro_batch_size, num_workers=0)
+    core = ckpt_io.unwrap(model)
+    is_levjepa = isinstance(core, _LeVJEPAPretrainModule)
+    # drop_last for LeVJEPA: a 1-clip tail batch would trip _levjepa_step's guard.
+    loader = DataLoader(
+        dataset, batch_size=micro_batch_size, num_workers=0, drop_last=is_levjepa
+    )
+    if is_levjepa:
+        return _train_epoch_levjepa(
+            model,
+            loader,
+            optimizer,
+            device,
+            accum_steps=accum_steps,
+            grad_clip=grad_clip,
+            max_steps=steps_per_round,
+            amp=amp,
+            progress_desc=f"round {round_num}",
+            abandon_check=abandon_check,
+            ema=ema,
+            sigreg_lambda=float(sigreg_lambda if sigreg_lambda is not None else 0.02),
+            sigreg_directions=int(
+                sigreg_directions if sigreg_directions is not None else 1024
+            ),
+            sigreg_opts=sigreg_opts,
+            sigreg_key=(round_num,),
+        )
     return _train_epoch_ssl(
         model,
         loader,
@@ -822,23 +1338,41 @@ def train_one_round(
 
 def evaluate_val_loss(
     model,
-    val_dataset: MeshShardIterableDataset,
+    val_dataset,
     device,
     masker,
     amp: str,
     *,
     max_windows: int = 2000,
+    sigreg_lambda: float | None = None,
+    sigreg_directions: int | None = None,
+    sigreg_opts: SigregOptions | None = None,
 ) -> float:
     """No-grad pass over up to max_windows windows from val_dataset.
 
-    Returns mean reconstruction loss. Per the design spec, per-round val
-    runs on a fixed ~2000-window subsample, not the full 7GB val set.
-    Leaves `model.training is True` on return (matches train_one_round's
-    expectation for the next round), regardless of whether this function
-    raises.
+    Returns mean reconstruction loss (VideoMAE) or mean levjepa_loss
+    (LeVJEPA), dispatched on the unwrapped model's type. Per the design
+    spec, per-round val runs on a fixed ~2000-window subsample, not the
+    full 7GB val set. Leaves `model.training is True` on return (matches
+    train_one_round's expectation for the next round), regardless of
+    whether this function raises.
     """
-    model.eval()
     core = ckpt_io.unwrap(model)
+    if isinstance(core, _LeVJEPAPretrainModule):
+        return _evaluate_val_loss_levjepa(
+            model,
+            val_dataset,
+            device,
+            amp,
+            max_windows=max_windows,
+            sigreg_lambda=float(sigreg_lambda if sigreg_lambda is not None else 0.02),
+            sigreg_directions=int(
+                sigreg_directions if sigreg_directions is not None else 1024
+            ),
+            sigreg_opts=sigreg_opts,
+        )
+
+    model.eval()
     token_grid = core.encoder.token_grid
     autocast_enabled = amp in ("bf16", "fp16")
     amp_dtype = torch.bfloat16 if amp == "bf16" else torch.float16

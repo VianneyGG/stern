@@ -40,6 +40,9 @@ if (( ${#NODES[@]} > MAX_MESH_NODES )); then
   exit 1
 fi
 
+# Class-hours gate (class_hours.py): refuse to launch anything that would
+# run Mon-Fri 08:00-20:00 Europe/Paris. No override.
+python3 "$(dirname "${BASH_SOURCE[0]}")/class_hours.py" || exit 1
 SBATCH_SCRIPT="video_encoding/slurm/mesh_train.sbatch"
 
 # Deliberately small grid -- each cell is a full short run (18 cells total).

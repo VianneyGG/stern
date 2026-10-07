@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -304,6 +305,29 @@ def test_probe_by_depth_every_layer_has_both_arms(tmp_path):
     for checkpoint_value, control_value in per_layer.values():
         assert isinstance(checkpoint_value, MetricValue)
         assert isinstance(control_value, MetricValue)
+
+
+def test_probe_by_depth_runs_on_levjepa_bundles(tmp_path):
+    """LeVJEPA tokenizes per frame and carries a cls token: the probe must read
+    its patch tokens at every requested depth, for arm and control alike."""
+    from video_encoding.scripts._diag_common import random_init_bundle
+
+    manifest_path = _write_probe_manifest(tmp_path, n_identities=10, n_frames=40)
+    cfg = _tiny_model_cfg(encoder="levjepa", depth=3, drop_ratio=0.5)
+    torch.manual_seed(0)
+    bundle = random_init_bundle(cfg)
+    torch.manual_seed(1)
+    control = random_init_bundle(cfg)
+
+    per_layer, final_block_reference = probe_by_depth(
+        bundle, control, manifest_path, layers=[1, 2], n_seeds=3, epochs=1
+    )
+
+    assert set(per_layer.keys()) == {1, 2}
+    for checkpoint_value, control_value in per_layer.values():
+        assert math.isfinite(checkpoint_value.mean)
+        assert math.isfinite(control_value.mean)
+    assert math.isfinite(final_block_reference.mean)
 
 
 def test_probe_by_depth_final_block_reference_present(tmp_path):

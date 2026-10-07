@@ -27,3 +27,4 @@ projector_hidden: 2048
 embed_dim_k: 256          # K, the SIGReg/invariance embedding space dim
 polyak_decay: 0.9999      # eval-only shadow weights, no role in the training objective
 polyak_update_every: 32   # steps
+grad_checkpoint: false    # recompute blocks in backward; exact (n1004 equiv test)

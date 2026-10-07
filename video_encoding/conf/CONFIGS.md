@@ -58,10 +58,18 @@ off it).
 
 ## `model/`
 
-One shared architecture (`videomae_base`) — Stage 1 (SSL) and Stage 2
-(probe/finetune) use the same `VideoMAEEncoder`, so there is nothing to
-select between; per-stage/per-experiment knobs live as fields on this one
-file, overridden per-experiment where needed.
+Two unrelated architectures, selected via `override /model: <name>`:
+
+- `videomae_base` (default) — Stage 1 (SSL) and Stage 2 (probe/finetune) use
+  the same `VideoMAEEncoder`, so there is nothing to select between within
+  this family; per-stage/per-experiment knobs live as fields on this one
+  file, overridden per-experiment where needed.
+- `levjepa_base` — a second, independent Stage 1 SSL objective
+  (`LeVJEPAEncoder` + SIGReg/invariance losses, `video_encoding/models/
+  levjepa/`), not a delta on `videomae_base`. Selected, as its
+  `levjepa_lean` variant, by `conf/experiment/levjepa_mesh_ssl.yaml`; its own `encoder:
+  levjepa` field is what `training/diloco/mesh_round.py`'s
+  `_build_pretrain_model` dispatches on for mesh runs.
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -78,7 +86,8 @@ file, overridden per-experiment where needed.
 | File | Used by | Notes |
 |---|---|---|
 | `default.yaml` | Stage 2 (`training/train.py`) | Adam, flat LR, CCC-loss batch sizing |
-| `ssl.yaml` | Stage 1 (`training/pretrain.py`) | AdamW, linear-scaling-rule LR (`base_lr`/`lr_mult`), warmup+cosine, throughput/VRAM instrumentation fields |
+| `ssl.yaml` | Stage 1 VideoMAEv2 (`training/pretrain.py`) | AdamW, linear-scaling-rule LR (`base_lr`/`lr_mult`), warmup+cosine, throughput/VRAM instrumentation fields |
+| `levjepa.yaml` | Stage 1 LeVJEPA (`training/pretrain_levjepa.py`) | AdamW, flat `lr` + `warmup_epochs` consumed by `training.pretrain._build_scheduler` (reused, not reimplemented), single-node only (no `ddp:` block) |
 
 Both share the checkpoint-hand-off fields (`default.yaml` only, since
 Stage 1 never loads a downstream checkpoint):
@@ -108,6 +117,7 @@ registry rewrite.
 | Name | Stage | Dataset (self-selected) | Purpose |
 |---|---|---|---|
 | `videomae_ssl_pretrain_voxmini` | `pretrain` | `voxmini` | Stage 1 MAE pretraining |
+| `levjepa_mesh_ssl` | `pretrain` | mesh shards | Stage 1 LeVJEPA SIGReg pretraining (DiLoCo mesh) |
 | `videomae_probe_veatic` | `va_finetune` | `veatic` | Stage 2 frozen-encoder probe, loads Stage 1's `best.pt` |
 | `videomae_va_finetune_afewva` | `va_finetune` | `afewva` | End-to-end from-scratch fine-tune, no freezing |
 | `videomae_va_finetune_veatic` | `va_finetune` | `veatic` | End-to-end from-scratch fine-tune, no freezing |

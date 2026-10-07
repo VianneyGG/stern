@@ -28,6 +28,9 @@ def script(tmp_path) -> Path:
     dest.parent.mkdir(parents=True)
     shutil.copy2(REAL_SCRIPT, dest)
     dest.chmod(0o755)
+    # The script calls its sibling class_hours.py before registering; stub it
+    # open so these tests run at any hour (test_class_hours.py covers closed).
+    (dest.parent / "class_hours.py").write_text("raise SystemExit(0)\n")
     # EXPERIMENT is validated against the config tree, so the mirror needs
     # one too -- names only, since the script never reads their contents.
     conf = tmp_path / "video_encoding" / "conf" / "experiment"

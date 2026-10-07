@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import torch
 import torchvision.transforms.v2.functional as TF
 
@@ -23,13 +25,26 @@ def _to_tchw_float(clip: torch.Tensor) -> torch.Tensor:
     return clip.permute(0, 3, 1, 2).float() / 255.0
 
 
+def derive_seed(*parts) -> int:
+    """Stable 63-bit seed from arbitrary parts, e.g. `(seed, "views", round)`.
+    Python's `hash()` is salted per process, so it cannot key a generator
+    that must agree across arms and relaunches."""
+    digest = hashlib.sha256(":".join(map(str, parts)).encode()).digest()
+    return int.from_bytes(digest[:8], "little") >> 1
+
+
 def build_views(
     clip: torch.Tensor,
     num_local: int = 4,
     global_size: int = 224,
     local_size: int = 96,
+    generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns `(global_view, local_views, crop_boxes)`.
+
+    `generator`: draw crops and jitter from it instead of the global RNG, so
+    views do not shift when something else (model init, token drop) changes
+    how much global randomness is consumed. None = global RNG, as before.
 
     `crop_boxes`: `(num_local, 4)`, fractional `(top, left, height, width)`
     of the original frame each local view was cropped from -- consumed by
@@ -45,13 +60,13 @@ def build_views(
     local_views = []
     crop_boxes = []
     for _ in range(num_local):
-        top, left, height, width = _random_crop_box(orig_h, orig_w)
+        top, left, height, width = _random_crop_box(orig_h, orig_w, generator)
         cropped = TF.resized_crop(
             frames, top, left, height, width, [local_size, local_size], antialias=True
         )
-        brightness = 0.6 + torch.rand(1).item() * 0.8
-        contrast = 0.6 + torch.rand(1).item() * 0.8
-        saturation = 0.6 + torch.rand(1).item() * 0.8
+        brightness = 0.6 + torch.rand(1, generator=generator).item() * 0.8
+        contrast = 0.6 + torch.rand(1, generator=generator).item() * 0.8
+        saturation = 0.6 + torch.rand(1, generator=generator).item() * 0.8
         cropped = TF.adjust_brightness(cropped, brightness)
         cropped = TF.adjust_contrast(cropped, contrast)
         cropped = TF.adjust_saturation(cropped, saturation)
@@ -67,12 +82,14 @@ def build_views(
     )
 
 
-def _random_crop_box(height: int, width: int) -> tuple[int, int, int, int]:
-    scale = 0.2 + torch.rand(1).item() * 0.5  # area fraction in [0.2, 0.7]
+def _random_crop_box(
+    height: int, width: int, generator: torch.Generator | None = None
+) -> tuple[int, int, int, int]:
+    scale = 0.2 + torch.rand(1, generator=generator).item() * 0.5  # area fraction in [0.2, 0.7]
     target_area = scale * height * width
-    aspect = 0.75 + torch.rand(1).item() * 0.5  # in [0.75, 1.25]
+    aspect = 0.75 + torch.rand(1, generator=generator).item() * 0.5  # in [0.75, 1.25]
     crop_h = min(height, max(1, int(round((target_area / aspect) ** 0.5))))
     crop_w = min(width, max(1, int(round((target_area * aspect) ** 0.5))))
-    top = torch.randint(0, height - crop_h + 1, (1,)).item()
-    left = torch.randint(0, width - crop_w + 1, (1,)).item()
+    top = torch.randint(0, height - crop_h + 1, (1,), generator=generator).item()
+    left = torch.randint(0, width - crop_w + 1, (1,), generator=generator).item()
     return top, left, crop_h, crop_w

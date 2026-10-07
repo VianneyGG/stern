@@ -25,6 +25,7 @@ from video_encoding.watcher.quota import collect_disk_usage_pct
 from video_encoding.watcher.quota_cleanup import remediate_quota_pressure
 from video_encoding.watcher.registry import load_registry
 from video_encoding.watcher.remediate import remediate_dead_job
+from video_encoding.scripts import class_hours
 from video_encoding.watcher.results import result_json_mtimes
 from video_encoding.watcher.squeue import load_squeue_snapshot
 from video_encoding.watcher.state import WatcherState, advance_backoff
@@ -100,6 +101,12 @@ def run_full_check(
         )
         record_escalation(state, flag.subject, now=now)
         actions.append(f"escalate {flag.subject} ({flag.kind}) -> {transcript_path}")
+
+    # During class hours (class_hours.py) neither resubmit nor escalate: the
+    # escalation agent may sbatch too. The flags recur next tick, so they are
+    # handled once launching is allowed again.
+    if class_hours.blocked(now) is not None:
+        dead_flags, stalled_flags = [], []
 
     for flag in dead_flags:
         job_state = state.job(flag.subject)

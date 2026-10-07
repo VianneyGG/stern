@@ -55,6 +55,20 @@ if [[ ! -d "${MESH_ROOT}" ]]; then
   exit 1
 fi
 
+# val/manifest.json has been observed missing at this exact instant even
+# though seed_mesh.py already wrote it (confirmed present on disk moments
+# later on the same node) -- an NFS/automount visibility race on freshly
+# seeded nodes, not missing data. Retry briefly instead of failing fast.
+_VAL_MANIFEST="${MESH_ROOT}/val/manifest.json"
+for _i in $(seq 1 10); do
+  [[ -f "${_VAL_MANIFEST}" ]] && break
+  sleep 3
+done
+if [[ ! -f "${_VAL_MANIFEST}" ]]; then
+  echo "ERROR: ${_VAL_MANIFEST} not found on $(hostname) after 30s -- run seed_mesh.py before submitting workers" >&2
+  exit 1
+fi
+
 # Node-local caches under /tmp, NOT the student home quota (~5 GB free): the
 # cu128 torch wheels uv installs are multi-GB. Mirrors train.sbatch.
 export UV_CACHE_DIR="/tmp/uv_cache_${SLURM_JOB_ID:-$$}"

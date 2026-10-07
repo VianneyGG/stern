@@ -1,0 +1,45 @@
+# @package _global_
+defaults:
+  - override /dataset: veatic
+
+# Ladder rung 4, candidate B (design.md "Rung 4 is two training runs, and the
+# better one wins"): end-to-end fine-tune from the best Stage-1 SSL checkpoint,
+# pinned explicitly rather than resolved from a "latest" path -- the same
+# reasoning `load_ladder_rung` uses to refuse a default-run fallback.
+#
+# `videomae_ssl_pretrain_voxmini/best.pt` -- this repo's previously-recorded
+# best Stage-1 SSL run, and what `videomae_probe_veatic.yaml` freezes for rung
+# 3's frozen-probe reading -- no longer exists on any cluster host (checked
+# node090/node063/node089/login-node 2026-09-15); almost certainly wiped in the
+# 2026-08-22 SallesInfo rebuild, same as VEATIC's own staging.
+#
+# No confirmed-good replacement exists either: the mesh sweep chain
+# (lev-fix16c and follow-ups, see memory/pretrain-diagnosis-goal.md) exists
+# specifically to diagnose whether pretraining is working at all, so nothing
+# in ~/stern_mesh/checkpoints/ carries a validated "best" label. Of the
+# ViT-B-geometry (depth=12, embed_dim=768) candidates actually present there,
+# `factorial100-mixed-per_frame-20260913v2` was picked as the most-recent
+# available option -- `pool-cars-best-120r-*` and `cars-real100r` are both
+# dangling symlinks (their target files no longer exist), and
+# `depth3-ablation-20260913v3` is geometry-incompatible (depth=3). Snapshotted
+# to a dedicated path (not the live mesh path, which a later round could
+# overwrite) 2026-09-15 12:28 UTC:
+#   cp ~/stern_mesh/checkpoints/factorial100-mixed-per_frame-20260913v2/master.pt \
+#      ~/stern_checkpoints_pinned/ssl_diag_rung4_stage1/best.pt
+# This pin is a caveat, not a validated ceiling: task 6.4 must report if this
+# candidate loses to the scratch candidate or to rungs 1-2, since an unvalidated
+# Stage-1 checkpoint is exactly the situation the ladder is designed to surface
+# rather than absorb.
+#
+# Differs from ssl_diag_rung4_scratch.yaml ONLY in pretrain_encoder_path.
+experiment:
+  name: ssl_diag_rung4_ssl_init
+  description: "Ladder rung 4 candidate B: end-to-end fine-tune from a pinned (unvalidated -- see comment above) Stage-1 SSL mesh checkpoint, trained on VEATIC's rung-4 fit-split manifest only."
+  stage: va_finetune
+
+dataset:
+  manifest_path: ${oc.env:VEATIC_ROOT,???}/manifest_rung4_fit.csv
+
+train:
+  pretrain_encoder_path: ${oc.env:HOME}/stern_checkpoints_pinned/ssl_diag_rung4_stage1/best.pt
+  freeze_backbone: false        # rung 4 is the end-to-end encoder, not a frozen probe

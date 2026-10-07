@@ -24,6 +24,7 @@ from omegaconf import OmegaConf
 from PIL import Image
 
 from video_encoding.mesh.pending_files import pending_filename
+from video_encoding.models.levjepa.encoder import LeVJEPAEncoder
 from video_encoding.models.videomaev2.encoder import VideoMAEEncoder
 from video_encoding.models.videomaev2.mae import VideoMAEForPreTraining
 from video_encoding.scripts._diag_common import (
@@ -676,6 +677,154 @@ def test_forward_with_hidden_states_returns_detached_tensors():
         state.numpy()
     # no_grad, never inference_mode: Plan 3 trains attentive probes on these.
     assert (hidden[-1] * torch.ones(1, requires_grad=True)).requires_grad
+
+
+# --- LeVJEPA encoders ----------------------------------------------------
+
+
+def _tiny_levjepa_cfg(**overrides):
+    cfg = {
+        "encoder": "levjepa",
+        "num_frames": 4,
+        "image_size": 32,
+        "in_channels": 3,
+        "patch_size": 16,
+        "embed_dim": 16,
+        "depth": 3,
+        "num_heads": 2,
+        "mlp_ratio": 2.0,
+        "dropout": 0.0,
+        "drop_path_rate": 0.0,
+        "drop_ratio": 0.5,
+        "projector_hidden": 32,
+        "embed_dim_k": 8,
+    }
+    cfg.update(overrides)
+    return OmegaConf.create(cfg)
+
+
+def write_levjepa_checkpoint(mesh_shared, run_id: str, model_cfg):
+    """Save the encoder+projector state dict the LeVJEPA mesh round writes."""
+    from video_encoding.training.diloco.mesh_round import _LeVJEPAPretrainModule
+
+    torch.manual_seed(0)
+    model = _LeVJEPAPretrainModule(model_cfg)
+    path = mesh_shared / "checkpoints" / run_id / "master.pt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model_state_dict": model.state_dict()}, path)
+    return model
+
+
+def test_random_init_bundle_builds_the_encoder_the_cfg_names():
+    bundle = random_init_bundle(_tiny_levjepa_cfg())
+
+    assert isinstance(bundle.encoder, LeVJEPAEncoder)
+    assert not bundle.encoder.training
+    assert isinstance(random_init_bundle(_tiny_model_cfg()).encoder, VideoMAEEncoder)
+
+
+def test_load_bundle_loads_levjepa_encoder_and_ignores_the_projector(tmp_path):
+    cfg = _tiny_levjepa_cfg()
+    saved = write_levjepa_checkpoint(tmp_path, "lev-run", cfg)
+
+    bundle = load_bundle("lev-run", tmp_path, cfg)
+
+    assert isinstance(bundle.encoder, LeVJEPAEncoder)
+    expected = saved.encoder.state_dict()
+    got = bundle.encoder.state_dict()
+    assert set(got) == set(expected)
+    for key, tensor in expected.items():
+        assert torch.equal(got[key], tensor), key
+
+
+def test_load_bundle_raises_on_a_levjepa_checkpoint_missing_an_encoder_key(tmp_path):
+    cfg = _tiny_levjepa_cfg()
+    write_levjepa_checkpoint(tmp_path, "lev-run", cfg)
+    path = tmp_path / "checkpoints" / "lev-run" / "master.pt"
+    payload = torch.load(path)
+    del payload["model_state_dict"]["encoder.cls_token"]
+    torch.save(payload, path)
+
+    with pytest.raises(ValueError, match="encoder.cls_token|cls_token"):
+        load_bundle("lev-run", tmp_path, cfg)
+
+
+def test_load_bundle_raises_on_levjepa_checkpoint_under_a_videomae_cfg(tmp_path):
+    """The probe CLI defaults to videomae_base.yaml; forgetting --model-cfg must
+    fail loudly, not probe a VideoMAE encoder under the LeVJEPA run's name."""
+    write_levjepa_checkpoint(tmp_path, "lev-run", _tiny_levjepa_cfg())
+
+    with pytest.raises(ValueError, match="lev-run: checkpoint/model key mismatch"):
+        load_bundle("lev-run", tmp_path, _tiny_model_cfg())
+
+
+def test_levjepa_full_model_bundle_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="full_model"):
+        random_init_bundle(_tiny_levjepa_cfg(), full_model=True)
+
+
+def test_levjepa_encoder_exposes_the_geometry_the_probe_reads():
+    encoder = LeVJEPAEncoder(_tiny_levjepa_cfg())
+
+    assert (encoder.num_frames, encoder.image_size, encoder.embed_dim) == (4, 32, 16)
+
+
+def test_forward_with_hidden_states_matches_levjepa_forward():
+    """Same bit-for-bit parity pin as the VideoMAE traversal: the final state,
+    normed, is exactly what the encoder's own eval forward returns."""
+    torch.manual_seed(0)
+    encoder = LeVJEPAEncoder(_tiny_levjepa_cfg()).eval()
+    x = torch.randn(2, 3, 4, 32, 32)
+
+    hidden = forward_with_hidden_states(encoder, x)
+
+    assert len(hidden) == 4  # depth (3) + 1
+    n_tokens = 1 + 4 * (32 // 16) ** 2  # cls + one token per frame patch
+    for state in hidden:
+        assert state.shape == (2, n_tokens, 16)
+        assert not state.requires_grad
+    with torch.no_grad():
+        assert torch.equal(encoder.final_norm(hidden[-1]), encoder(x))
+
+
+def test_forward_with_hidden_states_levjepa_keeps_every_token_even_in_train_mode():
+    """Token dropping is a training-time augmentation; a probe reading a
+    randomly dropped subset would score a different input every pass."""
+    encoder = LeVJEPAEncoder(_tiny_levjepa_cfg(drop_ratio=0.9)).train()
+
+    hidden = forward_with_hidden_states(encoder, torch.randn(1, 3, 4, 32, 32))
+
+    assert hidden[-1].shape[1] == 1 + 4 * 4
+
+
+def test_forward_with_hidden_states_levjepa_is_block_causal():
+    """A frame-3 perturbation must leave frames 0-2's tokens untouched at every
+    depth -- a traversal that dropped the attention mask would leak it back."""
+    torch.manual_seed(0)
+    encoder = LeVJEPAEncoder(_tiny_levjepa_cfg()).eval()
+    x = torch.randn(1, 3, 4, 32, 32)
+    y = x.clone()
+    y[:, :, 3] += 1.0
+
+    hx = forward_with_hidden_states(encoder, x)
+    hy = forward_with_hidden_states(encoder, y)
+
+    per_frame = 4
+    past = slice(1, 1 + 3 * per_frame)
+    assert torch.allclose(hx[-1][:, past], hy[-1][:, past], atol=1e-6)
+    assert not torch.allclose(
+        hx[-1][:, 1 + 3 * per_frame :], hy[-1][:, 1 + 3 * per_frame :]
+    )
+
+
+def test_patch_tokens_drops_cls_for_levjepa_and_registers_for_videomae():
+    lev = LeVJEPAEncoder(_tiny_levjepa_cfg())
+    x = torch.arange(2 * 17 * 3, dtype=torch.float32).reshape(2, 17, 3)
+    assert torch.equal(patch_tokens(lev, x), x[:, 1:])
+
+    mae = VideoMAEEncoder(_tiny_model_cfg(num_registers=2))
+    y = torch.randn(2, 10, 3)
+    assert torch.equal(patch_tokens(mae, y), mae.registers.strip(y))
 
 
 # --- the measurement ladder ------------------------------------------------

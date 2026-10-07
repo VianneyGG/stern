@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from video_encoding.models.levjepa.losses import (
@@ -34,15 +35,41 @@ def test_invariance_loss_excludes_global_self_comparison():
     z_global = torch.randn(4, 8)
     z_locals = torch.randn(4, 3, 8)
     loss = invariance_loss(z_global, z_locals)
-    manual = (z_locals - z_global.unsqueeze(1)).pow(2).sum(dim=-1).mean()
+    manual = (z_locals - z_global.unsqueeze(1)).pow(2).mean()
     assert torch.allclose(loss, manual, atol=1e-6)
 
 
-def test_sigreg_loss_low_for_true_gaussian_samples():
+def test_invariance_loss_is_a_per_dimension_mean_not_a_sum():
+    """LeJEPA's `(center - proj).square().mean()` averages over the embedding
+    dims too. Summing over K=256 inflated the invariance term 256x against
+    SIGReg, so lam=0.02 no longer meant what the paper tuned it to mean."""
+    z_global = torch.zeros(2, 256)
+    z_locals = torch.ones(2, 3, 256)
+    assert invariance_loss(z_global, z_locals).item() == pytest.approx(1.0)
+
+
+# Golden values produced by running the upstream `EppsPulley().forward` (defaults
+# t_max=3, n_points=17, world_size=1) from rbalestr-lab/lejepa @ c293d291,
+# lejepa/univariate/epps_pulley.py, on the same inputs and projections.
+@pytest.mark.parametrize(
+    "batch_size, upstream",
+    [(2, 0.7728983163833618), (16, 4.675853729248047), (128, 36.51273727416992)],
+)
+def test_sigreg_loss_matches_official_epps_pulley(batch_size, upstream):
+    torch.manual_seed(1)
+    z = 0.3 * torch.randn(batch_size, 32)
+    torch.manual_seed(7)
+    assert sigreg_loss(z, num_directions=64).item() == pytest.approx(upstream, rel=1e-5)
+
+
+def test_sigreg_collapse_penalty_scales_with_batch_size():
+    """The official statistic is multiplied by N: its value on N(0, I) stays
+    O(1), while a collapsed batch's penalty grows linearly with N. Without the
+    factor, SIGReg is ~N times too weak against the invariance term."""
     torch.manual_seed(0)
-    z = torch.randn(2048, 16)  # true N(0, I) samples
-    loss = sigreg_loss(z, num_directions=256)
-    assert loss.item() < 0.05
+    small = sigreg_loss(0.05 * torch.randn(64, 16), num_directions=256)
+    large = sigreg_loss(0.05 * torch.randn(256, 16), num_directions=256)
+    assert large.item() / small.item() == pytest.approx(4.0, rel=0.05)
 
 
 def test_sigreg_loss_high_for_collapsed_batch():
@@ -69,18 +96,19 @@ def test_sigreg_empirical_floor_is_nonnegative():
     assert floor >= 0.0
 
 
-def test_sigreg_empirical_floor_shrinks_with_larger_batch():
-    """The floor is a finite-sample estimator bias -- it must trend toward
-    zero as the batch grows, confirming it is a sample-size artifact and not
-    a fixed offset baked into the metric."""
+def test_sigreg_empirical_floor_is_batch_size_independent():
+    """The N factor cancels the O(1/N) finite-sample bias of the empirical
+    characteristic function, so the floor on true N(0, I) samples is an O(1)
+    constant rather than shrinking with batch size."""
     torch.manual_seed(0)
     small = sigreg_empirical_floor(
-        batch_size=16, dim=8, num_directions=64, num_trials=4
+        batch_size=16, dim=8, num_directions=256, num_trials=8
     )
     large = sigreg_empirical_floor(
-        batch_size=1024, dim=8, num_directions=64, num_trials=4
+        batch_size=1024, dim=8, num_directions=256, num_trials=8
     )
-    assert large < small
+    assert 0.3 < small < 3.0
+    assert large == pytest.approx(small, rel=0.3)
 
 
 def test_levjepa_loss_combines_terms_with_fixed_lambda():
@@ -88,6 +116,6 @@ def test_levjepa_loss_combines_terms_with_fixed_lambda():
     z_global = torch.randn(8, 16)
     z_locals = torch.randn(8, 4, 16)
     total, components = levjepa_loss(z_global, z_locals, lam=0.02, num_directions=64)
-    expected = components["invariance"] + 0.02 * components["sigreg"]
+    expected = (1 - 0.02) * components["invariance"] + 0.02 * components["sigreg"]
     assert torch.allclose(total, expected, atol=1e-6)
     assert set(components) == {"invariance", "sigreg"}

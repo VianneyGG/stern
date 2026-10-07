@@ -26,6 +26,7 @@ import threading
 from pathlib import Path
 from typing import Iterator
 
+import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
@@ -123,6 +124,7 @@ class MeshShardIterableDataset(IterableDataset):
         frame_stride: int = 1,
         augment: bool = False,
         seed: int = 0,
+        raw_frames: bool = False,
     ):
         self._shard_names = list(shard_names)
         self._mesh_root = Path(mesh_root)
@@ -135,6 +137,12 @@ class MeshShardIterableDataset(IterableDataset):
         self._augment = augment
         self._seed = seed
         self._round = 0
+        # LeVJEPA's LeVJEPAViewDataset/build_views need un-normalized
+        # (T, H, W, 3) uint8 clips (same contract as
+        # SSLWindowDataset(raw_frames=True)), not preprocess_window's
+        # normalized (C, T, H, W) float pixel_values -- build_views does its
+        # own resize/crop/normalize per view.
+        self._raw_frames = raw_frames
 
     def set_round(self, round_num: int) -> None:
         """Selects the deterministic shard/window permutation the next
@@ -259,6 +267,12 @@ class MeshShardIterableDataset(IterableDataset):
                     frames = read_shard_frames_indexed(
                         path, clip_key, idx, size=self._image_size
                     )
+                    if self._raw_frames:
+                        # No group augment or normalization here -- LeVJEPA's
+                        # build_views (called downstream) does its own
+                        # spatial/photometric augmentation per view.
+                        yield torch.from_numpy(np.stack(frames))
+                        continue
                     if self._augment:
                         params = sample_group_augment(self._image_size, aug_rng)
                         frames = apply_group_augment(frames, params, self._image_size)

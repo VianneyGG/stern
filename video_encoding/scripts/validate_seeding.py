@@ -32,8 +32,8 @@ from video_encoding.mesh.seeding import holdings_from_scan, validate
 from video_encoding.mesh.topology import tier_nodes
 from video_encoding.scripts.seed_mesh import MESH_DIR, _VAL_SUBDIR
 
-GOLDEN_HOST = "node001"
-GOLDEN_DIR = "/Data/$USER/voxceleb2_shards"
+GOLDEN_HOST = "node114"
+GOLDEN_DIR = "/Data/voxceleb2_shards_8fps"  # 8fps corpus, default since 2026-09-19
 DEFAULT_METADATA_DIR = Path.home() / "stern_mesh" / "metadata"
 
 # `-L` follows symlinks: seed_mesh._symlink_source_node links the source

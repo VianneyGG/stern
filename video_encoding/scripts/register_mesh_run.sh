@@ -120,6 +120,10 @@ if [[ ! -f "${REPO_ROOT}/video_encoding/conf/experiment/${EXPERIMENT}.yaml" ]]; 
   exit 1
 fi
 
+# Class-hours gate (class_hours.py): refuse to launch anything that would
+# run Mon-Fri 08:00-20:00 Europe/Paris. No override.
+python3 "$(dirname "${BASH_SOURCE[0]}")/class_hours.py" || exit 1
+
 python3 - "${RUN_ID}" "${ACTIVE_CSV}" "${ROUNDS}" "${OUTER_LR}" "${OUTER_MOMENTUM}" "${REPO_ROOT}" "${QUORUM_K}" "${WEIGHTING}" "${EXTRA_OVERRIDES}" "${GRACE_S}" "${CHUNK_ROUNDS}" "${EXPERIMENT}" <<'PYEOF'
 import json
 import os
