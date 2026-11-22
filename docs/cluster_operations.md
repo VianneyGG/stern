@@ -10,19 +10,19 @@ checkout on the shared home directory.
   lacks it). Each node builds its own torch with `uv sync`.
 - **Always `uv run --no-sync`.** The shared venv is about 9.4 GB on NFS. A sync
   on every tick raced concurrent ticks into import crash loops.
-- **Use `python -m video_encoding.scripts.X`** from the repo root, not file paths.
+- **Use `python -m stern.<package>.<module>`** from the repo root, not file paths.
 - **Quota.** The shared home has a 30 GB hard quota. Keep data on `$DATA_ROOT`.
 - **No GPU resource in SLURM.** GPUs are used by landing on a node. Worker jobs
   request `--time=02:00:00`.
 
 ## Launching a mesh pool
 
-Run on the login node. Roster: `video_encoding/mesh/tiers.tsv` (113 nodes).
+Run on the login node. Roster: `stern/mesh/tiers.tsv` (113 nodes).
 
 ```bash
 cd $REPO
 QUORUM_K=8 WEIGHTING=token GRACE_S=900 \
-  video_encoding/scripts/launch_mesh_pool.sh cars <run_id> 40 0.8 0.9
+  cluster/launch_mesh_pool.sh cars <run_id> 40 0.8 0.9
 ```
 
 - Arguments: tier, run id, rounds, outer lr, outer momentum (defaults 25, 0.7, 0.9).
@@ -35,13 +35,13 @@ QUORUM_K=8 WEIGHTING=token GRACE_S=900 \
 
 ## Installing the watcher
 
-The watcher is a one-minute tick: `video_encoding/scripts/watch_training.py`.
+The watcher is a one-minute tick: `stern/watcher/watch_training.py`.
 Only one host may tick, and the designation lives in `runs/state/watcher_host`.
 
 ```bash
 cd $REPO
-video_encoding/scripts/install_watcher.sh <login-node>   # designate and converge
-video_encoding/scripts/install_watcher.sh                # later: converge this host
+cluster/install_watcher.sh <login-node>   # designate and converge
+cluster/install_watcher.sh                # later: converge this host
 ```
 
 On the designated host this installs a systemd user timer (`stern-watcher.timer`,
@@ -50,7 +50,7 @@ every minute); elsewhere it stops the timer.
 **Cron alternative.** Delete watcher lines from earlier layouts, then add:
 
 ```
-* * * * *  cd $REPO && $HOME/.local/bin/uv run --no-sync python -m video_encoding.scripts.watch_training
+* * * * *  cd $REPO && $HOME/.local/bin/uv run --no-sync python -m stern.watcher.watch_training
 ```
 
 **Checking liveness.** Read the mtime of `runs/state/squeue.json`, which every
@@ -64,7 +64,7 @@ No job may run Monday to Friday, 08:00 to 20:00, Europe/Paris. The rule is
 enforced in code. Do not work around it.
 
 ```bash
-python3 video_encoding/scripts/class_hours.py   # exit 0 allowed, 1 refused, reason on stderr
+python3 stern/watcher/class_hours.py   # exit 0 allowed, 1 refused, reason on stderr
 ```
 
 To gate hand-typed submissions, link the shim as `sbatch`, `srun` and `salloc` in
@@ -74,7 +74,7 @@ and `salloc` through inside an allocation. Job scripts call `class_hours.py` the
 ## Monitoring with TensorBoard
 
 ```bash
-cd $REPO && video_encoding/scripts/view_mesh_tensorboard.sh
+cd $REPO && cluster/view_mesh_tensorboard.sh
 ```
 
 The script picks one serving host, reachable over SSH, and reads
@@ -109,14 +109,14 @@ cp <run_id>/master.pt $DATA_ROOT/stern_mesh_results_local/checkpoints/<run_id>/
 
 # 2. Export activations and attention for one shard.
 cd $REPO && $HOME/.local/bin/uv run --no-sync python -m \
-  video_encoding.scripts.export_vit_internals \
+  stern.evaluation.diagnostics.export_vit_internals \
   --shard-path $DATA_ROOT/voxceleb2_shards/shard-000000.tar \
   --mesh-shared $DATA_ROOT/stern_mesh_results_local \
   --run-ids <run_id_1>,<run_id_2> --out internals.npz
 
 # 3. Plot.
 $HOME/.local/bin/uv run --no-sync python -m \
-  video_encoding.scripts.plot_vit_internals --npz internals.npz --out-dir plots/
+  stern.evaluation.diagnostics.plot_vit_internals --npz internals.npz --out-dir plots/
 ```
 
 This writes `plots/contact_sheet.png` and `plots/layer_diagnostics.png`. The

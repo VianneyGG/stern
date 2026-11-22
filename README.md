@@ -1,7 +1,7 @@
 ## Video arm (face, VA probing)
 
 See `docs/superpowers/specs/2026-06-29-video-arm-design.md` for the design
-and `video_encoding/` for the code. Shared contract code the skeleton
+and `stern/` for the code. Shared contract code the skeleton
 (landmark) arm will reuse lives in flat top-level packages: `data/`
 (harmonisation, manifests, labels), `eval/` (CCC metric), and `cache/`
 (embedding cache). The landmark arm is a placeholder in `landmark_encoding/`.
@@ -17,7 +17,7 @@ D-DATA-1, D-DATA-2; an external build-spec doc, not checked into this repo)
 
 View live TensorBoard for all mesh (DiLoCo) runs at once:
 
-    video_encoding/scripts/view_mesh_tensorboard.sh
+    cluster/view_mesh_tensorboard.sh
 
 Then open http://localhost:3003 and pick a run in the sidebar to compare
 it against the others — no run_id argument needed; `--logdir` points at
@@ -73,14 +73,14 @@ the two-stage export → plot pipeline:
             ~/stern_mesh_results_local/checkpoints/<run_id>/master.pt'
 
     ssh login-node 'cd ~/stern && ~/.local/bin/uv run --no-sync python -m \
-        video_encoding.scripts.export_vit_internals \
+        stern.evaluation.diagnostics.export_vit_internals \
         --shard-path /Data/vox2_val_shards_8fps/shard-000000.tar \
         --mesh-shared ~/stern_mesh_results_local \
         --run-ids <run_id_1>,<run_id_2>,... \
         --out internals.npz'
 
     ssh login-node 'cd ~/stern && ~/.local/bin/uv run --no-sync python -m \
-        video_encoding.scripts.plot_vit_internals \
+        stern.evaluation.diagnostics.plot_vit_internals \
         --npz internals.npz --out-dir plots/'
 
 which writes `plots/contact_sheet.png` (per-run attention maps + PCA-RGB,

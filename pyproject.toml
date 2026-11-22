@@ -48,28 +48,28 @@ dev = [
 # Scoped to the pure, stateless modules (no I/O, no torch/GPU) so a full
 # mutation run stays cheap -- their existing test subset runs in ~13s.
 source_paths = [
-    "data/harmonise.py",
-    "eval/ccc.py",
-    "video_encoding/mesh/quorum.py",
-    "video_encoding/mesh/outer_step.py",
+    "stern/data/harmonise.py",
+    "stern/evaluation/ccc.py",
+    "stern/mesh/quorum.py",
+    "stern/mesh/outer_step.py",
 ]
 pytest_add_cli_args_test_selection = [
-    "data/tests/test_harmonise.py",
-    "data/tests/test_harmonise_properties.py",
-    "eval/tests/test_ccc.py",
-    "eval/tests/test_ccc_properties.py",
-    "video_encoding/tests/test_mesh_quorum.py",
-    "video_encoding/tests/test_mesh_quorum_properties.py",
-    "video_encoding/tests/test_mesh_outer_step.py",
+    "tests/data/test_harmonise.py",
+    "tests/data/test_harmonise_properties.py",
+    "tests/evaluation/test_ccc.py",
+    "tests/evaluation/test_ccc_properties.py",
+    "tests/mesh/test_mesh_quorum.py",
+    "tests/mesh/test_mesh_quorum_properties.py",
+    "tests/mesh/test_mesh_outer_step.py",
 ]
 also_copy = [
     "data/__init__.py",
     "data/tests",
     "eval/__init__.py",
     "eval/tests",
-    "video_encoding/__init__.py",
-    "video_encoding/mesh/__init__.py",
-    "video_encoding/tests",
+    "stern/__init__.py",
+    "stern/mesh/__init__.py",
+    "tests",
 ]
 
 [tool.pytest.ini_options]

@@ -27,12 +27,12 @@ def _(mo):
         r"""
         # molab streaming SSL pretrain
 
-        Runs `video_encoding/training/pretrain.py`'s SSL pretrain stage on this
+        Runs `stern/training/pretrain.py`'s SSL pretrain stage on this
         molab GPU while VoxCeleb2 WDS shards stay on login-node, streamed shard-major
         over a token-gated HTTP tunnel.
 
         **Before running this notebook:** on login-node, start
-        `video_encoding/scripts/serve_shards_public.sh <shards-dir> <manifest-csv>`
+        `cluster/serve_shards_public.sh <shards-dir> <manifest-csv>`
         and copy the printed `<tunnel-url>/<token>` into the field below.
 
         See `openspec/changes/molab-streaming-pretrain/design.md` for the full
@@ -75,7 +75,7 @@ def _(Path, github_pat, mo, os, repo_ready, subprocess, sys):
             check=True,
         )
     # Not `pip install -e .`: the repo's flat layout (data/, eval/,
-    # video_encoding/, etc. all at top level) has no explicit `packages`
+    # stern/, etc. all at top level) has no explicit `packages`
     # config, so setuptools' auto-discovery refuses to build it. The notebook
     # only imports a handful of modules, so put the clone on sys.path instead
     # and install just what those imports need (torch/torchvision are assumed
@@ -181,7 +181,7 @@ def _(clone_path, mo, shards_url):
 
     from hydra import compose, initialize_config_dir
 
-    config_dir = str(clone_path / "video_encoding" / "conf")
+    config_dir = str(clone_path / "configs")
     with initialize_config_dir(config_dir=config_dir, version_base=None):
         cfg = compose(
             config_name="config",
@@ -441,8 +441,8 @@ def _(
         mo.md("Paste the tunnel base URL above before continuing."),
     )
 
-    from video_encoding.data.shard_stream import StreamingShardDataset
-    from video_encoding.training.pretrain import run_pretrain_stage
+    from stern.data.shard_stream import StreamingShardDataset
+    from stern.training.pretrain import run_pretrain_stage
 
     stream_dataset = StreamingShardDataset(
         base_url=shards_url.value,

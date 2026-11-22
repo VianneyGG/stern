@@ -1,0 +1,235 @@
+"""Unit tests for SSLWindowDataset (stern/data/ssl_windows.py).
+
+Covers the bug found during Workstream A/B review: the cache directory was
+computed as `VOXMINI_FRAMES_ROOT/<identity_id>/<clip_path>.stem`, which (a)
+crashed with AttributeError on `clip_path` (a str, not a Path) and (b) even
+fixed, duplicated identity_id and dropped the video_id directory relative to
+the layout `cache_voxmini_frames.py` actually writes
+(`frames_root / Path(clip_path).with_suffix("")`, where clip_path already
+starts with identity_id). Also covers the missing window-start offset: every
+window of a clip was reading frames [0, num_frames) regardless of its
+intended start index.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest import mock
+
+import numpy as np
+import pytest
+import torch
+from omegaconf import OmegaConf
+from PIL import Image
+
+from stern.data.manifest import ManifestRecord
+from stern.data.loaders import SSLDataset
+from stern.data.ssl_windows import SSLWindowDataset
+from stern.prep.build_wds_shards import (
+    BalancedShardWriter,
+    encode_frames_jpeg,
+)
+
+pytestmark = pytest.mark.integration
+
+
+def _write_fake_frames(clip_dir: Path, n: int, size: int = 224) -> None:
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        Image.fromarray(np.zeros((size, size, 3), dtype=np.uint8)).save(
+            clip_dir / f"{i:04d}.jpg"
+        )
+
+
+def _ssl_dataset(root: Path, clip_path: str) -> SSLDataset:
+    return SSLDataset(
+        records_by_identity={
+            "id00012": [
+                ManifestRecord(
+                    identity_id="id00012",
+                    clip_path=clip_path,
+                    duration_s=5.0,
+                    role="ssl",
+                )
+            ]
+        },
+        window_cfg=OmegaConf.create({}),
+        root=root,
+    )
+
+
+def test_cache_dir_matches_cache_voxmini_frames_layout(tmp_path, monkeypatch):
+    """The reader must resolve the same directory the writer
+    (cache_voxmini_frames.transcode_clip) fills in: frames_root /
+    Path(clip_path).with_suffix(''), NOT frames_root / identity_id / stem."""
+    frames_root = tmp_path / "frames"
+    clip_path = "id00012/vid1/001.mp4"
+    # Matches cache_voxmini_frames.cache_frames: out_dir = frames_root / Path(clip_path).with_suffix("")
+    _write_fake_frames(frames_root / "id00012/vid1/001", n=16)
+
+    monkeypatch.setenv("VOXMINI_FRAMES_ROOT", str(frames_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.0)
+
+    assert len(ds) == 1
+    pixel_values = ds[0]
+    assert pixel_values.shape == (3, 16, 224, 224)
+
+
+def test_raw_frames_mode_skips_normalisation(tmp_path, monkeypatch):
+    """LeVJEPA's build_views does its own uint8 normalisation/augmentation --
+    raw_frames=True must hand it back untouched (T, H, W, 3) uint8 instead
+    of the ImageNet-normalised (C, T, H, W) float preprocess_window emits."""
+    frames_root = tmp_path / "frames"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_frames(frames_root / "id00012/vid1/001", n=16)
+
+    monkeypatch.setenv("VOXMINI_FRAMES_ROOT", str(frames_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(
+        dataset, num_frames=16, image_size=224, overlap=0.0, raw_frames=True
+    )
+
+    frames = ds[0]
+    assert frames.shape == (16, 224, 224, 3)
+    assert frames.dtype == torch.uint8
+
+
+def test_multiple_windows_read_distinct_frame_ranges(tmp_path, monkeypatch):
+    """Two overlapping windows over a longer cached clip must read different
+    frame slices, not both collapse to frames [0, num_frames)."""
+    frames_root = tmp_path / "frames"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_frames(frames_root / "id00012/vid1/001", n=24)
+
+    monkeypatch.setenv("VOXMINI_FRAMES_ROOT", str(frames_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.5)
+
+    # window_starts(24, 16, 0.5) -> step=8 -> starts at [0, 8]
+    assert len(ds) == 2
+    assert ds._items[0][1] == list(range(0, 16))
+    assert ds._items[1][1] == list(range(8, 24))
+
+
+def test_falls_back_to_live_decode_when_cache_root_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("VOXMINI_FRAMES_ROOT", raising=False)
+    clip_path = "id00012/vid1/001.mp4"
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    fake_frames = [np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(16)]
+    with mock.patch(
+        "stern.data.ssl_windows.decode_frames", return_value=fake_frames
+    ) as mock_decode:
+        ds = SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.5)
+        assert len(ds) == 1  # one window per clip in the live-decode fallback
+        pixel_values = ds[0]
+
+    mock_decode.assert_called_once_with(tmp_path / "raw" / clip_path, 16)
+    assert pixel_values.shape == (3, 16, 224, 224)
+
+
+def test_skips_clip_with_no_cached_frames(tmp_path, monkeypatch):
+    frames_root = tmp_path / "frames"
+    frames_root.mkdir()
+    monkeypatch.setenv("VOXMINI_FRAMES_ROOT", str(frames_root))
+    dataset = _ssl_dataset(tmp_path / "raw", "id00012/vid1/001.mp4")
+
+    with pytest.raises(ValueError, match="no usable SSL clips"):
+        SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.0)
+
+
+def _write_fake_shard(
+    shards_root: Path, clip_key: str, n_frames: int, size: int = 224
+) -> None:
+    writer = BalancedShardWriter(shards_root, n_shards=1)
+    frames = [np.zeros((size, size, 3), dtype=np.uint8) for _ in range(n_frames)]
+    writer.write(clip_key, encode_frames_jpeg(frames))
+    writer.close()
+
+
+def test_reads_from_wds_shards_when_shards_root_set(tmp_path, monkeypatch):
+    shards_root = tmp_path / "shards"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_shard(shards_root, "id00012/vid1/001", n_frames=16)
+
+    monkeypatch.delenv("VOXMINI_FRAMES_ROOT", raising=False)
+    monkeypatch.setenv("VOXMINI_SHARDS_ROOT", str(shards_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.0)
+
+    assert len(ds) == 1
+    pixel_values = ds[0]
+    assert pixel_values.shape == (3, 16, 224, 224)
+
+
+def test_wds_multiple_windows_read_distinct_frame_ranges(tmp_path, monkeypatch):
+    shards_root = tmp_path / "shards"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_shard(shards_root, "id00012/vid1/001", n_frames=24)
+
+    monkeypatch.delenv("VOXMINI_FRAMES_ROOT", raising=False)
+    monkeypatch.setenv("VOXMINI_SHARDS_ROOT", str(shards_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.5)
+
+    assert len(ds) == 2
+    assert ds._items[0][1] == list(range(0, 16))
+    assert ds._items[1][1] == list(range(8, 24))
+
+
+def test_wds_shards_root_takes_priority_over_frames_root(tmp_path, monkeypatch):
+    shards_root = tmp_path / "shards"
+    frames_root = tmp_path / "frames"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_shard(shards_root, "id00012/vid1/001", n_frames=16)
+    # Deliberately do NOT populate frames_root -- if the dataset reads it
+    # instead of the shard, this test fails with "no usable SSL clips".
+
+    monkeypatch.setenv("VOXMINI_SHARDS_ROOT", str(shards_root))
+    monkeypatch.setenv("VOXMINI_FRAMES_ROOT", str(frames_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(dataset, num_frames=16, image_size=224, overlap=0.0)
+    assert len(ds) == 1
+
+
+def test_frame_stride_widens_the_cached_window_span(tmp_path, monkeypatch):
+    """H3: with stride 1 a tubelet spans two adjacent frames. The dataset must
+    actually sample further apart when asked, in the frame-cache path."""
+    frames_root = tmp_path / "frames"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_frames(frames_root / "id00012/vid1/001", n=24)
+
+    monkeypatch.setenv("VOXMINI_FRAMES_ROOT", str(frames_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(
+        dataset, num_frames=8, image_size=224, overlap=0.0, frame_stride=3
+    )
+    # span = (8-1)*3 + 1 = 22, so 24 frames hold exactly one window
+    assert len(ds) == 1
+    assert ds._items[0][1] == [0, 3, 6, 9, 12, 15, 18, 21]
+
+
+def test_frame_stride_widens_the_shard_window_span(tmp_path, monkeypatch):
+    """The same, in the WebDataset shard path -- the one production actually
+    uses. The two branches build indices separately and can drift apart."""
+    shards_root = tmp_path / "shards"
+    clip_path = "id00012/vid1/001.mp4"
+    _write_fake_shard(shards_root, "id00012/vid1/001", n_frames=24)
+
+    monkeypatch.delenv("VOXMINI_FRAMES_ROOT", raising=False)
+    monkeypatch.setenv("VOXMINI_SHARDS_ROOT", str(shards_root))
+    dataset = _ssl_dataset(tmp_path / "raw", clip_path)
+
+    ds = SSLWindowDataset(
+        dataset, num_frames=8, image_size=224, overlap=0.0, frame_stride=3
+    )
+    assert len(ds) == 1
+    assert ds._items[0][1] == [0, 3, 6, 9, 12, 15, 18, 21]

@@ -42,7 +42,7 @@ Three things make it unusual:
 
 ## Data and shared contracts
 
-- **Manifest.** `data/manifest.py` defines one CSV schema for every dataset:
+- **Manifest.** `stern/data/manifest.py` defines one CSV schema for every dataset:
   `identity_id`, `clip_path`, `duration_s`, `role`, `label_path`. The role is
   `ssl`, `probe`, or `eval`. `read_manifest` checks the role it is given, so a
   probe loader cannot silently read an SSL manifest.
@@ -50,11 +50,11 @@ Three things make it unusual:
   (VoxMini, 218 hours). VA probing and fine-tuning use AFEW-VA (600 clips,
   240 actors). Loaders are split by role (`build_ssl_loader`,
   `build_probe_loader`, `build_eval_loader`).
-- **VA harmonisation.** `data/harmonise.py` maps every VA source onto
+- **VA harmonisation.** `stern/data/harmonise.py` maps every VA source onto
   `[-1, 1]` (`harmonise_va`) and resamples annotations to one rate
-  (`harmonise_rate`). `data/labels.py` reads per-frame labels through
+  (`harmonise_rate`). `stern/data/labels.py` reads per-frame labels through
   `harmonise_va`, so no caller sees raw ranges.
-- **CCC.** `eval/ccc.py` holds the Lin (1989) concordance correlation
+- **CCC.** `stern/evaluation/ccc.py` holds the Lin (1989) concordance correlation
   coefficient as a NumPy metric (`concordance_correlation_coefficient`) and as
   a differentiable loss (`ccc_loss`).
 
@@ -77,7 +77,7 @@ The notebook path reads shards through `StreamingShardDataset`
 
 ## DiLoCo mesh
 
-**Roster.** `video_encoding/mesh/tiers.tsv` lists 113 nodes in five tiers:
+**Roster.** `stern/mesh/tiers.tsv` lists 113 nodes in five tiers:
 fish 23, birds 23, cars 23, countries 19, orchids 25. Each node is one GPU with
 no `torch.distributed`. The network is 1 GbE, which is why multi-node DDP was
 dropped (see `results.md`).
