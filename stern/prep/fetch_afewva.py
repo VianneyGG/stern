@@ -7,15 +7,14 @@ archives manually -- there is no anonymous download URL, so this script cannot
 fetch them for you. It only unpacks the zips you already downloaded.
 
 Defaults to `.data/afewva` (see `.gitignore`'s "local bulk dataset downloads"
-entry) for local work. On the login-node/SallesInfo cluster, override with
-`AFEWVA_ROOT=/Data/$USER/afewva` -- bulk data belongs on per-node `/Data`
-there, never the shared NFS mount.
+entry). On the cluster, set `AFEWVA_ROOT` to a node-local data path. Bulk data
+must stay off the shared NFS mount.
 
 Usage (local):
     uv run python stern/prep/fetch_afewva.py --zips ~/Downloads/AFEW-VA/*.zip
 
 Usage (cluster):
-    AFEWVA_ROOT=/Data/$USER/afewva \\
+    AFEWVA_ROOT=$DATA_ROOT/afewva \\
       uv run python stern/prep/fetch_afewva.py --zips ~/Downloads/AFEW-VA/*.zip
 
 Then build the manifest (PYTHONPATH=. is needed for build_afewva_manifest.py's
@@ -32,6 +31,7 @@ from pathlib import Path
 
 
 def extract(zips: list[Path], dest: Path) -> None:
+    """Unzip each archive into `dest`."""
     dest.mkdir(parents=True, exist_ok=True)
     for archive in zips:
         with zipfile.ZipFile(archive) as zf:

@@ -1,9 +1,8 @@
-"""Quorum merge: replaces the all-or-timeout wait in watcher/mesh_tick.py.
+"""Quorum merge: merge a round once `quorum_k` nodes have checked in.
 
-Waiting for every node in the round (or the full ROUND_TIMEOUT_S) before
-merging is what costs 297s/round on average (spec: 2604.21428 Decoupled
-DiLoCo, 2501.18512 Streaming DiLoCo). `ready_for_merge` lets a round merge
-once `quorum_k` nodes have checked in, without waiting on stragglers.
+Waiting for every node, or for ROUND_TIMEOUT_S, cost about 297 s per round.
+The decoupled and streaming DiLoCo designs (arXiv 2604.21428, 2501.18512)
+avoid that barrier. `ready_for_merge` lets stragglers miss the round.
 """
 
 from __future__ import annotations
@@ -21,16 +20,12 @@ class NodeStats:
 def token_weights(stats: dict[str, NodeStats]) -> dict[str, float]:
     """`w_i = c_tokens_i * (c_tokens_i / c_steps_i)`, normalized to sum to 1.
 
-    "Quantity x quality" (spec 2.2): squares the token count and divides by
-    steps taken to earn it, so a node that trained more data per step (a
-    healthy, well-fed worker) is weighted up relative to one that needed
-    more steps for the same tokens. Supersedes weighting="data"
-    (mesh/outer_step.data_weights), which renormalizes only over whoever's
-    checkpoint happened to arrive -- silently biased whenever the round
-    didn't get a full check-in. A node with c_tokens=0 (fetched no shards)
-    is weighted to exactly 0.0 without ever computing 0/c_steps, so a
-    zero-token, zero-step node (the common case -- it never trained at all)
-    can't produce a 0/0 NaN.
+    Quantity times quality: a node that trained more data per step is weighted
+    up relative to one that needed more steps for the same tokens. Replaces
+    `weighting="data"` (`outer_step.data_weights`), which renormalizes only over
+    the checkpoints that arrived and so is biased when a round is incomplete.
+    A node with no tokens or no steps gets weight exactly 0.0 without computing
+    0/c_steps, so it cannot produce a NaN.
     """
     raw = {
         name: 0.0

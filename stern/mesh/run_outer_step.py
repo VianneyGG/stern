@@ -1,27 +1,23 @@
 """Merge CLI wrapping the DiLoCo outer optimizer (`stern/mesh/outer_step.py`)
 with a persistent momentum buffer.
 
-Runs as a subprocess from the watcher's epoch-advance logic (mirroring
-`remediate.py`'s existing shell-out pattern): reads whatever worker
-checkpoints have landed in `pending/`, computes the alpha-weighted
-pseudo-gradient, takes one Nesterov outer-optimizer step, and atomically
-overwrites `master.pt` and the momentum buffer. Deliberately does *not*
-delete the pending checkpoints or advance any round counter -- that is the
-caller's job (Task 11), so this module stays a pure, retryable merge step:
-a crash or non-zero exit here just means the next cron tick tries again
-against the same pending/ contents. That retryability has one hard limit:
-once master.pt has been rewritten the round is applied, and a *later* failure
--- including the caller SIGKILLing this process on its own timeout, which is
-not catchable here -- cannot undo it. `merge_round` therefore detects an
-already-applied round on the next attempt (master.pt stamped with the round
-being merged) and reports a no-op success rather than retrying a round whose
-pending deltas are now all stale against the master this merge produced.
+Runs as a subprocess from the watcher's epoch-advance logic. It reads the
+worker checkpoints in `pending/`, computes the alpha-weighted pseudo-gradient,
+takes one Nesterov outer step, and atomically overwrites `master.pt` and the
+momentum buffer.
 
-Weighting is `data` (FedAvg sample-count proportional) by default and
-intentionally never falls back silently: a worker checkpoint missing
-`n_samples` is a contract violation from the training side (Task 12's
-`pretrain.py` follow-up is supposed to always write it) and must fail loud
-rather than let some default weight quietly bias the merge.
+It does not delete pending checkpoints or advance any round counter. The
+caller does that, so this module is a retryable merge step: a crash or
+non-zero exit just means the next tick retries against the same `pending/`.
+There is one hard limit. Once `master.pt` is rewritten the round is applied,
+and a later failure (including a caller SIGKILL on timeout, which cannot be
+caught here) cannot undo it. `merge_round` therefore detects an already-applied
+round (`master.pt` stamped with that round) and reports a no-op success instead
+of retrying deltas that are now stale.
+
+Weighting is `data` (FedAvg sample-count proportional) by default and never
+falls back silently. A checkpoint missing `n_samples` is a contract violation
+from the training side and must fail loudly rather than bias the merge.
 """
 
 from __future__ import annotations
@@ -56,12 +52,10 @@ from stern.training.tb_logger import make_writer, write_mesh_round_scalars
 
 WEIGHTING_CHOICES = ("data", "inverse_loss", "token")
 
-# Dtype master.pt is written in for workers to read back. "fp32" is the
-# historical behaviour and stays the default: switching to "fp16" halves the
-# dominant term in the per-round NFS budget but doubles the quantization
-# noise floor inside pseudo_gradient (the worker push is already fp16), and
-# that trade is model-dependent. Measure ||delta||/||w|| per tensor on a real
-# round before flipping it -- see _quantize_broadcast_with_error_feedback.
+# Dtype that master.pt is written in. fp32 is the default. fp16 halves the NFS
+# broadcast but doubles the quantization noise in pseudo_gradient, and the
+# trade depends on the model. Measure ||delta||/||w|| per tensor on a real
+# round before switching (see _quantize_broadcast_with_error_feedback).
 BROADCAST_DTYPE_CHOICES = ("fp32", "fp16")
 
 
@@ -74,35 +68,23 @@ def _load_worker_checkpoints(
 ) -> dict[str, dict[str, Any]]:
     """Load this run's pending checkpoints, keyed by node name.
 
-    `pending_dir` is ONE flat directory shared by every concurrent run
-    (mesh_tick.py's _do_merging builds `checkpoints/pending` with no
-    per-run subdirectory), and finished runs can leave their checkpoints
-    behind. Globbing `*.pt` here therefore averaged sibling runs -- and dead
-    runs' leftovers -- straight into this run's master. Every other glob in
-    mesh_tick.py (lines 331/519/594/748) is already `{run_id}_*.pt`; this
-    was the one path that was not, so the scoping is mandatory here rather
-    than a defaulted convenience.
+    `pending_dir` is one flat directory shared by every concurrent run, and
+    finished runs leave files behind. The glob is therefore always scoped to
+    `run_id`, so sibling and dead runs are never averaged in.
 
-    Filenames are `{run_id}_{round}_{node}.pt` (mesh/pending_files.py). When
-    `round_num` is given, only that round's files are read -- a straggler
-    that finished a PRIOR round late (after that round's own merge already
-    cleared pending/) must not get averaged into a DIFFERENT round's merge
-    just because its file happened to still be sitting in the directory.
-    `round_num=None` keeps every matching file regardless of round (the
-    caller's choice, e.g. a cold-start bootstrap with nothing else to go on).
+    Filenames are `{run_id}_{round}_{node}.pt` (see `pending_files.py`). With
+    `round_num` set, only that round's files are read. A straggler that
+    finishes a prior round late must not be averaged into a different round.
+    `round_num=None` keeps every matching file.
 
-    `eligible=None` (default) keeps every node; otherwise a node not in
-    `eligible` is dropped (logged, not raised -- design §5.1b: a quarantined
-    node under self-requeue's enforcement window is still training and
-    still writing checkpoints for a few more rounds, which is expected here,
-    not exceptional).
+    `eligible=None` keeps every node. Otherwise a node not in `eligible` is
+    dropped with a log line, not an error. A quarantined node may keep
+    training and writing checkpoints for a few rounds.
 
-    Validates `n_samples` and exactly one of `model_state_dict` (round 0, or
-    a pre-3.2/merge=False push -- full weights, nothing to diff against yet)
-    / `delta_state_dict` (Phase 3.2: already `master - worker`, quantized
-    with error feedback on the worker side) up front, so a malformed
-    checkpoint fails before any merge math runs rather than surfacing as a
-    confusing KeyError deep in `average_deltas`.
+    Each checkpoint must carry `n_samples` and exactly one of
+    `model_state_dict` (full weights, nothing to diff against) or
+    `delta_state_dict` (already `master - worker`). These are validated up
+    front so a malformed checkpoint fails before any merge math runs.
     """
     if round_num is not None:
         files = sorted(pending_files_for_round(pending_dir, run_id, round_num))
@@ -217,20 +199,15 @@ def _atomic_save(path: Path, payload: dict[str, Any]) -> None:
 def _quantize_broadcast_with_error_feedback(
     master_sd: StateDict, residual_path: Path | None
 ) -> StateDict:
-    """Cast `master_sd` to fp16 for the NFS broadcast, carrying the rounding
-    residual across rounds.
+    """Cast `master_sd` to fp16 for the NFS broadcast, carrying the rounding residual.
 
-    Every worker reads master.pt once per round, so it is the only 16x-
-    amplified term in the round's NFS budget (measured: 349 MiB fp32 x 16
-    nodes = 5.4 GiB/round/pool, vs 174 MiB for the whole push direction,
-    which push_checkpoint_and_wait already casts to fp16). fp16 -- not bf16
-    -- because these are weights in roughly [-1, 1]: bf16 buys exponent
-    range nothing here needs and gives up 3 mantissa bits (rel. precision
-    ~3.9e-3 vs fp16's ~4.9e-4).
+    Every worker reads master.pt each round, so this is the largest NFS term:
+    the fp32 master fanned out to every node. fp16 rather than bf16, because
+    the weights sit roughly in [-1, 1]. bf16's extra exponent range is unused
+    there, and it gives up three mantissa bits.
 
-    Thin wrapper: see `mesh/quantize.py::quantize_with_error_feedback` for
-    the error-feedback mechanics, shared with the worker's pseudo-gradient
-    push (Phase 3.2).
+    Thin wrapper around `quantize.quantize_with_error_feedback`, which the
+    worker's pseudo-gradient push also uses.
     """
     return quantize_with_error_feedback(master_sd, residual_path)
 
@@ -252,20 +229,14 @@ def _append_merge_metrics(
 ) -> None:
     """Append one JSONL record for this merge round to `metrics_out`.
 
-    Mirrors mesh_round.py's worker-side per-round metrics: per-round merge
-    data (the contributor set, alpha weights) otherwise exists only in this
-    process's stdout -- unworkable to scrape across an 8-run sweep. A failed
-    write is logged and swallowed: metrics must never fail a merge that
-    otherwise succeeded.
+    Contributors and alpha weights otherwise exist only in this process's
+    stdout, which is unusable across a sweep. A failed write is logged and
+    swallowed, since metrics must never fail a merge that succeeded.
 
-    misses_excused_job_absent/misses_correlated stay 0 (design §8's
-    blame-aware categories, design §4) -- this codebase counts every miss
-    via the plain missed_round_count, not Task 9's blame-aware split, which
-    is still gated on Task 1's live-deployment replay data. requeues_seen
-    also stays 0: it's counted by the worker's own journal
-    (mesh_continue_allowed.sh's per-node requeue journal), and aggregating
-    that from the watcher side has no mechanism specified yet -- flagged
-    explicitly rather than fabricated.
+    `misses_excused_job_absent` and `misses_correlated` stay 0. Every miss is
+    counted as `missed_round_count`, with no blame-aware split yet. `requeues_seen`
+    stays 0 because the worker's requeue journal is not aggregated on the watcher
+    side. These are reported as 0 rather than guessed.
     """
     record = {
         "run_id": run_id,
@@ -305,15 +276,12 @@ def _write_tb_scalars(
     timeout_forced: bool,
     alphas: dict[str, float],
 ) -> None:
-    """Write this merge's contributor scalars, then replay any backlogged
-    per-round scalars from the JSONL. Never raises -- diagnostics must
-    never fail an otherwise-successful merge, same rule
-    _append_merge_metrics follows for --metrics-out.
+    """Write this merge's contributor scalars, then replay backlogged per-round scalars.
 
-    mesh_shared is derived from pending_dir (always
-    mesh_shared/checkpoints/pending, see watcher/mesh_tick.py::_do_merging)
-    rather than taking its own flag -- one less thing for callers to keep
-    in sync.
+    Never raises: diagnostics must never fail a merge that succeeded.
+    `mesh_shared` is derived from `pending_dir` (always
+    `mesh_shared/checkpoints/pending`, see `watcher/mesh_tick.py::_do_merging`),
+    so callers have no separate flag to keep in sync.
     """
     mesh_shared = pending_dir.parent.parent
     last_round_path = tb_dir.parent / "tb_last_round.txt"
@@ -347,24 +315,22 @@ def _write_tb_scalars(
 def filter_nonfinite(
     checkpoints: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    """Split off checkpoints carrying a nan/inf tensor.
+    """Split off checkpoints carrying a nan or inf tensor.
 
-    A node that trains zero samples -- because it was assigned a shard it does
-    not hold -- produces nan weights while still reporting a perfectly healthy
-    val_loss, since val shards are replicated to every node and always resolve
-    locally. `_inverse_loss_weights` only ever checked val_loss, so on
-    2026-08-20 those weights averaged straight into master.pt and poisoned
-    every node in the pool. Averaging is not robust to this: one nan makes the
-    whole merged tensor nan regardless of its alpha.
+    A node that trains zero samples (it was assigned a shard it does not hold)
+    produces nan weights while its val_loss stays healthy, since val shards
+    resolve locally on every node. Averaging is not robust to this: one nan
+    makes the merged tensor nan regardless of its alpha. So these checkpoints
+    must be dropped before weighting.
 
-    Returns `(kept, dropped_names)`; the caller decides whether an empty
-    `kept` is fatal.
+    Returns `(kept, dropped_names)`. The caller decides whether an empty `kept`
+    is fatal.
     """
     kept: dict[str, dict[str, Any]] = {}
     dropped: list[str] = []
     for name, ckpt in checkpoints.items():
-        sd = ckpt.get("delta_state_dict") or ckpt.get("model_state_dict") or {}
-        if all(torch.isfinite(t).all() for t in sd.values() if torch.is_tensor(t)):
+        state = ckpt.get("delta_state_dict") or ckpt.get("model_state_dict") or {}
+        if all(torch.isfinite(t).all() for t in state.values() if torch.is_tensor(t)):
             kept[name] = ckpt
         else:
             dropped.append(name)
@@ -413,28 +379,14 @@ def merge_round(
     current_master_version = master_payload.get("master_version")
 
     if round_num is not None and current_master_version == round_num:
-        # This round is already applied: merge_round is the only writer of
-        # master.pt and it stamps the round it just merged, so reaching here
-        # means a previous attempt got as far as that write and still failed
-        # to report success. Observed 2026-08-28 on e2b-c-cars and
-        # e2b-d-countries: mesh_tick.py runs this module under
-        # subprocess.run(..., timeout=300) and SIGKILLed it ~90s AFTER every
-        # durable write had landed (master.pt, the momentum buffer and the
-        # residual all carry that run's mtime), while main() was still in its
-        # trailing diagnostics. A SIGKILL from the parent cannot be caught
-        # here, so _write_tb_scalars' own "never fail the merge" except
-        # clause was no defence. The caller saw a non-zero exit, never
-        # unlinked pending/, and retried the same round every tick forever --
-        # each retry correctly dropping all 16 deltas as stale, because they
-        # were computed against the master this very round had replaced, and
-        # then dying on the resulting empty weight dict (722 failures).
-        #
-        # Re-merging is not an option (the deltas no longer apply to this
-        # master) and is not needed (the round is in master.pt already), so
-        # report a no-op success and let the caller clear pending/ and
-        # advance. Only if the interrupting failure fell between the master
-        # and momentum writes is anything lost, and then only that round's
-        # momentum, never the round itself.
+        # merge_round is the only writer of master.pt, and it stamps the round
+        # it merged. Reaching here means an earlier attempt completed that
+        # write but failed to report success (the caller may SIGKILL on
+        # timeout while diagnostics still run). Re-merging is wrong: the deltas
+        # were computed against the master this round replaced, so they are all
+        # stale. Report a no-op success so the caller clears pending/ and
+        # advances. Only a failure between the master and momentum writes loses
+        # anything, and then only that round's momentum update.
         print(
             f"run_outer_step: WARNING master.pt is already stamped "
             f"master_version={round_num} (run_id={run_id!r}) -- this round was "
@@ -462,7 +414,7 @@ def merge_round(
             f"merge_round: every worker checkpoint for run_id={run_id!r} has "
             f"non-finite weights ({sorted(nonfinite)}) -- refusing to merge. A "
             "worker training zero samples reports train_loss=nan while its "
-            "val_loss stays healthy, so re-run validate_seeding.py before "
+            "val_loss stays healthy, so re-run python -m stern.mesh.validate_seeding before "
             "restarting this run."
         )
     checkpoints, stale = filter_stale_deltas(checkpoints, current_master_version)
@@ -496,12 +448,10 @@ def merge_round(
         )
         momentum_buf = momentum_payload["momentum_buf"]
     elif round_num is not None and round_num > 0 and not allow_missing_momentum:
-        # The buffer now lives on watcher-local disk (/Data), which
-        # serve_shards.sh documents as shared world-writable scratch -- a
-        # sweep there can delete it mid-run. Silently continuing would
-        # degrade Nesterov to plain weighted averaging for the rest of the
-        # run and surface only as "DiLoCo underperforms", so past round 0
-        # this is fatal unless the caller opts out explicitly.
+        # The buffer lives on watcher-local disk, which a sweep can clear
+        # mid-run. Continuing silently would degrade Nesterov to plain
+        # averaging for the rest of the run, showing up only as "DiLoCo
+        # underperforms". Past round 0 this is fatal unless the caller opts out.
         raise ValueError(
             f"merge_round: no momentum buffer at {momentum_path} but round_num="
             f"{round_num} > 0 -- refusing to silently degrade to plain weighted "
@@ -624,7 +574,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Set by the watcher when this round's quorum floor was relaxed "
-            "below quorum_k for unreplaceable-missing nodes (design §5.2) "
+            "below quorum_k for unreplaceable-missing nodes "
             "-- recorded verbatim into --metrics-out."
         ),
     )

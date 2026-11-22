@@ -1,22 +1,17 @@
 """Effective compute weights and proportional shard counts for the mesh.
 
-Each node in the decentralized P2P training mesh gets an "effective weight"
-`E_i`: a hand-assigned cold-start prior (`SCORE_TABLE`), scaled by GPU count,
-overridden entirely by measured throughput once available. The fish-cluster
-nodes are shared with other students' jobs (why `train.sbatch` uses
-`--exclusive`), so a contended 3090 can be genuinely slower than an idle 2000
-Ada — the static table is only ever a starting point (arXiv 2607.02544 on
-fixed assumptions degrading on shared infra).
+Each node in the P2P training mesh gets an effective weight `E_i`: a
+cold-start prior from `SCORE_TABLE`, scaled by GPU count, replaced entirely by
+measured throughput once available. Nodes are shared with other users' jobs,
+so a contended GPU can be slower than the table says. The table is only a
+starting point (arXiv 2607.02544 on fixed assumptions degrading on shared
+infrastructure).
 
-`compute_shard_counts` turns a pool of these weights into exact shard counts
-that sum to `n_shards`. Naively flooring every node's share at 1 shard
-silently flattens the split to uniform once the pool gets large enough that
-the weakest node's true share rounds below that floor — this is the bug that
-once made a 3090 and a 2000 Ada equal. `ProportionalityError` catches that
-case before it happens instead of nodes silently getting a mis-sized fair
-share. Rounding drift is settled across multiple nodes rather than dumped on
-one, since several nodes tied at a `.5` boundary (the normal case here, not
-an edge case) can otherwise push a single node's count to zero or negative.
+`compute_shard_counts` turns the weights into integer shard counts that sum to
+`n_shards`. Flooring every node at one shard would silently flatten the split
+to uniform once the weakest node's share rounds below that floor, so
+`ProportionalityError` is raised instead. Rounding drift is spread across
+nodes rather than dumped on one, since many nodes tie at a `.5` boundary.
 """
 
 from __future__ import annotations
@@ -72,26 +67,13 @@ def _proportionality_error(
 def compute_shard_counts(
     weights: dict[str, float], n_shards: int, *, min_shards_per_node: int = 2
 ) -> dict[str, int]:
-    """Split `n_shards` across nodes proportional to `weights`, summing exactly.
+    """Split `n_shards` across nodes in proportion to `weights`, summing exactly.
 
-    `W_i = max(1, round(E_i/sum(E) * n_shards))`. Any drift left over by
-    rounding is then settled across *multiple* nodes, ordered by descending
-    weight (highest-`E_i` first), one shard at a time — never dumped onto a
-    single node. Several nodes tied at a `.5` rounding boundary (e.g. several
-    nodes in the same `SCORE_TABLE` group — the normal case on this cluster,
-    not an edge case) can all get rounded the same direction by Python's
-    banker's rounding, so the aggregate overshoot/undershoot can exceed what
-    any single node can safely absorb without going below
-    `min_shards_per_node`; distributing it avoids driving one node's count to
-    zero or negative.
-
-    Raises `ProportionalityError` if the weakest node's *unfloored* share
-    rounds below `min_shards_per_node` (the `max(1, .)` floor would otherwise
-    silently inflate it to a token allocation that looks proportional but
-    isn't), or if settling the rounding drift would require pushing some
-    node's final count below `min_shards_per_node` no matter how the drift is
-    distributed (i.e. the split is genuinely infeasible at this `n_shards`,
-    not just unluckily rounded).
+    Each node gets `max(1, round(E_i / sum(E) * n_shards))`. Rounding drift is
+    then settled one shard at a time, in descending-weight order, spread across
+    nodes. Raises `ProportionalityError` if a node's unfloored share rounds below
+    `min_shards_per_node`, or if the drift cannot be settled without pushing a
+    node under that minimum.
     """
     if not weights:
         raise ValueError("compute_shard_counts: no nodes provided in `weights`")
@@ -137,9 +119,8 @@ def compute_shard_counts(
             else:
                 stalled += 1
                 if stalled >= len(order):
-                    # A full pass with no eligible node: the drift can't be
-                    # distributed without pushing someone below the floor,
-                    # no matter how it's spread. Genuinely infeasible.
+                    # A full pass with no eligible node: the drift cannot be
+                    # spread without going below the floor. Infeasible.
                     raise _proportionality_error(
                         min_shards_per_node, n_shards, len(weights)
                     )

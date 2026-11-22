@@ -1,26 +1,18 @@
 """DiLoCo outer optimizer core: pseudo-gradient merge of divergent worker weights.
 
-After each node in the decentralized P2P mesh trains locally for H steps on
-its assigned shards (Tasks 1-4 decide *which* shards; this module is
-orthogonal to that), the resulting worker weights have diverged from the
-shared master. DiLoCo (arXiv 2311.08105, OpenDiLoCo arXiv 2407.07852) treats
-`master - worker` as a "pseudo-gradient" -- the direction the master would
-have moved had it seen that worker's data -- averages those pseudo-gradients
-across workers weighted by how much data each one trained on (FedAvg-style,
-`n_i / sum(n_j)`), and then takes an SGD-with-Nesterov-momentum step on the
-master using that averaged pseudo-gradient in place of a real gradient.
+After each worker trains locally for H steps on its assigned shards, its
+weights have diverged from the shared master. DiLoCo (arXiv 2311.08105,
+OpenDiLoCo arXiv 2407.07852) treats `master - worker` as a pseudo-gradient,
+averages those across workers weighted by data count (FedAvg-style,
+`n_i / sum(n_j)`), and takes an SGD-with-Nesterov-momentum step on the master
+using the average in place of a real gradient.
 
-Momentum persists *across* rounds (the caller is expected to carry
-`new_momentum_buf` into the next round's call): that's what distinguishes
-DiLoCo from plain federated averaging, which is memoryless and discards
-whatever the momentum buffer learned about the descent direction in prior
-rounds. At `lr=1.0, momentum=0.0` the Nesterov step degenerates to
-`master - delta`, which -- because `delta` is itself an alpha-weighted
-average of `master - worker_i` -- is algebraically identical to plain
-weighted averaging `sum(alpha_i * worker_i)`. That equivalence makes naive
-averaging a free ablation baseline (Tasks 13/14) and is the trip-wire that
-would catch a flipped pseudo-gradient sign: get the sign backwards and this
-specific equivalence breaks while every other test here still passes.
+Momentum persists across rounds: the caller carries `new_momentum_buf` into
+the next call. Plain federated averaging is memoryless and discards that. At
+`lr=1.0, momentum=0.0` the Nesterov step reduces to `master - delta`, which
+equals plain weighted averaging `sum(alpha_i * worker_i)`. That identity is a
+useful test: a flipped pseudo-gradient sign breaks it while other tests still
+pass.
 """
 
 from __future__ import annotations
@@ -31,20 +23,20 @@ import torch
 
 StateDict = dict[str, torch.Tensor]
 
-# Version watcher/mesh_tick.py::_bootstrap_master stamps on the master it
-# seeds before round 0's own merge has ever run. Negative on purpose, so it
-# can collide with no real round_num: `filter_stale_deltas` must not reject a
-# worker's first diff against it, and run_outer_step's already-merged
-# recovery must not mistake a bootstrap master for round 0's completed merge.
+# Version that watcher/mesh_tick.py::_bootstrap_master stamps on the master
+# before round 0 merges. Negative, so it cannot collide with a real round_num:
+# `filter_stale_deltas` must keep a worker's first diff against it, and the
+# already-merged check in run_outer_step must not mistake it for a finished merge.
 BOOTSTRAP_MASTER_VERSION = -1
 
 
 def to_fp32_state_dict(state_dict: StateDict) -> StateDict:
-    """Upcasts every floating-point tensor to fp32, leaving non-float
-    buffers untouched. Both the merge side (a pending checkpoint or master.pt
-    may arrive fp16) and the worker side (Phase 3.2: the master snapshot a
-    pseudo-gradient push diffs against) need this before any delta/momentum
-    arithmetic -- a no-op if the input already arrives in fp32."""
+    """Upcast every floating-point tensor to fp32; non-float buffers are untouched.
+
+    Needed before any delta or momentum arithmetic, on the merge side (a
+    checkpoint or master.pt may be fp16) and on the worker side (the master
+    snapshot a pseudo-gradient push diffs against). A no-op for fp32 input.
+    """
     return {
         k: (v.float() if torch.is_floating_point(v) else v)
         for k, v in state_dict.items()
@@ -54,10 +46,8 @@ def to_fp32_state_dict(state_dict: StateDict) -> StateDict:
 def data_weights(n_samples: dict[str, int]) -> dict[str, float]:
     """FedAvg data-proportional weights: `alpha_i = n_i / sum(n_j)`.
 
-    Deliberately *not* inverse-val-loss or any quality-based weighting: the
-    averaged pseudo-gradient is meant to estimate the full-data gradient, and
-    weighting by model quality would bias that estimator away from a true
-    data-proportional average.
+    Not inverse-val-loss or any other quality weighting. The average should
+    estimate the full-data gradient, and quality weighting would bias it.
     """
     total = sum(n_samples.values())
     if total <= 0:
@@ -96,21 +86,14 @@ def average_deltas(deltas: dict[str, StateDict], alphas: dict[str, float]) -> St
 def filter_stale_deltas(
     checkpoints: dict[str, dict[str, Any]], current_master_version: int | None
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    """Drops any checkpoint whose `master_version` doesn't match
-    `current_master_version` -- a pseudo-gradient (Phase 3.2) computed
-    against a master that's no longer current must not be silently applied
-    to the wrong one via nesterov_outer_step.
+    """Drop checkpoints whose `master_version` differs from `current_master_version`.
 
-    Skips the check (keeps everything) when `current_master_version` is
-    None: an unversioned master predates Phase 3.2, and rejecting every
-    checkpoint on that basis would stall a mesh mid-upgrade rather than
-    merging it plain. A checkpoint with no `master_version` key at all
-    pushed full weights (round 0, or a pre-3.2 worker) rather than a delta
-    -- that's not comparable to a version, not stale, so it is always kept
-    regardless of `current_master_version`.
+    A pseudo-gradient computed against an outdated master must not be applied
+    to the current one. The check is skipped when `current_master_version` is
+    None (an unversioned master). A checkpoint with no `master_version` pushed
+    full weights rather than a delta, so it is not comparable and is always kept.
 
-    Returns `(survivors, dropped_names)` -- the caller logs `dropped_names`
-    rather than losing them silently.
+    Returns `(survivors, dropped_names)`. The caller logs the drops.
     """
     if current_master_version is None:
         return dict(checkpoints), []

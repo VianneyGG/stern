@@ -1,3 +1,8 @@
+"""Dataset-agnostic manifest CSV: the one schema every acquisition script writes.
+
+Loaders read only this format, never a dataset-specific layout.
+"""
+
 from __future__ import annotations
 
 import csv
@@ -12,6 +17,8 @@ _REQUIRED_COLUMNS = ("identity_id", "clip_path", "duration_s", "role", "label_pa
 
 @dataclass
 class ManifestRecord:
+    """One clip. `label_path` is None for label-free (ssl) clips."""
+
     identity_id: str
     clip_path: str
     duration_s: float
@@ -28,6 +35,7 @@ class ManifestSchemaError(ValueError):
 
 
 def write_manifest(path: Path, records: list[ManifestRecord]) -> None:
+    """Write `records` as a manifest CSV, creating parent directories."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=_REQUIRED_COLUMNS)
@@ -45,6 +53,7 @@ def write_manifest(path: Path, records: list[ManifestRecord]) -> None:
 
 
 def read_manifest(path: Path, expected_role: Role) -> list[ManifestRecord]:
+    """Read a manifest CSV, failing if any row has a different role."""
     with path.open(newline="") as f:
         reader = csv.DictReader(f)
         fieldnames = set(reader.fieldnames or [])

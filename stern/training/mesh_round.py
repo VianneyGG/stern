@@ -1,27 +1,25 @@
 """Worker-side round loop for decentralized mesh SSL pretraining.
 
-Entry point invoked from `pretrain.py`'s `main()` when `MESH_RUN_ID` is set in
-the environment (set by `run_mesh_worker.sh`, not this module). Every mesh
-job is `--nodes=1 --ntasks=1`: this module must NEVER call
-`torch.distributed.init_process_group` or otherwise assume DDP is active.
+Worker-side round loop for mesh SSL pretraining. `pretrain.py`'s `main()`
+calls into this module when `MESH_RUN_ID` is set (`run_mesh_worker.sh` sets it).
 
-One `run_mesh_pretrain_stage` call covers the worker's ENTIRE lifetime for
-this run -- it loops over every round itself (not resubmitted per round via
-SLURM), so `round_num` ranges over `[0, cfg.mesh.rounds)` inside one process.
-Each round:
+Every mesh job runs as one task on one node, so this module must never call
+`torch.distributed.init_process_group` or assume DDP is active.
 
-  1. If `cfg.mesh.merge` and `round_num > 0`, pull the freshly-merged
-     `master.pt` into the local model (the outer-optimizer merge itself runs
-     on the watcher side -- Task 3 -- between this worker's rounds, never
-     here).
-  2. Train `H` local steps over this node's assigned shards
-     (`train_one_round`). `H` is `cfg.mesh.steps_per_round` unless
-     `cfg.mesh.round_budget_s` is set, in which case it is whatever fits in
-     that budget at this node's own measured rate (`mesh/pacing.py`).
-  3. Evaluate a fixed ~2000-window val subsample (`evaluate_val_loss`).
-  4. Save a local checkpoint, then push it to the shared `pending/` dir and
-     (if merging) block until the watcher's sync flag appears
-     (`push_checkpoint_and_wait`).
+One `run_mesh_pretrain_stage` call covers the worker's whole lifetime. It loops
+over every round itself, so `round_num` runs over `[0, cfg.mesh.rounds)` in one
+process. Each round:
+
+  1. If `cfg.mesh.merge` and `round_num > 0`, load the freshly merged
+     `master.pt` into the local model. The merge runs on the watcher side,
+     never here.
+  2. Train local steps over this node's shards (`train_one_round`). The step
+     count is `cfg.mesh.steps_per_round`, unless `cfg.mesh.round_budget_s` is
+     set, in which case it is whatever fits the budget at this node's measured
+     rate (`mesh/pacing.py`).
+  3. Evaluate a fixed ~2000-window validation subsample (`evaluate_val_loss`).
+  4. Save a local checkpoint, push it to the shared `pending/` dir, and, when
+     merging, wait for the watcher's sync flag (`push_checkpoint_and_wait`).
 """
 
 from __future__ import annotations
@@ -75,48 +73,40 @@ from stern.training.pretrain_levjepa import (
 
 logger = logging.getLogger(__name__)
 
-# Fixed poll cadence for the sync-flag wait -- see push_checkpoint_and_wait.
-# Not busy-looping: a 30-minute window at 5s intervals is ~360 checks, cheap
-# for both this process and the shared filesystem.
+# Poll interval for the sync-flag wait (see push_checkpoint_and_wait).
+# A 30-minute wait at 5 s is about 360 checks, which is cheap on NFS.
 _SYNC_POLL_INTERVAL_S = 5.0
 
-# Every window this dataset yields already carries no batch dimension
-# (MeshShardIterableDataset.__iter__ does `yield pixel_values.squeeze(0)`),
-# so a DataLoader batch_size of 1 is the natural unit here. Effective batch
-# size is built via `accum_steps` (gradient accumulation) instead of a wider
-# micro-batch -- these are memory-constrained single-GPU fish nodes, and
-# accum_steps trades wall-clock for peak VRAM without changing the interface
-# train_one_round/evaluate_val_loss were specified with.
+# Each window this dataset yields already has no batch dimension
+# (MeshShardIterableDataset.__iter__ squeezes it), so a DataLoader batch size
+# of 1 is the natural unit. The effective batch comes from `accum_steps`
+# instead, which trades wall-clock for peak VRAM on these single-GPU nodes.
 _MESH_BATCH_SIZE = 1
 # LeVJEPA validation batch: SIGReg is a batch statistic, so scoring one clip
-# at a time (the VideoMAE convention above) would make val loss meaningless.
+# at a time would make val loss meaningless.
 _LEVJEPA_VAL_BATCH_SIZE = 16
 
-# Keys present in the full round payload (checkpoint.base_payload()) that are
-# dropped before the payload is pushed to the shared NFS pending/ dir.
-# run_outer_step.py::_load_worker_checkpoints only ever reads
-# model_state_dict/n_samples/val_loss from a pending file, and AdamW's
-# exp_avg+exp_avg_sq buffers roughly double payload size -- shipping them to
-# NFS is pure waste, read by nobody, held until the next merge tick or
-# ROUND_TIMEOUT_S, then unlinked. The LOCAL checkpoint (checkpoint_root/
-# {run_id}.pt) keeps these keys unchanged; only the shared push drops them.
+# Keys dropped from the round payload before it is pushed to the shared NFS
+# pending/ dir. The merge reads only model_state_dict, n_samples and val_loss.
+# The optimizer buffers roughly double the payload, and the shared copy is
+# unlinked unread. The local checkpoint keeps these keys.
 _SHARED_PAYLOAD_DROP_KEYS = ("optimizer_state_dict", "optimizer_name")
 
 
 def _fp16_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Casts every floating-point tensor to fp16, leaving any non-float
-    buffer untouched. Halves the ~365MB/round NFS write in
-    push_checkpoint_and_wait; run_outer_step.py upcasts back to fp32
-    before any merge arithmetic runs on it."""
+    """Cast floating-point tensors to fp16 and leave other buffers alone.
+
+    Halves the per-round NFS write in push_checkpoint_and_wait. The merge
+    upcasts back to fp32 before doing any arithmetic.
+    """
     return {
         k: (v.half() if torch.is_floating_point(v) else v)
         for k, v in state_dict.items()
     }
 
 
-# Three rounds in a row merged without us is no longer a transient: it means
-# this node's cadence is persistently slower than its pool's, and preemption
-# is silently keeping it in the roster while it contributes nothing.
+# Three consecutive abandoned rounds mean a persistently slow node, not a
+# transient one: it stays in the roster and contributes nothing.
 _ABANDON_ALERT_STREAK = 3
 
 
@@ -139,11 +129,8 @@ def _append_round_metrics(
 ) -> None:
     """Append one JSONL record to mesh_shared/metrics/<run_id>/<node>.jsonl.
 
-    Per-round loss otherwise exists only in this process's stdout, scattered
-    across one SLURM job per node per run -- an 8-run sweep must not repeat
-    the bespoke multi-job log scraper that took to extract it last time. A
-    failed write is logged and swallowed: metrics are diagnostic, never a
-    reason to kill a training round.
+    Per-round metrics otherwise live only in each job's stdout. A failed write
+    is logged and swallowed, since metrics must never abort a round.
     """
     record = {
         "run_id": run_id,
@@ -154,17 +141,12 @@ def _append_round_metrics(
         "samp_s": samp_s,
         "n_shards": n_shards,
         "lr": lr,
-        # Exact counts, not samp_s x round_budget_s: the inferred axis is
-        # wrong for a fetch-starved node, which is what a scaling sweep
-        # measures.
+        # Exact counts. samp_s x round budget would be wrong for a node that is
+        # starved for data.
         "n_samples": n_samples,
         "n_steps": n_steps,
-        # A preempted node writes a record too, so that "this node stopped
-        # contributing" is visible in the same stream we already aggregate
-        # rather than showing up as a silent gap. Preemption trades a loud
-        # failure (the pool stalls behind a straggler) for a quiet one (the
-        # straggler holds a whole node and merges into nothing), and this is
-        # what keeps the quiet one countable.
+        # An abandoned round still writes a record, so a node that stopped
+        # contributing shows up in the stream instead of as a silent gap.
         "abandoned": abandoned,
         "consecutive_abandons": consecutive_abandons,
         "val_loss_ema": val_loss_ema,
@@ -188,17 +170,12 @@ def _append_round_metrics(
 
 
 def _resolve_subnet(hostname: str, cfg: DictConfig) -> str:
-    """This node's real subnet, for mesh/shard_map.py's same-subnet peer
-    preference (cross-switch uplink caps at ~0.94 Gbps total vs. a
-    non-blocking intra-switch backplane -- shard_map.py's docstring).
+    """Return this node's subnet, for the same-subnet peer preference in mesh/shard_map.py.
 
-    NODE_SUBNETS (mesh/topology.py) is the same hostname->subnet mapping the
-    rest of the mesh design is keyed on (fish=/254, birds=/253, cars=/252,
-    countries=/254, orchids=/253) -- a single yaml-wide constant would
-    misreport every birds/cars/orchids node as fish's "/254", silently
-    defeating the same-subnet preference for more than half the roster.
-    `cfg.mesh.subnet` is only a fallback for hosts NODE_SUBNETS doesn't know
-    about (e.g. a manual test run off the real roster).
+    The cross-switch uplink is much slower than the intra-switch backplane, so
+    peers on the same subnet are preferred. NODE_SUBNETS (mesh/topology.py)
+    maps each hostname to its subnet. `cfg.mesh.subnet` is only a fallback for
+    hosts it does not know, such as a manual test run.
     """
     return NODE_SUBNETS.get(hostname, str(cfg.mesh.get("subnet", "/254")))
 
@@ -208,14 +185,10 @@ def _require_local_shards(
 ) -> None:
     """Exit non-zero if this node was assigned a shard it does not hold.
 
-    Assignment is static (mesh/assignment.py::assign_static), so this can
-    only fire when the assignment file disagrees with the disk -- the exact
-    condition that ran undetected for two weeks before 2026-08-20, because
-    the only symptom was a skipped-shard WARNING and a zero-sample round
-    that the worker treated as "not a failure".
-
-    A worker that cannot train on what it was given must die loudly at
-    startup, not spend the round burning a GPU at 0 samp/s.
+    Assignment is static, so this fires only when the assignment file and the
+    disk disagree. A worker that cannot train on its shards must fail at
+    startup. Otherwise it spends the round at zero samples per second, and a
+    skipped-shard warning looks like a success.
     """
     absent = [name for name in shard_names if not (mesh_root / name).exists()]
     if not absent:
@@ -226,7 +199,7 @@ def _require_local_shards(
         + ", ".join(absent[:10])
         + (" ..." if len(absent) > 10 else "")
         + f" -- {mesh_root} is out of sync with the shard assignment. "
-        "Re-run validate_seeding.py; do not restart this worker."
+        "Re-run python -m stern.mesh.validate_seeding; do not restart this worker."
     )
 
 
@@ -287,24 +260,16 @@ def round_already_merged(mesh_shared: Path, run_id: str, round_num: int) -> bool
 
 
 def chunk_stop_round(rounds: int, start_round: int, chunk_rounds: int | None) -> int:
-    """Last round (exclusive) THIS worker job runs, vs `rounds` for the run.
+    """Return the last round (exclusive) this worker job runs.
 
-    `chunk_rounds is None` means one job spans the whole run -- the
-    pre-2026-08-22 behaviour, and the default, so every already-registered
-    run is unaffected. Chunking became necessary when the rebuilt cluster
-    capped SallesInfo at a 2h walltime: an ~11h 40-round run no longer fits
-    in one job, so the watcher relaunches successive chunks that resume via
-    +mesh.start_round and master.pt.
+    `chunk_rounds=None` runs the whole run in one job. Otherwise the watcher
+    relaunches successive chunks, each resuming from `master.pt` via
+    `mesh.start_round`. Exiting cleanly before the walltime cap matters: a
+    walltime kill takes every worker down mid-round at once, so all of them
+    miss the same round.
 
-    Exiting cleanly under the cap is the whole point. A walltime kill instead
-    takes all 16 workers down mid-round at the same instant, every one misses
-    the same round, and that is precisely what permanently excludes an entire
-    roster.
-
-    Clamped to `rounds` so the final chunk stops at the run's real end rather
-    than overshooting, and never below `start_round` (a non-positive
-    chunk_rounds yields an empty range and an immediate clean exit rather
-    than a backwards range that would silently skip the round).
+    Clamped to `rounds`, and never below `start_round`, so a non-positive
+    chunk_rounds exits cleanly rather than skipping rounds.
     """
     if chunk_rounds is None:
         return rounds
@@ -386,28 +351,15 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     checkpoint_root = Path(os.environ["STERN_CHECKPOINT_ROOT"])
     checkpoint_root.mkdir(parents=True, exist_ok=True)
 
-    # socket.gethostname() reports whatever the node's NSS/DNS config
-    # returns -- a short name ("node008") or an FQDN ("node008.
-    # polytechnique.fr") depending on cluster configuration, and this has
-    # been observed to change cluster-wide between mesh runs. shard
-    # assignments, NODE_SUBNETS, and the per-node checkpoint naming
-    # convention are all keyed by the short name, so normalize here once
-    # rather than at each lookup site.
+    # gethostname() may return a short name or an FQDN, depending on DNS config,
+    # and that has changed between runs. Shard assignments, NODE_SUBNETS and
+    # checkpoint names all use the short name, so normalise once here.
     node = socket.gethostname().split(".", 1)[0]
     subnet = _resolve_subnet(node, cfg)
 
     rounds = int(cfg.mesh.get("rounds", 10))
     start_round = int(cfg.mesh.get("start_round", 0))
-    # How many rounds THIS job runs before exiting cleanly, vs `rounds` which
-    # is the run's absolute length. None means one job spans the whole run --
-    # the pre-2026-08-22 behaviour, kept as the default so every already
-    # registered run is unaffected. It became necessary when the rebuilt
-    # cluster capped SallesInfo at a 2h walltime: an 11h 40-round run no
-    # longer fits in one job, so the watcher relaunches successive chunks that
-    # resume through +mesh.start_round and master.pt. Exiting under the cap is
-    # the point -- being walltime-killed instead kills all 16 workers mid-round
-    # simultaneously, and every one then misses the same round, which is what
-    # permanently excludes a whole roster.
+    # Rounds this job runs before it exits cleanly. None runs the whole run.
     stop_round = chunk_stop_round(
         rounds, start_round, cfg.mesh.get("chunk_rounds", None)
     )
@@ -416,12 +368,10 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     outer_lr = float(cfg.mesh.get("outer_lr", 0.7))
     outer_momentum = float(cfg.mesh.get("outer_momentum", 0.9))
     sync_timeout_s = float(cfg.mesh.get("sync_timeout_s", 1800.0))
-    # Per-node pacing (spec 2.3'): None keeps the uniform steps_per_round every
-    # node uses today. When set, each node instead trains whatever fits in
-    # round_budget_s at its own measured rate, so rounds take equal *time*
-    # across heterogeneous hardware and the fast nodes stop idling at the
-    # barrier. The clamps are expressed as fractions of steps_per_round so a
-    # run only has to tune one number.
+    # Per-node pacing. None keeps the uniform steps_per_round. When set, each
+    # node trains whatever fits in round_budget_s at its own measured rate, so
+    # rounds take equal time on mixed hardware and fast nodes stop idling at the
+    # barrier. The clamps are fractions of steps_per_round.
     round_budget_s = cfg.mesh.get("round_budget_s", None)
     round_budget_s = None if round_budget_s is None else float(round_budget_s)
     step_floor = int(float(cfg.mesh.get("step_floor_frac", 0.25)) * steps_per_round)
@@ -452,9 +402,8 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         raw_frames=(encoder_kind == "levjepa"),
     )
 
-    # Val shards are replicated in full to every node under mesh_root/val/
-    # (seed_mesh.py's _VAL_SUBDIR) -- always locally resolvable, so an empty
-    # shard_map is fine here (resolve_shard finds them as seeded copies).
+    # Val shards are replicated in full to every node under mesh_root/val/, so
+    # they are always local and an empty shard_map is fine.
     val_root = mesh_root / "val"
     val_shard_names = (
         sorted(p.name for p in val_root.glob("*.tar")) if val_root.is_dir() else []
@@ -517,19 +466,13 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             view_seed=derive_seed(train_seed, "val") if rng_split else None,
         )
 
-    # Production never seeds torch before this function runs (the only
-    # manual_seed call in the whole training path is pretrain.py's Stage-2
-    # branch), so model init and RandomTubeMasking's torch.rand/torch.randperm
-    # calls were previously left to whatever RNG state the process happened
-    # to be in -- making cold-start runs statistically incomparable to each
-    # other. Reseed from cfg.train.seed here, right before the first RNG
-    # consumer, so two cold starts with the same cfg are reproducible.
+    # Seed right before the first RNG consumer (model init, then masking), so
+    # two cold starts with the same config are reproducible.
     torch.manual_seed(train_seed if init_seed is None else int(init_seed))
     model = _build_pretrain_model(cfg, device=device)
-    # No DDP on this path (single-GPU worker, see module docstring), so
-    # compile happens directly on the raw model -- no wrap_ddp ordering to
-    # worry about. Compiled once here; surviving every later master.pt
-    # reload since load_state_dict mutates parameters in place.
+    # No DDP on this path, so compile the raw model directly. The compiled
+    # module survives later master.pt reloads, since load_state_dict mutates
+    # parameters in place.
     model = maybe_compile(model, cfg)
     _maybe_compile_levjepa_encoder(model, cfg)
     amp = str(cfg.train.get("amp", "off")).lower()
@@ -540,18 +483,10 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     accum_steps = int(cfg.train.get("accum_steps", 1))
     grad_clip = float(cfg.train.get("grad_clip", 0.0))
     micro_batch_size = int(cfg.mesh.get("micro_batch_size", _MESH_BATCH_SIZE))
-    # local_batch=micro_batch_size: the mesh path's real per-optimizer-step
-    # sample count is micro_batch_size * accum_steps, NOT cfg.train.batch_size
-    # (16 in ssl.yaml, never overridden here) -- _scaled_lr's linear-scaling
-    # rule must scale off the batch actually seen per step, or the LR is
-    # silently mistuned for every mesh run regardless of accum_steps. Kept in
-    # its own variable (not inlined into the AdamW call) so it can also be
-    # reported alongside per-round metrics. It is the schedule's *peak*: the
-    # per-round value is set from mesh_round_lr below, before each round runs.
-    # LeVJEPA's train config (conf/train/levjepa.yaml) has no base_lr/
-    # learning_rate linear-scaling-rule fields (it uses a flat `lr`, same as
-    # the single-node pretrain_levjepa.py path) -- _scaled_lr would raise
-    # looking for `cfg.train.learning_rate`.
+    # The LR scales with the batch actually seen per step (micro_batch_size,
+    # times accum_steps), not cfg.train.batch_size, which the mesh never uses.
+    # This is the schedule's peak; each round's value comes from mesh_round_lr.
+    # LeVJEPA configs have no base_lr fields, so they use the flat `lr`.
     peak_lr = (
         float(cfg.train.lr)
         if encoder_kind == "levjepa"
@@ -586,9 +521,7 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
     mesh_stop_file = os.environ.get("MESH_STOP_FILE")
     for round_num in range(start_round, stop_round):
         if mesh_stop_file and Path(mesh_stop_file).exists():
-            # Checked only at the round boundary -- checkpoint semantics are
-            # unchanged, and round-in-progress loss stays bounded by one
-            # round, exactly as at today's chunk boundary (design §1.1).
+            # Checked only at round boundaries, so at most one round of work is lost.
             break
         _write_current_round_marker(mesh_shared, run_id, node, round_num)
         lr = mesh_round_lr(
@@ -597,14 +530,11 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
         for group in optimizer.param_groups:
             group["lr"] = lr
 
-        # Not "round_num > start_round": a worker relaunched mid-run (e.g.
-        # after the watcher process died) starts its local round_num back at
-        # start_round, but master.pt may already reflect many prior rounds
-        # this process never saw. Loading it whenever it exists -- not just
-        # after this process's own first local round -- is what makes a
-        # relaunch a resume (and a late joiner's first round a real join)
-        # instead of silently overwriting the mesh average with a
-        # fresh-init/stale model's contribution.
+        # Load master.pt whenever it exists, not only after this process's first
+        # round. A relaunched worker starts round_num back at start_round, but
+        # master.pt may already reflect many rounds it never saw. Loading it
+        # keeps a relaunch a resume, rather than overwriting the mesh average
+        # with a stale model.
         io_stats = {
             "master_load_s": 0.0,
             "master_bytes": 0,
@@ -614,10 +544,9 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             "flag_wait_s": 0.0,
         }
 
-        # Snapshot of the master this round started from, kept around to push
-        # a pseudo-gradient (Phase 3.2) instead of the full trained weights.
-        # None on a cold start (no master.pt yet) or merge=False -- both keep
-        # push_checkpoint_and_wait's pre-3.2 full-weight path.
+        # Snapshot of the master this round started from, used to push a
+        # pseudo-gradient instead of full weights. None on a cold start or when
+        # merge=False, which keeps push_checkpoint_and_wait's full-weight path.
         master_sd_for_delta: dict[str, torch.Tensor] | None = None
         master_version: int | None = None
 
@@ -628,9 +557,8 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
                 master_payload = torch.load(
                     master_path, map_location=device, weights_only=False
                 )
-                # torch.load returns tensors independent of what
-                # load_state_dict copies into the model below, so this stays
-                # an untouched snapshot of the round's starting master.
+                # The tensors here are independent of the model's, so this
+                # snapshot is not changed by the load below.
                 master_sd_for_delta = to_fp32_state_dict(
                     master_payload["model_state_dict"]
                 )
@@ -640,11 +568,9 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
                 )
                 io_stats["master_load_s"] = time.monotonic() - _t0
                 if load_result.missing_keys or load_result.unexpected_keys:
-                    # strict=False silently skips mismatched keys rather than
-                    # raising -- without this check a key-name regression (e.g.
-                    # a stray _orig_mod. prefix) would leave this worker
-                    # training on stale weights for the rest of the run with
-                    # no signal in the round bookkeeping.
+                    # strict=False skips mismatched keys silently. Without this
+                    # check, a key-name regression (such as a stray _orig_mod.
+                    # prefix) would train on stale weights with no signal.
                     logger.error(
                         "run_mesh_pretrain_stage: master state_dict key "
                         "mismatch at round %d (run_id=%s) -- missing=%s "
@@ -655,12 +581,9 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
                         load_result.unexpected_keys,
                     )
             else:
-                # Expected only if the watcher's merge hasn't landed yet for
-                # some reason -- push_checkpoint_and_wait already blocked
-                # until the sync flag appeared, so this should be rare.
-                # Warn and keep training on this node's own weights rather
-                # than crashing a multi-day run (mirrors run_outer_step.py's
-                # missing-momentum-buffer handling).
+                # Rare: push_checkpoint_and_wait already waited for the sync
+                # flag. Warn and keep this node's own weights rather than
+                # crash a multi-day run.
                 logger.warning(
                     "run_mesh_pretrain_stage: merge=True but no master "
                     "checkpoint at %s (run_id=%s round=%d) -- continuing "
@@ -670,10 +593,8 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
                     round_num,
                 )
 
-        # Without this, a fresh DataLoader built inside train_one_round every
-        # round replayed the dataset's fixed insertion order from the top,
-        # so max_steps=steps_per_round truncated at the identical windows
-        # every round regardless of round_num.
+        # Without set_round, every round would replay the dataset from the same
+        # start, and max_steps would cut the identical windows each round.
         train_dataset.set_round(round_num)
         if rng_split and encoder_kind == "levjepa":
             ckpt_io.unwrap(model).encoder.reseed_drop(
@@ -717,15 +638,10 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             sigreg_opts=sigreg_opts,
         )
         if train_stats.get("abandoned"):
-            # The pool merged this round without us. Drop the partial round
-            # whole -- no val pass, no local save, no push. The next
-            # iteration's master load is the resync, and because we bail the
-            # moment the flag appears, that iteration's round_num is the one
-            # the pool is now on: the lag stops here instead of compounding
-            # by (our cadence - the pool's) every round. Observed 2026-08-23:
-            # node055 ran 442s/round slower than its pool for 23 rounds,
-            # contributing to six merges out of 32 and costing 3.08h of
-            # chunk-boundary stalls.
+            # The pool merged this round without us. Drop the partial round with
+            # no val pass, save or push. Bailing as soon as the flag appears
+            # lets the next iteration resync to the pool's round. Otherwise a
+            # node slower than its pool falls further behind every round.
             logger.warning(
                 "run_mesh_pretrain_stage: round %d merged without this node "
                 "after %d/%d steps (run_id=%s node=%s) -- abandoning the "
@@ -841,9 +757,8 @@ def run_mesh_pretrain_stage(cfg: DictConfig, *, device: torch.device) -> dict:
             payload["round"] = round_num
             payload["samples_per_s"] = train_stats["samples_per_s_per_gpu"]
             payload["outer_lr"] = outer_lr
-            # The seed the model was cold-started from (the manual_seed above):
-            # diag_depth.delta_from_init only measures training against a
-            # random init it can prove is this run's own.
+            # The cold-start seed. Diagnostics need it to recover this run's own
+            # random init.
             payload["init_seed"] = int(cfg.train.get("seed", 42))
             payload["outer_momentum"] = outer_momentum
 
@@ -1131,23 +1046,21 @@ def _levjepa_pooled_window(
     accum_steps: int,
     autocast_ctx: Callable[[], contextlib.AbstractContextManager],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """One optimizer step's micro-batches with SIGReg on their union
-    (train.sigreg_pool); backpropagates and returns the window's loss.
+    """Backpropagate one optimizer step's micro-batches with SIGReg pooled over them.
 
-    SIGReg depends on the batch only through per-sample sums (ECF real/imag,
-    projection moments), so: pass 1 (no grad) adds up every micro-batch's
-    sums under one shared direction set per view and differentiates the
-    pooled SIGReg w.r.t. those sums; pass 2 re-forwards each micro-batch with
-    grad and backprops invariance / accum_steps + <dSIGReg/dsums, its sums>
-    (accum_steps, not len(batches): a short last window weighs its invariance
-    like the unpooled path does)
-    -- the exact pooled gradient without holding every micro-batch's graph.
-    CPU+CUDA RNG is replayed per micro-batch so in-model randomness matches
-    across passes.
+    SIGReg depends on the batch only through per-sample sums, so the pooled
+    gradient can be computed exactly in two passes. Pass 1 (no grad) sums each
+    micro-batch's statistics under one shared direction set per view, then
+    differentiates the pooled SIGReg with respect to those sums. Pass 2
+    re-forwards each micro-batch with grad. It backprops the invariance term
+    divided by accum_steps, plus the SIGReg sums' gradient dotted with that
+    micro-batch's sums. Dividing by accum_steps rather than len(batches) keeps
+    a short last window weighted like the unpooled path. CPU and CUDA RNG are
+    replayed per micro-batch, so in-model randomness matches across passes.
 
-    Known approximation (flagged, not changed): the projector's BatchNorm
-    normalises with each micro-batch's statistics, not the pooled batch's,
-    and its running stats update in both passes.
+    Known approximation: the projector's BatchNorm normalises each micro-batch
+    with its own statistics, not the pooled batch's, and its running stats
+    update in both passes.
     """
     is_cuda = device.type == "cuda"
     states, total, n, dirs = [], None, 0, None
@@ -1252,9 +1165,9 @@ def _evaluate_val_loss_levjepa(
                         device,
                         sigreg_lambda=sigreg_lambda,
                         sigreg_directions=sigreg_directions,
+                        sigreg_opts=sigreg_opts,
                         # Round-independent key: with a seed, every round's
                         # val pass sees the same directions per batch.
-                        sigreg_opts=sigreg_opts,
                         sigreg_key=(-1, i),
                     )
                 if torch.isfinite(loss):
@@ -1285,14 +1198,12 @@ def train_one_round(
     sigreg_directions: int | None = None,
     sigreg_opts: SigregOptions | None = None,
 ) -> dict:
-    """Thin wrapper around _train_epoch_ssl (VideoMAE) / _train_epoch_levjepa
-    (LeVJEPA) for one mesh round, dispatched on the unwrapped model's type.
+    """Run one mesh round through the VideoMAE or LeVJEPA epoch loop.
 
-    Builds a DataLoader over `dataset` (num_workers=0 -- MeshShardIterableDataset's
-    own prefetch thread is the concurrency; a second DataLoader worker layer
-    would race it for the same cache dir), calls the matching per-batch loop
-    with max_steps=steps_per_round and progress_desc=f"round {round_num}",
-    and returns its stats dict unchanged.
+    The loop is picked from the unwrapped model's type. The loader uses
+    num_workers=0, since MeshShardIterableDataset already prefetches on a
+    thread, and a second worker layer would race it for the same cache dir.
+    Returns the epoch loop's stats dict unchanged.
     """
     core = ckpt_io.unwrap(model)
     is_levjepa = isinstance(core, _LeVJEPAPretrainModule)
@@ -1350,12 +1261,10 @@ def evaluate_val_loss(
 ) -> float:
     """No-grad pass over up to max_windows windows from val_dataset.
 
-    Returns mean reconstruction loss (VideoMAE) or mean levjepa_loss
-    (LeVJEPA), dispatched on the unwrapped model's type. Per the design
-    spec, per-round val runs on a fixed ~2000-window subsample, not the
-    full 7GB val set. Leaves `model.training is True` on return (matches
-    train_one_round's expectation for the next round), regardless of
-    whether this function raises.
+    Returns mean reconstruction loss (VideoMAE) or mean levjepa_loss (LeVJEPA),
+    chosen from the unwrapped model's type. Each round uses a fixed subsample of
+    about 2000 windows. Leaves `model.training` True on return, even if this
+    raises, because the next round's training expects that.
     """
     core = ckpt_io.unwrap(model)
     if isinstance(core, _LeVJEPAPretrainModule):
@@ -1419,45 +1328,27 @@ def push_checkpoint_and_wait(
     master_version: int | None = None,
     residual_path: Path | None = None,
 ) -> dict[str, float]:
-    """Push `payload` to the shared pending/ dir, then (if merging) wait.
+    """Push `payload` to the shared pending/ dir, then wait if merging.
 
-    Returns `{"pending_push_s", "pending_bytes", "flag_wait_s", "pushed"}`
-    for the caller's per-round I/O log -- the push and the barrier wait are
-    the two costs that have to be told apart before any NFS optimization can
-    be judged, and they are only separable here.
+    Returns `{"pending_push_s", "pending_bytes", "flag_wait_s", "pushed"}` for
+    the caller's per-round I/O log.
 
-    Writes to mesh_shared/checkpoints/pending/{run_id}_{round_num}_{node}.pt
-    (mesh/pending_files.pending_filename -- the round segment is what lets
-    every reader tell this round's submission apart from a straggler still
-    pushing a prior round's checkpoint after that round's merge already
-    cleared pending/) via `checkpoint.try_save` so a transient NFS write
-    failure degrades instead of raising: on exhausted retries this returns
-    `pushed=False` and skips the barrier entirely, leaving the caller to
-    proceed to the next round from its own weights rather than dying
-    mid-run.
+    The file goes to mesh_shared/checkpoints/pending/ via `checkpoint.try_save`,
+    so a transient NFS failure does not raise. On exhausted retries it returns
+    `pushed=False` and skips the barrier, and the caller carries on from its
+    own weights.
 
-    When `master_sd` is given (every round this worker had a master to load,
-    i.e. every round but round 0), pushes `master_sd - model_state_dict`
-    (Phase 3.2) instead of the full weights: DiLoCo's actual signal is that
-    small difference, and quantizing it directly (with the same error
-    feedback as the master broadcast, via `residual_path`) wastes far less
-    precision than quantizing the large weight values before the merge side
-    subtracts them. `master_version` travels alongside so the merge can
-    reject a delta computed against a master that's no longer current rather
-    than silently applying it to the wrong one. When `master_sd` is None
-    (round 0, or a merge=False solo run with nothing to diff against), keeps
-    pushing the full `model_state_dict` cast to fp16, unchanged from before
-    this parameter existed.
+    When `master_sd` is given, the push is `master_sd - model_state_dict`, a
+    quantized pseudo-gradient, not the full weights. Quantizing the small
+    difference loses far less precision than quantizing whole weights.
+    `master_version` lets the merge reject a delta computed against a stale
+    master. With `master_sd=None` (round 0, or a solo run), the full state dict
+    is pushed in fp16.
 
-    If the push succeeded and `merge` is False (the ab-single_node reference
-    arm), returns immediately -- no wait, the caller proceeds to the next
-    round locally. If the push succeeded and `merge` is True, polls for
-    mesh_shared/checkpoints/flags/sync_complete_{run_id}_{round_num}.flag
-    every 5s up to sync_timeout_s; on timeout, logs an ERROR naming
-    run_id/round_num/node and calls sys.exit(1) -- NOT escalate.py, which
-    operates on watcher-process state, not a worker job's own state. The
-    existing, unmodified dead/stalled-job detectors catch this exit through
-    the normal cron path.
+    With `merge=False`, returns right after the push. With `merge=True`, polls
+    for mesh_shared/checkpoints/flags/sync_complete_{run_id}_{round_num}.flag
+    every 5 s, up to sync_timeout_s. On timeout it logs an error and exits the
+    process. The watcher's existing stall detectors pick up that exit.
     """
     mesh_shared = Path(mesh_shared)
     pending_path = (

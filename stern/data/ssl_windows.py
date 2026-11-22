@@ -1,10 +1,8 @@
 """Label-free dataset for SSL pretraining on unlabelled video.
 
-Mirrors _VAWindowDataset from probe/train.py but:
-- No labels (unlabelled video like VoxCeleb2)
-- Reads from WDS shards (VOXMINI_SHARDS_ROOT, preferred) or the legacy
-  cached-JPEG-directory layout (VOXMINI_FRAMES_ROOT) when available
-- Falls back to live mp4 decode if neither is set
+Mirrors VAWindowDataset (stern/data/probe_windows.py), minus the labels. Frame
+sources, in priority order: WDS shards (VOXMINI_SHARDS_ROOT), the legacy JPEG
+directory cache (VOXMINI_FRAMES_ROOT), then live mp4 decode.
 """
 
 from __future__ import annotations
@@ -25,20 +23,17 @@ from stern.data.windows import build_frame_windows
 
 
 class SSLWindowDataset(Dataset):
-    """Unlabelled, fixed-window dataset from SSLDataset.
+    """Unlabelled, fixed-window dataset over an SSLDataset.
 
-    Iterates identity->clip, reads fixed `num_frames`-long windows, emits only
-    pixel_values (no labels). Three source priorities, checked in order:
+    Emits `pixel_values` only, one item per `num_frames`-long window. The frame
+    source is chosen in this order:
 
-    1. VOXMINI_SHARDS_ROOT set: read from WDS shards (build_wds_shards.py).
-       `_items` entries are `((shard_path, clip_key), idx)` -- a tuple in
-       position 0 distinguishes this from the directory-cache case below.
-    2. VOXMINI_FRAMES_ROOT set: read from the legacy loose-JPEG-directory
-       cache via `build_frame_windows` -- `_items` entries are
-       `(frame_files, idx)`, unchanged from before.
-    3. Neither set: one live-decoded window per clip via `decode_frames`,
-       `_items` entries are `(None, clip_path)` -- for the small local smoke
-       test only, unchanged from before.
+    1. VOXMINI_SHARDS_ROOT: WDS shards from build_wds_shards.py. Items are
+       `((shard_path, clip_key), idx)`.
+    2. VOXMINI_FRAMES_ROOT: legacy JPEG directory cache, via
+       `build_frame_windows`. Items are `(frame_files, idx)`.
+    3. Neither: one live-decoded window per clip, for the local smoke test.
+       Items are `(None, clip_path)`.
     """
 
     def __init__(
@@ -129,11 +124,9 @@ class SSLWindowDataset(Dataset):
             raise RuntimeError(f"Failed to load frames for item {i}") from exc
 
         if self._raw_frames:
-            # LeVJEPA's build_views does its own uint8 normalisation and
-            # photometric augmentation -- handing it preprocess_window's
-            # already-ImageNet-normalised float tensor would double up
-            # (and its (C, T, H, W) layout doesn't match build_views's
-            # expected (T, H, W, 3) input either).
+            # build_views normalises and augments uint8 frames itself. Passing it
+            # preprocess_window's ImageNet-normalised (C, T, H, W) float tensor
+            # would normalise twice, and the layout is wrong for (T, H, W, 3).
             return torch.from_numpy(np.stack(frames))
 
         pixel_values = preprocess_window(frames, self._num_frames, self._image_size)

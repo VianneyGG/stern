@@ -1,8 +1,8 @@
-"""Write one probe run's val-set predictions for the gate aggregator.
+"""Write one probe run's validation predictions for the temporal-conditions gate.
 
-A Hydra entrypoint taking the same overrides as `training.train`, so the val
-split is reproduced exactly: `_split_loaders` seeds `random_split` from
-`cfg.train.seed`, and holding that constant across conditions is what keeps the
+A Hydra entrypoint that takes the same overrides as the training entrypoint, so
+the val split is reproduced exactly. `_split_loaders` seeds its `random_split`
+from `cfg.train.seed`. Keeping that seed fixed across conditions keeps the
 bootstrap paired.
 """
 
@@ -71,8 +71,7 @@ def main(cfg: DictConfig) -> None:
         str(cfg.train.probe_checkpoint_label),
         str(cfg.train.get("temporal_condition", "normal")),
     )
-    # VA is 2-dimensional; the gate is computed on valence and arousal pooled,
-    # matching how concordance_correlation_coefficient is applied elsewhere.
+    # Valence and arousal are pooled into one flat array for the gate's CCC.
     np.savez(out, pred=preds.reshape(-1), target=targets.reshape(-1))
     print(f"wrote {out} ({len(preds)} windows)", flush=True)
 

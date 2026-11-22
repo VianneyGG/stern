@@ -1,3 +1,5 @@
+"""Tubelet patch embedding: a Conv3d over non-overlapping spatiotemporal cubes."""
+
 from __future__ import annotations
 
 from torch import nn

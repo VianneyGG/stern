@@ -1,10 +1,11 @@
-"""Per-block attention-map entropy, read off the shared residual-stream
-traversal (`_diag_common.forward_with_hidden_states`) so the only
-block-local thing done here is the attention-weight extraction itself --
-never a second hand-mirrored copy of `ViTBlock.forward`'s residual update.
+"""Per-block attention-map entropy.
 
-`attention_nmi` is cut per the design doc: reasoned redundant with entropy
-in advance rather than measured, so this module ships entropy only.
+Reads the residual stream through the shared `common.forward_with_hidden_states`
+traversal, so the only block-local step here is extracting attention weights.
+Do not copy `ViTBlock.forward`'s residual update, or the two will drift.
+
+`attention_nmi` was dropped on purpose: it was judged redundant with entropy,
+not measured to be so. Only entropy is implemented.
 """
 
 from __future__ import annotations

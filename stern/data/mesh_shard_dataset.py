@@ -1,20 +1,16 @@
 """Iterable dataset over mesh-resident WDS shards, with prefetch and eviction.
 
-Two shard populations live under `mesh_root` and are **not** interchangeable:
+Two shard populations live under `mesh_root`. They are **not** interchangeable:
 
-- `mesh_root/` itself -- this node's permanent seeded contribution. Peers
-  pull from it via `serve_shards.sh` (`stern/mesh/shard_map.py`'s
-  `shard_map` lookups depend on it persisting across rounds *and runs*).
-  Never deleted by the training loop.
-- `mesh_root/cache/` -- shards fetched for this round via `fetch_shard`
-  (`stern/mesh/fetch.py`). Evicted immediately after use to bound
-  `/Data`.
+- `mesh_root/` itself holds this node's permanent seeded shards. Peers rely on
+  them (see `stern/mesh/shard_map.py`), so they must persist across rounds and
+  runs. The training loop never deletes them.
+- `mesh_root/cache/` holds shards staged for the current round. They are
+  evicted right after use to bound local disk.
 
-`resolve_shard` and `evict_if_fetched` are kept as separate, directly-tested
-functions (not folded into one convenience call) precisely so a refactor
-can't accidentally collapse "fetched" and "seeded" into a single
-delete-after-use path -- doing so would delete this node's seeded shards out
-from under every peer that depends on them.
+`resolve_shard` and `evict_if_fetched` are separate functions on purpose. Merging
+them into one delete-after-use path would delete seeded shards that peers
+depend on.
 """
 
 from __future__ import annotations
@@ -49,13 +45,9 @@ def resolve_shard(
 ) -> tuple[Path, bool]:
     """Locate `shard` on local disk, preferring the permanent seeded copy.
 
-    Fall-through order: seeded (`mesh_root/shard`) -> already-cached
-    (`mesh_root/cache/shard`) -> FileNotFoundError. Only the seeded copy is
-    reported as `was_fetched=False`; a leftover `cache/` entry still counts
-    as fetched and is evicted after use.
-
-    Raises FileNotFoundError if the shard is absent. There is deliberately
-    no P2P fetch: see the comment in the body.
+    Checks `mesh_root/shard`, then `mesh_root/cache/shard`, then raises
+    FileNotFoundError. Only the seeded copy returns `was_fetched=False`. A
+    leftover cache entry counts as fetched and is evicted after use.
     """
     mesh_root = Path(mesh_root)
 
@@ -68,24 +60,21 @@ def resolve_shard(
     if cached_path.exists():
         return cached_path, True
 
-    # No P2P fallback. Assignment is static -- a node is only ever given
-    # shards it verifiably holds -- so reaching here means the assignment
-    # disagrees with the disk, and fetching would paper over that exactly
-    # as it did before 2026-08-20, when nothing was serving and every miss
-    # became a silently skipped shard.
+    # No network fallback. Assignment is static, and a node is only given
+    # shards it holds. A miss here means assignment and disk disagree, and
+    # fetching would hide that by silently skipping the shard.
     raise FileNotFoundError(
         f"resolve_shard: {shard!r} is not present under {mesh_root} and no "
         "fetch fallback exists. The shard assignment disagrees with this "
-        "node's disk -- re-run validate_seeding.py."
+        "node's disk -- re-run python -m stern.mesh.validate_seeding."
     )
 
 
 def evict_if_fetched(path: Path, mesh_root: Path) -> None:
     """Delete `path` only if it lives under `mesh_root/cache/`.
 
-    A seeded shard (anywhere else under `mesh_root`, notably `mesh_root`
-    itself) is never touched. Idempotent: deleting an already-missing path
-    is a no-op, not an error, since eviction can race a concurrent cleanup.
+    Seeded shards are never touched. Deleting a missing path is a no-op, since
+    eviction can race a concurrent cleanup.
     """
     path = Path(path)
     cache_dir = (Path(mesh_root) / _CACHE_DIRNAME).resolve()
@@ -103,12 +92,10 @@ def evict_if_fetched(path: Path, mesh_root: Path) -> None:
 class MeshShardIterableDataset(IterableDataset):
     """Streams VA-probe/SSL windows from a list of mesh shards.
 
-    Keeps exactly one shard "active" (being decoded) and one "pending"
-    (resolving -- local lookup or P2P fetch -- on a background daemon
-    thread) at a time, so disk usage under `mesh_root/cache/` stays bounded
-    regardless of how many shards this node is assigned. An unfetchable
-    shard is logged and skipped rather than raised: the worker keeps
-    training on what it has, and the watcher reconciles next round.
+    One shard is active (being decoded) and one is pending (being resolved on a
+    background daemon thread). Disk use under `mesh_root/cache/` therefore stays
+    bounded however many shards the node holds. A shard that cannot be resolved
+    is logged and skipped, so training continues on what is available.
     """
 
     def __init__(
@@ -137,20 +124,17 @@ class MeshShardIterableDataset(IterableDataset):
         self._augment = augment
         self._seed = seed
         self._round = 0
-        # LeVJEPA's LeVJEPAViewDataset/build_views need un-normalized
-        # (T, H, W, 3) uint8 clips (same contract as
-        # SSLWindowDataset(raw_frames=True)), not preprocess_window's
-        # normalized (C, T, H, W) float pixel_values -- build_views does its
-        # own resize/crop/normalize per view.
+        # LeVJEPA's build_views takes un-normalised (T, H, W, 3) uint8 clips, as
+        # SSLWindowDataset(raw_frames=True) does. It does its own resize, crop
+        # and normalisation per view.
         self._raw_frames = raw_frames
 
     def set_round(self, round_num: int) -> None:
-        """Selects the deterministic shard/window permutation the next
-        __iter__ call uses. Without this, a fresh DataLoader built each
-        mesh round (mesh_round.py's train_one_round) replayed the exact
-        same first `steps_per_round` windows every round -- the node's
-        shard/clip/window order is otherwise fixed insertion order, and
-        max_steps truncation always cuts at the same point."""
+        """Set the round that seeds the shard and window order of the next `__iter__`.
+
+        Without this, every round replays the same first `steps_per_round`
+        windows, because the order is fixed and truncation always cuts at the
+        same point."""
         self._round = round_num
 
     def _worker_shards(self) -> list[str]:
@@ -180,33 +164,26 @@ class MeshShardIterableDataset(IterableDataset):
         if not shard_names:
             return
 
-        # Keyed on (seed, round, worker_id) so a relaunched worker process
-        # reproduces the exact order its round_num implies (mesh_round.py's
-        # cold-start/resume contract), rather than depending on process
-        # state that a crash would lose. `_worker_shards` may return
-        # `self._shard_names` itself (no worker split) -- copy before
-        # shuffling so repeated __iter__ calls don't compound permutations
-        # on the stored list.
+        # Keyed on (seed, round, worker_id), so a relaunched worker reproduces
+        # the order for its round (see mesh_round.py's resume contract) without
+        # relying on process state that a crash would lose. `_worker_shards` may
+        # return `self._shard_names` itself, so copy before shuffling. Otherwise
+        # repeated `__iter__` calls would compound permutations.
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
-        # random.Random's seed only accepts int/float/str/bytes/None, not a
-        # tuple -- a delimited string keeps the three components distinct
-        # (no collision between e.g. (1, 23) and (12, 3)).
+        # random.Random rejects tuple seeds. The colon-joined string keeps the
+        # fields distinct, so (1, 23) and (12, 3) cannot collide.
         rng = random.Random(f"{self._seed}:{self._round}:{worker_id}")
-        # A SEPARATE stream for augmentation draws. Sharing `rng` would let
-        # every augment draw advance the same state the per-shard
-        # `rng.shuffle(windows)` consumes, so merely toggling `augment` would
-        # silently reorder the training windows of every shard after the
-        # first -- an augmentation flag must not change which data is seen in
-        # which order.
+        # Augmentation draws use their own stream. Sharing `rng` would make the
+        # `augment` flag reorder the windows of every shard after the first.
+        # The flag must not change which data is seen in which order.
         aug_rng = random.Random(f"aug:{self._seed}:{self._round}:{worker_id}")
         shard_names = list(shard_names)
         rng.shuffle(shard_names)
 
-        # Loaded once from mesh_root/manifest.json -- a single index over
-        # the whole shard set. A shard fetched into mesh_root/cache/ has no
-        # manifest.json of its own, so this must never be re-derived from a
-        # shard's own parent directory.
+        # One index over the whole shard set, loaded from mesh_root/manifest.json.
+        # Cached shards have no manifest of their own, so never derive the index
+        # from a shard's parent directory.
         shard_index = load_shard_index(self._mesh_root)
 
         result_queue: "queue.Queue" = queue.Queue()
@@ -230,12 +207,9 @@ class MeshShardIterableDataset(IterableDataset):
                 continue
 
             try:
-                # Built as a flat list (not the nested generator this
-                # replaces) because the shuffle below needs the full
-                # per-shard window set materialized first -- one shard's
-                # windows (~2k for the measured 260-shard corpus) is a
-                # trivial in-memory list, and this never buffers across
-                # shards so the bounded-disk eviction contract is untouched.
+                # A flat list, because the shuffle needs every window of this
+                # shard up front. A shard holds about 2k windows, which is cheap.
+                # Nothing is buffered across shards, so eviction stays bounded.
                 windows = [
                     (clip_key, start)
                     for clip_key, entry in shard_index.items()
@@ -256,21 +230,15 @@ class MeshShardIterableDataset(IterableDataset):
                             self._frame_stride,
                         )
                     )
-                    # _indexed, not _at: the shuffle above makes this random
-                    # access within the shard, and read_shard_frames_at
-                    # re-opens the tar and walks all ~4k member headers on
-                    # every window. Measured on a real 0.89 GB shard:
-                    # 47.8 ms/window vs 3.3 ms via the cached member offsets,
-                    # of which the actual JPEG decode is only 2.7 ms. The tar
-                    # scan, not the decode, is what held every node's GPU at
-                    # ~15% utilization.
+                    # Indexed, not `_at`: the shuffle makes this random access.
+                    # `_at` re-walks every tar header on each window, and that
+                    # scan dominates the cost, not the JPEG decode.
                     frames = read_shard_frames_indexed(
                         path, clip_key, idx, size=self._image_size
                     )
                     if self._raw_frames:
-                        # No group augment or normalization here -- LeVJEPA's
-                        # build_views (called downstream) does its own
-                        # spatial/photometric augmentation per view.
+                        # No augment or normalisation here. build_views does both
+                        # per view, downstream.
                         yield torch.from_numpy(np.stack(frames))
                         continue
                     if self._augment:
@@ -281,6 +249,6 @@ class MeshShardIterableDataset(IterableDataset):
                     )
                     yield pixel_values.squeeze(0)
             finally:
-                evict_if_fetched(path, self._mesh_root)
+                evict_if_fetched(path, self._mesh_root)  # no-op for seeded shards
 
             pending_thread = next_thread

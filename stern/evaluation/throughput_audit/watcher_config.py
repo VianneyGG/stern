@@ -1,9 +1,9 @@
-"""Static config-vs-code check: is quorum merge enabled per registered run?
+"""Static check: is quorum merge enabled for each registered run?
 
-Reads runs/state/mesh_run_configs.json (or a locally-pulled copy). Per
-MeshRunConfig in stern/watcher/mesh_tick.py, quorum_k defaults to
-None -- that default means the run falls back to the pre-quorum
-all-or-ROUND_TIMEOUT_S wait quorum.py was built to remove.
+Reads runs/state/mesh_run_configs.json, or a local copy of it. In
+MeshRunConfig (stern/watcher/mesh_tick.py), `quorum_k` defaults to None. That
+default falls back to the old all-or-ROUND_TIMEOUT_S wait, which quorum merge
+replaces.
 """
 
 from __future__ import annotations

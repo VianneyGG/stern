@@ -1,13 +1,10 @@
 # stern/watcher/escalate.py
 """Headless `claude -p` escalation for failure modes that need judgment:
-repeat death after auto-resubmit, a stalled RUNNING job, or quota pressure
-(spec §3 Escalator, §5 safety guardrails).
+repeat death after auto-resubmit, a stalled RUNNING job, or quota pressure.
 
-Cooldown + daily budget are the two automated brakes (spec §5, guardrails
-4-5); the transcript-before-action guarantee (guardrail 6) is why this
-writes stdout to disk via a live file handle (subprocess.Popen) instead of
-subprocess.run's capture-then-write-at-exit -- a kill mid-call still leaves
-whatever was written on disk.
+A per-subject cooldown and a daily budget are the automated brakes. Output
+goes to the transcript file through a live handle (Popen), not captured by
+subprocess.run, so a kill mid-call still leaves what was written on disk.
 """
 
 from __future__ import annotations
@@ -173,8 +170,8 @@ def _resubmit_nan_node(
 ) -> str | None:
     """Reload this run's MeshRunConfig from mesh_run_configs.json and
     resubmit `node` with a halved inner-LR override, reloading from the
-    run's last merged master checkpoint (mesh_round.py's cold-start
-    contract already handles a fresh worker picking up master.pt)."""
+    run's last merged master checkpoint. A fresh worker picks up master.pt
+    on cold start, so no extra state is needed."""
     from stern.watcher.mesh_tick import (
         load_run_configs,
         resubmit_with_override,

@@ -28,7 +28,7 @@ class LinearVAHead(nn.Module):
     Accepts either `(B, D)` or `(B, N, D)` and returns `(B, 2)` VA values in
     `[-1, 1]` after a tanh activation. With `bounded=False` the training
     output is linear and only the eval output is clamped to `[-1, 1]`: a tanh
-    that saturates zeroes its own gradient (the ssl-diag-03 probe on AFEW-VA).
+    that saturates zeroes its own gradient (seen on an AFEW-VA probe).
     """
 
     def __init__(self, embed_dim: int = 768, num_heads: int = 12, bounded: bool = True):

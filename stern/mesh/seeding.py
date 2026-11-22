@@ -1,11 +1,10 @@
 """Verify that a pool's on-disk shard payload matches the golden reference.
 
-Written after the 2026-08-20 factorial incident, in which shard *attribution*
-and shard *reality* disagreed for two weeks without anything noticing: the
-shard map claimed node069 held 89 shards; node069 held 0. Assignment was computed
-against one source of truth and resolution against another, so workers were
-assigned shards that did not exist, trained on zero samples, and reported it
-as a warning.
+Checks a pool's on-disk shard payload against the golden reference. Shard
+*attribution* (what the shard map says a node holds) and shard *reality* (what
+is on disk) can disagree silently. When they did, a node was assigned 89
+shards and held none, so its workers trained on zero samples and only logged a
+warning.
 
 Everything here is pure. The SSH scan that feeds it lives in
 `stern/mesh/validate_seeding.py`.

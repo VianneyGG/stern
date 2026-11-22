@@ -1,11 +1,10 @@
-"""Parses runs/state/watcher.log for MERGING events and cron-outage gaps.
+"""Parse runs/state/watcher.log for MERGING events and cron-outage gaps.
 
-Line format is fixed by _log() in stern/watcher/watch_training.py:
+The line format comes from `_log()` in stern/watcher/watch_training.py:
     f"{iso_ts} mesh: {run_id}: AWAITING_CHECKPOINTS -> MERGING ({detail})"
-detail is produced by _do_awaiting_checkpoints in
-stern/watcher/mesh_tick.py and has exactly three shapes:
-"{N} nodes" (full check-in), "quorum {k}/{eligible} reached, {N} nodes"
-(quorum merge), "timeout, missing {list}{excluded_note}" (old timeout path).
+`detail` is written by `_do_awaiting_checkpoints` in stern/watcher/mesh_tick.py
+and has three shapes: "{N} nodes" (full check-in), "quorum {k}/{eligible}
+reached, {N} nodes" (quorum merge), and "timeout, missing {list}..." (timeout).
 """
 
 from __future__ import annotations

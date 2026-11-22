@@ -13,15 +13,14 @@ Frame files are written unpadded (`0.jpg, 1.jpg, ..., 10.jpg`, matching the
 original tool) -- `frame_decoder.list_frame_files` sorts these numerically.
 
 Defaults to `.data/veatic` (see `.gitignore`'s "local bulk dataset downloads"
-entry) for local work. On the login-node/SallesInfo cluster, override with
-`VEATIC_ROOT=/Data/$USER/veatic` -- bulk data belongs on per-node `/Data`
-there, never the shared NFS mount.
+entry). On the cluster, set `VEATIC_ROOT` to a node-local data path. Bulk data
+must stay off the shared NFS mount.
 
 Usage (local):
     uv run python stern/prep/fetch_veatic.py --zip ~/Downloads/VEATIC.zip
 
 Usage (cluster):
-    VEATIC_ROOT=/Data/$USER/veatic \\
+    VEATIC_ROOT=$DATA_ROOT/veatic \\
       uv run python stern/prep/fetch_veatic.py \\
         --zip ~/Downloads/VEATIC.zip --dest $VEATIC_ROOT
 
@@ -42,23 +41,22 @@ import av
 
 
 def extract_frames(video_path: Path, dest_dir: Path) -> int:
+    """Write every frame of `video_path` to `dest_dir` as unpadded `N.jpg`; return the count."""
     dest_dir.mkdir(parents=True, exist_ok=True)
-    n = 0
+    n_written = 0
     with av.open(str(video_path)) as container:
         stream = container.streams.video[0]
         for frame in container.decode(stream):
-            frame.to_image().save(dest_dir / f"{n}.jpg")
-            n += 1
-    return n
+            frame.to_image().save(dest_dir / f"{n_written}.jpg")
+            n_written += 1
+    return n_written
 
 
 def _find_dir(root: Path, *names: str) -> Path:
     """Locate a directory matching any of `names` under `root`, at any depth.
 
-    The zip's actual top-level layout is `videos/` (plural) + `rating_averaged/`
-    -- the README's tree names it `video/` (singular), confirmed wrong against
-    the real downloaded VEATIC.zip this session. Accept both spellings and
-    search subdirectories too, rather than assume either is exact.
+    The archive uses `videos/`, but the README says `video/`. Accept both, and
+    search subdirectories too.
     """
     for name in names:
         if (root / name).is_dir():

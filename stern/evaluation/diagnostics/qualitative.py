@@ -1,9 +1,10 @@
-"""Four Tier-C-by-construction qualitative panels: embedding scatter,
-retrieval grid, mask-ratio grid, attention rollout. No function here returns
-a decision rule -- `attention_rollout` is Tier C permanently (Abnar &
-Zuidema's rollout is not a faithful decomposition of attribution, per the
-design doc's rollout-faithfulness caveat), not pending calibration like the
-other diagnostics in this series.
+"""Four qualitative panels: embedding scatter, retrieval grid, mask-ratio grid,
+attention rollout.
+
+These are Tier C by construction and return no decision rule. Unlike the other
+diagnostics, none of them is waiting on calibration. Attention rollout stays
+Tier C for good: Abnar & Zuidema's rollout is not a faithful decomposition of
+attribution.
 """
 
 from __future__ import annotations
@@ -54,8 +55,8 @@ def retrieval_grid(query, gallery, k: int = 5) -> "np.ndarray":
 @torch.no_grad()
 def mask_ratio_grid(model, pixel_values, ratios, device) -> "np.ndarray":
     """One coarse per-patch z-value heatmap at token-grid resolution
-    `(h_p, w_p)` per mask ratio -- NOT a pixel-space reconstruction, since
-    `diag_reconstruction.py` has no unpatchify inverse (design.md)."""
+    `(h_p, w_p)` per mask ratio. This is NOT a pixel-space reconstruction:
+    `reconstruction.py` has no unpatchify inverse."""
     grid = model.encoder.token_grid
     t_p, h_p, w_p = grid
     pixel_values = pixel_values.to(device)

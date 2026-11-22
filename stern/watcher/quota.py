@@ -1,15 +1,10 @@
 """Disk-usage probes for the `quota` detector.
 
-Home-dir usage is the user's own NFS quota (`quota -w -p`, local -- the watcher
-runs on login-node, the NFS home's mount point), NOT `df`: `df` reports the
-whole shared filesystem's occupancy, which is a different number from this
-user's allowance and stayed near 51% while a real quota-exceeded incident
-was happening at 100% of a 30G limit (2026-08-14). `df` is kept only as a
-fallback for when `quota` itself is unavailable. Node-local /Data usage is
-per-node -- VoxCeleb2 frames and checkpoints live there (train.sbatch's
-STERN_CHECKPOINT_ROOT / VOXMINI_FRAMES_ROOT), not on the NFS home -- so it
-requires one `ssh <node>` per currently-running job's node, same pattern as
-sync_to_cluster.sh's Bash(ssh *) precedent.
+Home-dir usage is the user's own NFS quota (`quota -w -p`), NOT `df`: `df`
+reports the whole shared filesystem, which read ~51% while the 30G quota was
+at 100%. `df` is only a fallback for when `quota` is unavailable. Node-local
+/Data usage is per node (frames and checkpoints live there, not on the NFS
+home), so it takes one `ssh <node>` per running job's node.
 """
 
 from __future__ import annotations

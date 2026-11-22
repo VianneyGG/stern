@@ -1,3 +1,5 @@
+"""ViT building blocks shared by the VideoMAE and LeVJEPA encoders."""
+
 from stern.models.vit.attention import SelfAttention
 from stern.models.vit.block import BlockConfig, ViTBlock
 from stern.models.vit.droppath import DropPath

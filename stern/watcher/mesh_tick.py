@@ -1,18 +1,14 @@
-"""stern/watcher/mesh_tick.py
+"""Round-state driver for the decentralized P2P training mesh.
 
-Round-state driver for the decentralized P2P training mesh (design spec §9).
-Called every cron tick (unconditionally -- see watch_training.py's wiring),
-this module owns the ASSIGNING -> RUNNING -> AWAITING_CHECKPOINTS -> MERGING
--> SYNCING -> DONE state machine for each configured mesh run: it submits
-one sbatch job per node, invokes the existing run_outer_step.py DiLoCo merge
-once every eligible node has checked in (or a round times out), and writes
-the sync flags Task 2's worker-side round loop
-(stern/training/mesh_round.py) polls for.
+Runs on every cron tick. Owns the ASSIGNING -> RUNNING -> AWAITING_CHECKPOINTS
+-> MERGING -> SYNCING -> DONE state machine for each configured mesh run: it
+submits one sbatch job per node, runs the DiLoCo outer-step merge once every
+eligible node has checked in (or the round times out), and writes the sync
+flags the worker-side round loop polls for.
 
-Job health (dead/stalled detection, auto-resubmit, escalation) is entirely
-delegated to the existing, unmodified stern/watcher/tick.py --
-mesh jobs are appended to the SAME jobs_registry.json so that machinery
-covers them for free; this module only tracks round progress.
+Job health (dead/stalled detection, resubmission, escalation) belongs to
+stern/watcher/tick.py. Mesh jobs are appended to the same jobs_registry.json
+so that machinery covers them; this module only tracks round progress.
 """
 
 from __future__ import annotations
@@ -80,33 +76,25 @@ from stern.watcher.squeue import load_squeue_snapshot
 from stern.watcher.shard_transfer import copy_shards
 from stern.watcher.state import RunState, WatcherState, clear_run_state
 
-# Must stay well below the mesh's default per-round sync timeout
-# (videomae_mesh_ssl.yaml's mesh.sync_timeout_s: 1800.0) -- that's how long a
-# worker that already pushed its own checkpoint will wait at the barrier
-# before giving up and exiting. If this threshold were >= sync_timeout_s (it
-# was previously 3600.0, twice as long), every already-finished worker exits
-# before the watcher ever attempts the force-merge meant to save it. 900s
-# leaves a 900s margin under the worker's 1800s patience for tick cadence and
-# merge-operation overhead (design spec §9: "this round merges whatever
-# arrived (partial average)").
+# Must stay well below the workers' per-round sync timeout (mesh.sync_timeout_s,
+# 1800s). A worker that already pushed its checkpoint waits that long at the
+# barrier; the watcher's force-merge has to fire before it gives up. The gap
+# leaves room for tick cadence and merge overhead. A partial round merges
+# whatever arrived.
 ROUND_TIMEOUT_S = 900.0
 
-# Watcher-local scratch for merge state nobody but the watcher reads: the
-# Nesterov momentum buffer and the fp16 broadcast's error-feedback residual.
-# Both were on NFS, costing 698 MiB of read+write per round per pool for data
-# no worker ever opens. The watcher is pinned to one host (login-node's crontab),
-# so node-local disk is safe here -- and 26x faster (measured: 3.0 GB/s on
-# /Data vs 114 MB/s to the NFS home).
+# Watcher-local scratch for merge state only the watcher reads: the Nesterov
+# momentum buffer and the fp16 broadcast's error-feedback residual. Keeping
+# them on NFS cost ~700 MiB of I/O per round per pool. The watcher is pinned
+# to one host, so node-local disk is safe there.
 #
-# The momentum buffer is still copied back to the run's NFS dir at DONE so
-# _transfer_results_to_node089 keeps archiving it; the residual is a pure
-# optimization and is deliberately not preserved.
+# The momentum buffer is copied back to the run's NFS dir at DONE so it is
+# still archived. The residual is a pure optimization and is not preserved.
 MESH_LOCAL_ROOT_DEFAULT = data_root() / "stern_mesh_local"
 
 
 def _mesh_local_root() -> Path:
-    """Overridable via MESH_LOCAL_ROOT so tests and a relocated watcher don't
-    have to write to a hardcoded /Data path."""
+    """Local scratch root. Overridable via MESH_LOCAL_ROOT."""
     return Path(os.environ.get("MESH_LOCAL_ROOT", MESH_LOCAL_ROOT_DEFAULT))
 
 
@@ -122,35 +110,19 @@ class MeshRunConfig:
     rounds: int
     merge: bool = True  # False for the ab-single_node reference arm
     # "fp32" or "fp16" (default) for the master.pt every worker reads back
-    # each round. fp16 halves the dominant per-round NFS term (349 MiB/round
-    # x 16 nodes) via the unbiased error-feedback path in
-    # run_outer_step._quantize_broadcast_with_error_feedback -- correlated
-    # rounding across rounds does not accumulate. See
-    # run_outer_step.BROADCAST_DTYPE_CHOICES.
+    # each round. fp16 uses error feedback, so rounding errors do not
+    # accumulate across rounds.
     broadcast_dtype: str = "fp16"
-    # Quorum merge (spec 2.1): None keeps the old all-or-ROUND_TIMEOUT_S wait
-    # -- required for backward compatibility, since every run currently
-    # configured on login-node predates this field and has no value for it in
-    # its on-disk JSON. Set quorum_k to merge once that many nodes check in,
-    # with grace_s as the below-quorum fallback deadline (replaces
-    # ROUND_TIMEOUT_S's role for quorum-configured runs).
+    # None keeps the all-or-ROUND_TIMEOUT_S wait. Set quorum_k to merge once
+    # that many nodes check in; grace_s is the fallback deadline below quorum.
     quorum_k: int | None = None
     grace_s: float = ROUND_TIMEOUT_S
-    # Raw Hydra override strings (no '+'/'mesh.' prefixing assumed --
-    # e.g. "train.accum_steps=128") appended verbatim to every
-    # _submit_worker_job sbatch call for this run, on both initial
-    # assignment and later replenishment. Empty by default since every
-    # run registered before this field existed has no value for it in
-    # its on-disk JSON. list (not tuple): matches what json.loads produces,
-    # so a value round-tripped through mesh_run_configs.json and one
-    # constructed directly in Python have the same type.
+    # Raw Hydra overrides (e.g. "train.accum_steps=128"), appended verbatim to
+    # every worker sbatch call for this run. A list, to match json.loads output.
     extra_overrides: list[str] = field(default_factory=list)
-    # Rounds per worker JOB, vs `rounds` for the whole run. None keeps one job
-    # per run -- correct for every run registered before the 2026-08-22 cluster
-    # rebuild capped SallesInfo at a 2h walltime, and the reason this defaults
-    # to None rather than a number: those entries have no value for it on disk.
-    # Set it and the watcher relaunches successive chunks at the round boundary
-    # (see needs_worker_relaunch), each resuming through master.pt.
+    # Rounds per worker job. None runs one job for the whole run. Otherwise the
+    # watcher relaunches the next chunk at each round boundary (see
+    # needs_worker_relaunch), and each chunk resumes from master.pt.
     chunk_rounds: int | None = None
 
 
@@ -172,15 +144,11 @@ def _exclude_drained_nodes(
     state: WatcherState,
     node_states: dict[str, str],
 ) -> list[str]:
-    """SLURM-drain a roster node (admin/hardware action, sinfo state) and
-    the run it belongs to never notices -- sbatch just keeps failing
-    against it every relaunch. Exclude it the same way a crash-loop would,
-    once per tick's worth of run configs (node_states itself is one
-    batched sinfo call for the whole tick, done by the caller).
+    """Exclude roster nodes that SLURM has drained.
 
-    Skips nodes already in state.excluded_nodes so notify() (no dedupe of
-    its own) doesn't refire every tick for the same standing drain, and
-    skips DONE runs since there is nothing left to protect there.
+    Otherwise sbatch keeps failing against them on every relaunch. node_states
+    is one batched sinfo call made by the caller. Already-excluded nodes are
+    skipped so notify() does not refire each tick, and DONE runs are skipped.
     """
     actions: list[str] = []
     for run_config in run_configs:
@@ -211,31 +179,19 @@ def advance_all_runs(
 ) -> list[str]:
     """Advance every non-DONE run as far as it will go this tick.
 
-    Called every cron tick (unconditional -- not gated by run_full_check's
-    health-check backoff timer): worker jobs push checkpoints and wait on
-    sync flags on their own schedule, independent of that cadence.
+    Called every tick, not gated by run_full_check's health-check backoff:
+    worker jobs push checkpoints and wait on sync flags on their own schedule.
 
-    Cron itself only fires once/minute, so without the inner while-loop a
-    run sitting in a state whose condition is already satisfied (all
-    checkpoints already landed, sync flag already written) would still wait
-    for the *next* tick to notice -- pure dispatch latency, not real work
-    (observed: ~60-70s per such transition in production watcher.log).
-    advance_one_run's own per-status handlers are unchanged; this just
-    keeps calling the same run_id until one returns None (genuinely
-    blocked, e.g. still waiting on checkpoints) or the run reaches DONE.
+    Cron fires once a minute, so the inner loop keeps advancing a run whose
+    condition is already met instead of waiting for the next tick. It stops
+    when a handler returns None (blocked) or the run reaches DONE.
     """
     actions: list[str] = _exclude_drained_nodes(run_configs, state, query_node_states())
     for run_config in run_configs:
-        # Loop guard: a handler may report an action *without* advancing the
-        # state machine -- _do_assigning does exactly that when every node is
-        # excluded, returning "no eligible nodes" and deliberately leaving the
-        # status at ASSIGNING for a human to clear. Neither exit condition
-        # below is then ever reached, so on 2026-08-21 this spun forever,
-        # appending one string per iteration until the watcher had grown to
-        # 61 GB and made node089 unreachable. Revisiting a (status, round) pair
-        # means the last call changed nothing, so stop: the action is still
-        # reported once, but the run waits for the next tick instead of
-        # burning this one.
+        # Loop guard: a handler can report an action without changing state
+        # (e.g. _do_assigning with every node excluded). Revisiting a
+        # (status, round) pair means nothing changed, so stop. The action is
+        # still reported once, and the run waits for the next tick.
         seen: set[tuple[str, int]] = set()
         while state.run(run_config.run_id).status != "DONE":
             run = state.run(run_config.run_id)
@@ -259,18 +215,11 @@ def advance_all_runs(
 
 
 def _stall(run: RunState, note: str) -> str | None:
-    """Report a terminal chunk-relaunch condition once, not every tick.
+    """Return a terminal chunk-relaunch note once, then None until it changes.
 
-    _relaunch_chunk_if_finished runs before advance_one_run dispatches and
-    a non-None return short-circuits the state machine, so a condition
-    that cannot clear itself would re-report forever: one log line per
-    cron tick, backoff pinned at FAST_INTERVAL_S (tick.py sets
-    action_taken from the note count), and the merge/timeout handlers --
-    the only things that could still make progress -- never reached. This
-    is the shape of the 2026-08-21 runaway that grew the watcher to 61 GB.
-
-    An identical note means nothing changed since last tick, so return
-    None and let the run's normal handlers have the tick.
+    A non-None return short-circuits the state machine. A condition that cannot
+    clear itself would otherwise re-report every tick and starve the
+    merge/timeout handlers, which are the only paths that can make progress.
     """
     if run.last_stall_note == note:
         return None
@@ -288,15 +237,13 @@ def _relaunch_chunk_if_finished(
 ) -> str | None:
     """Submit the next chunk once every worker job for this run has exited.
 
-    Only for chunk_rounds runs: without it a worker spans the whole run and
-    its disappearance means a real failure, which tick.py's dead-job
-    detection already owns. Here disappearance is the expected end of a
-    chunk, and the round to resume from is simply the one the run is on --
-    master.pt already carries every merge up to it.
+    Only for chunk_rounds runs. Without chunking, a worker vanishing means a
+    real failure, which tick.py's dead-job detection owns. Here it is the
+    expected end of a chunk; the run resumes from its current round, since
+    master.pt already holds every merge up to it.
 
-    Excluded nodes are left out rather than given a fresh job: exclusion is
-    deliberately not auto-reversed (a human clears excluded_nodes), and
-    _recover_pool is the one path allowed to readmit.
+    Excluded nodes are not given a new job. Exclusion is not auto-reversed;
+    only _recover_pool can readmit a node.
     """
     if run_config.chunk_rounds is None:
         return None
@@ -320,21 +267,13 @@ def _relaunch_chunk_if_finished(
             run, f"{run_config.run_id}: chunk finished but every node is excluded"
         )
 
-    # A node can still be in run_config.nodes (only excluded_nodes is
-    # checked above) while its shard_assignments entry has been deleted by
-    # a concurrent redistribute_shards. Submitting it anyway crashes it on
-    # read_my_shards; skipping it silently is no better, because nothing
-    # else ever restores the entry (redistribute_shards fires only on
-    # exclusion, _recover_pool only on an already-excluded node) and
-    # eligible_nodes still counts it, so every round waits out the full
-    # grace period for a checkpoint no job exists to produce.
-    #
-    # So repair rather than skip, exactly as _recover_pool does: a node
-    # that dropped out of assignments still physically holds its shards,
-    # and any of them nobody else is training can simply be handed back.
-    # Only a node that genuinely cannot be given work is excluded -- with
-    # the "of {run_id}" reason suffix, so clear_run_state cleans it at
-    # DONE and _recover_pool can readmit it later.
+    # A node can be in run_config.nodes while its shard_assignments entry is
+    # gone (a concurrent redistribute_shards). Submitting it crashes the
+    # worker on read_my_shards, and skipping it leaves every round waiting out
+    # the grace period. So repair the entry, as _recover_pool does: hand back
+    # any shards the node still holds that nobody else trains. Only a node
+    # with no shards left is excluded, with the "of {run_id}" suffix so
+    # clear_run_state and _recover_pool can handle it later.
     assignments_path = (
         mesh_shared / "metadata" / f"shard_assignments_{run_config.run_id}.json"
     )
@@ -391,11 +330,10 @@ def _relaunch_chunk_if_finished(
                         f"shards to train -- excluded {', '.join(starved)}",
                     )
 
-    # A worker that hit its 2h walltime instead of exiting at the chunk
-    # boundary self-requeues (mesh_train.sbatch's --requeue) under the same
-    # job id, still holding a claim on this same --exclusive node -- clear
-    # it before resubmitting or the new job loses the race and sits PD.
-    # Best-effort: a failed scancel must not block the relaunch itself.
+    # A worker that hit its walltime self-requeues under the same job id and
+    # still holds its --exclusive node. Cancel it before resubmitting, or the
+    # new job sits pending. Best-effort: a failed scancel must not block the
+    # relaunch.
     stale_note = ""
     stale_ids = stale_jobs_for_nodes(
         run_id=run_config.run_id,
@@ -564,37 +502,19 @@ def _submit_worker_job(
     mesh_shared: Path | None = None,
     shards: list[str] | None = None,
 ) -> str | None:
-    """Submits one sbatch job for `node`, appends its record to
-    registry_path on success. Returns the parsed job id, or None if
-    sbatch failed to run or its stdout didn't contain a job id --
-    mirrors the existing per-node loop's own best-effort handling
-    (continue past a single node's submission failure).
+    """Submit one sbatch job for `node` and record it in registry_path.
 
-    `mesh_shared` + `shards` freeze this job's shard list at submission
-    time. shard_assignments_<run_id>.json is a live file that
-    redistribute_shards rewrites on every exclusion, but the worker only
-    reads it once, at process start (training/diloco/mesh_round.py) --
-    which on this cluster is minutes to hours after sbatch, since the job
-    sits PENDING until SLURM schedules it. Any exclusion cascade in that
-    window can delete this node's key and the job then dies on
-    read_my_shards (job 2708, `node045`, 2026-08-29). Reading the file
-    before submitting only narrows that window; it cannot close it. So
-    every caller that already knows the node's shard list writes it to a
-    per-node snapshot and points this job's MESH_ASSIGNMENTS at it,
-    making the submission immune to later mutation of the live file.
+    Returns the job id, or None if sbatch failed or printed no id. A single
+    node's failure does not stop the caller's loop.
 
-    Callers that do NOT know the list yet pass neither argument and keep
-    the live-file behaviour -- _replenish_pool deliberately relies on it,
-    since it submits a replacement *before* redistribute_shards hands it
-    any shards.
+    With `mesh_shared` and `shards`, the shard list is frozen into a per-node
+    snapshot that MESH_ASSIGNMENTS points at. The live shard_assignments file
+    is rewritten on every exclusion, and the worker reads it only at start,
+    which can be hours after sbatch. Callers that do not know the list yet
+    pass neither argument and use the live file. _replenish_pool relies on
+    that, since it submits before shards are redistributed.
 
-    The snapshot is per (run, node) rather than per job: a node only ever
-    has one worker in flight for a run (every submit path checks first),
-    so overwriting is safe and the file count stays bounded by the roster.
-
-    Refuses (returns None, no sbatch) during class hours whatever the caller
-    decided: advance_one_run already holds these paths, this catches any
-    caller that doesn't.
+    Returns None without calling sbatch during class hours.
     """
     held = class_hours.blocked(time.time())
     if held is not None:
@@ -603,9 +523,8 @@ def _submit_worker_job(
             file=sys.stderr,
         )
         return None
-    # ALL is sbatch's default; naming it keeps the rest of the submitter
-    # environment (PATH, MESH_ROOT, ...) propagating exactly as before while
-    # overriding only the variables listed below.
+    # Name ALL explicitly so the submitter's environment still propagates.
+    # Only the variables listed below are overridden.
     exports: list[str] = []
     if mesh_shared is not None and shards is not None:
         snapshot_path = (
@@ -614,22 +533,13 @@ def _submit_worker_job(
             / f"shard_assignments_{run_config.run_id}__{node}.json"
         )
         _write_json_atomic(snapshot_path, {node: list(shards)})
-        # run_mesh_worker.sh defaults MESH_ASSIGNMENTS with `:-`, so an
-        # inherited value wins.
+        # run_mesh_worker.sh defaults MESH_ASSIGNMENTS with `:-`, so this wins.
         exports.append(f"MESH_ASSIGNMENTS={snapshot_path}")
     if run_config.chunk_rounds is not None:
-        # Bounds run_mesh_worker.sh's own `scontrol requeue` self-chaining
-        # (mesh_continue_allowed.sh Layer 2) to this job's chunk. Without
-        # it that guard's env var is never set, so the worker keeps
-        # requeuing the SAME job id past the chunk boundary while this
-        # function's caller (_relaunch_chunk_if_finished) independently
-        # submits a NEW job id for the same --exclusive node once it
-        # decides the chunk is done -- two live chains racing for one
-        # node, the loser stuck PENDING and self-requeuing forever
-        # (observed 2026-09-07, lev-fix16c). SLURM_RESTART_COUNT is 0 on
-        # the initial (non-requeued) submission and increments once per
-        # requeue, so the check after training round `chunk_rounds` sees
-        # `chunk_rounds - 1`: that's the value that must trip the stop.
+        # Stops the worker's self-requeue at the chunk boundary. Otherwise the
+        # same job id keeps requeuing while the watcher submits a new job for
+        # the same node, and two chains race for one node. SLURM_RESTART_COUNT
+        # is 0 on the first submission, so the stop trips at chunk_rounds - 1.
         exports.append(f"MESH_MAX_REQUEUES={max(run_config.chunk_rounds - 1, 0)}")
     export = "ALL," + ",".join(exports) if exports else "ALL"
     cmd = [
@@ -642,30 +552,24 @@ def _submit_worker_job(
         run_config.experiment,
         run_config.run_id,
         f"+run_tag={run_config.run_id}",
-        # No '+' prefix on these four: conf/experiment/videomae_mesh_ssl.yaml
-        # already defines mesh.merge/outer_lr/outer_momentum/rounds, and '+'
-        # means "add a NEW key" -- Hydra raises ConfigCompositionException
-        # ("Could not append to config") if the key already exists. Only
-        # mesh.start_round is genuinely new, so it keeps the '+'.
+        # No '+' on these four: the experiment config already defines them, and
+        # Hydra's '+' fails on an existing key. mesh.start_round is new, so it
+        # keeps the '+'.
         f"mesh.merge={'true' if run_config.merge else 'false'}",
         f"mesh.outer_lr={run_config.outer_lr}",
         f"mesh.outer_momentum={run_config.outer_momentum}",
         f"mesh.rounds={run_config.rounds}",
         f"+mesh.start_round={start_round}",
     ]
-    # '++' (add-or-override), not '+': videomae_mesh_ssl.yaml defines no
-    # chunk_rounds key, but the paper-recipe experiment configs do, and '+'
-    # aborts composition on an existing key -- which would kill every worker
-    # of those runs at launch. Omitted entirely when unset so the worker's
-    # own None default applies.
+    # '++' (add-or-override), not '+': some experiment configs already define
+    # chunk_rounds, and '+' would abort composition. Omitted when unset.
     if run_config.chunk_rounds is not None:
         cmd.append(f"++mesh.chunk_rounds={run_config.chunk_rounds}")
     cmd.extend(run_config.extra_overrides)
     cmd.extend(extra_overrides)
-    # Two attempts, not one: with no sacct/slurmdbd on this cluster, a
-    # rejected sbatch is otherwise undiagnosable after the fact and, left
-    # terminal, silently walks the node into grace-expiry -> permanent
-    # exclusion -> shard drop over one transient scheduler hiccup.
+    # Retry once: a single transient scheduler failure would otherwise lead to
+    # grace expiry, exclusion, and shard loss. Failures are logged on the last
+    # attempt because no accounting database exists to diagnose them later.
     job_id = None
     for attempt in range(2):
         try:
@@ -734,14 +638,11 @@ def resubmit_with_override(
 
 
 def _verified_holdings(mesh_shared: Path) -> dict[str, list[str]]:
-    """`{node: [shard, ...]}` of what each node *physically holds*.
+    """`{node: [shard, ...]}` of the shards each node physically holds.
 
-    Read from verified_holdings.json, which validate_seeding.py writes from
-    a live `ls` of every node. This is the mesh's only source of truth about
-    shard location. The old shard_map.json was a placement *plan* -- what
-    seeding intended -- and was never reconciled with what seeding achieved;
-    by 2026-08-21 it was 1062/1113 false, which is what let a node be handed
-    89 shards it did not have.
+    Read from verified_holdings.json, which is written from a live listing of
+    every node. This is the only source of truth for shard location. A plan
+    of intended placement is not enough.
 
     Raises FileNotFoundError if the pool has never been validated.
     """
@@ -764,12 +665,10 @@ def _static_assignments(
 ) -> tuple[dict[str, list[str]], str]:
     """Partition the shards `nodes` actually hold, from verified_holdings.json.
 
-    The expected set is the union of this roster's own verified holdings
-    intersected with the golden manifest -- not the full 260. A roster that
-    is a subset of its tier trains what that subset collectively has, and the
-    resulting coverage is reported so a degraded round is visible rather than
-    silent. Asking for shards nobody in the roster holds is what produced the
-    2026-08-20 incident, so it is not expressible here.
+    The expected set is the union of this roster's verified holdings,
+    intersected with the golden manifest. A roster that is a subset of its tier
+    trains what it collectively holds. Coverage is reported so a degraded round
+    is visible. Shards that nobody in the roster holds are never requested.
 
     Raises FileNotFoundError if the pool has never been validated -- an
     unvalidated pool must not launch.
@@ -814,8 +713,7 @@ def _do_assigning(
 
     assignments, coverage_note = _static_assignments(eligible, mesh_shared)
 
-    # A node holding nothing would train zero samples and stall the round --
-    # exactly the 2026-08-20 failure. Drop it from this round instead.
+    # A node with no shards would train on nothing and stall the round. Drop it.
     starved = [node for node in eligible if not assignments.get(node)]
     if starved:
         eligible = [node for node in eligible if assignments.get(node)]
@@ -833,12 +731,9 @@ def _do_assigning(
 
     registry_path = repo_root / "runs" / "state" / "jobs_registry.json"
     submitted_at = datetime.now(timezone.utc).isoformat()
-    # Report what sbatch ACCEPTED, not what we intended to submit. A single
-    # failed submission used to vanish here -- the return value was discarded
-    # and the note below counted `eligible` -- so on 2026-08-22 a pool logged
-    # "16 nodes" while 15 jobs existed. With quorum_k == pool size that one
-    # missing worker cannot be waited out: every round runs to the full
-    # grace_s and then merges timeout-forced, at 30 minutes a round.
+    # The note reports submissions sbatch accepted, not the intended count. A
+    # failed submission must not be counted as running: with quorum_k equal to
+    # the pool size, one missing worker forces every round to time out.
     submitted_job_ids = {
         node: _submit_worker_job(
             run_config,
@@ -854,11 +749,9 @@ def _do_assigning(
     }
     failed_submit = [node for node, jid in submitted_job_ids.items() if jid is None]
 
-    # A concurrent launcher can grab a node in the window between our sinfo
-    # snapshot and sbatch actually landing it -- sbatch still accepts the
-    # submission (a job id comes back), but SLURM fails the job itself
-    # moments later (NODE_FAIL/BOOT_FAIL). One batched recheck right after
-    # submission catches this instead of waiting out the full round timeout.
+    # sbatch can accept a job that SLURM fails moments later (another launcher
+    # took the node). One batched recheck right after submission catches this
+    # instead of waiting out the round timeout.
     accepted_ids = {jid: node for node, jid in submitted_job_ids.items() if jid}
     if accepted_ids:
         bad_states = {"NODE_FAIL", "BOOT_FAIL", "FAILED", "CANCELLED", "PREEMPTED"}
@@ -894,10 +787,8 @@ def _do_running(
     run_config: MeshRunConfig, run: RunState, mesh_shared: Path
 ) -> str | None:
     if not run_config.merge:
-        # ab-single_node arm: Task 2's worker trains every round inside one
-        # job, pushing checkpoints nobody merges and never waiting on a sync
-        # flag -- no watcher-side round coordination applies once the job is
-        # submitted, so this run is done as far as the state machine cares.
+        # Single-node reference arm: the worker trains every round inside one
+        # job and never waits on a sync flag, so there is nothing to coordinate.
         run.status = "DONE"
         return f"{run_config.run_id}: RUNNING -> DONE (merge=False, single-node arm)"
 
@@ -905,9 +796,8 @@ def _do_running(
     if pending_nodes(pending_dir, run_config.run_id, round_num=run.round):
         run.status = "AWAITING_CHECKPOINTS"
         note = f"{run_config.run_id}: RUNNING -> AWAITING_CHECKPOINTS"
-        # Once per round, not once per tick: this transition fires exactly
-        # once a round, and a starving node is a standing condition that
-        # would otherwise repeat every 60s for hours.
+        # Reported once per round, not per tick: a starving node is a standing
+        # condition and would otherwise repeat every minute.
         starving = starving_nodes(mesh_shared / "metrics", run_config.run_id)
         if starving:
             detail = ", ".join(f"{n} ({c} rounds)" for n, c in sorted(starving.items()))
@@ -925,20 +815,12 @@ def _do_running(
 def _round_elapsed_s(
     pending_dir: Path, run_id: str, round_num: int, now: float, round_started_at: float
 ) -> float:
-    """Seconds since this round's earliest checkpoint arrived, or since the
-    round started if none have arrived yet.
+    """Seconds since this round's earliest checkpoint, or since the round started.
 
-    Scoped to `round_num` (mesh/pending_files.pending_files_for_round) so a
-    straggler finishing the PRIOR round -- who can write into pending/ after
-    a timeout-forced merge clears it (mesh_tick._do_merging), before this
-    round's real checkpoints land -- can't anchor this clock to its own
-    early arrival. mtime can't make that distinction on its own: the
-    straggler necessarily writes in real wall-clock time AFTER this round
-    already started. If the whole pool dies before a single current-round
-    node checks in, there are no files to read mtimes from at all --
-    falling back to `now - round_started_at` is what lets the
-    AWAITING_CHECKPOINTS timeout still fire in that case too, instead of
-    reading a permanent 0.0.
+    Only files for `round_num` count. A straggler from the prior round can
+    still write into pending/ after a forced merge, and its mtime must not
+    start this round's clock. With no current-round files, fall back to the
+    round start so the timeout still fires.
     """
     files = pending_files_for_round(pending_dir, run_id, round_num)
     if not files:
@@ -952,8 +834,9 @@ def _has_replacement_available(
     state: WatcherState,
     run_configs_path: Path | None,
 ) -> bool:
-    """Whether excluding a node right now has somewhere to go (design §5.1):
-    a tier-wide check, since any missing node draws on the same deficit and
+    """Whether excluding a node now has a replacement available.
+
+    Checked tier-wide, since every missing node draws on the same deficit and
     candidate pool."""
     if run_configs_path is None:
         return True  # no way to check -- matches the pre-existing behaviour
@@ -980,11 +863,11 @@ def effective_quorum_k(
     roster: list[str],
     missing_unreplaceable: Collection[str] = (),
 ) -> int:
-    """quorum_k minus unreplaceable-missing nodes, clamped at 60% of
-    target_pool_size, recomputed every round and NEVER written back to
-    mesh_run_configs.json (design §5.2) -- a config edit would be a
-    one-way ratchet that never restores when the pool grows back; this
-    re-derives upward for free once nodes return."""
+    """quorum_k minus unreplaceable-missing nodes, floored at 60% of the target pool.
+
+    Recomputed every round and never written back to the run config, so the
+    quorum rises again when nodes return.
+    """
     del state  # unused -- kept for interface parity with the design doc
     if run_config.quorum_k is None:
         return len(roster)  # no floor configured -- nothing to relax
@@ -1005,10 +888,8 @@ def _do_awaiting_checkpoints(
     pending_dir = mesh_shared / "checkpoints" / "pending"
     checked_in = pending_nodes(pending_dir, run_config.run_id, round_num=run.round)
     eligible = set(eligible_nodes(state, run_config.nodes))
-    # A quarantined node under self-requeue's enforcement window can still be
-    # training and dropping checkpoints for a few more rounds -- its stale
-    # file must not count toward quorum (design §5.1b). pending_nodes() only
-    # parses filenames, it has no notion of roster membership.
+    # A quarantined node can still drop checkpoints for a few rounds. Its stale
+    # file must not count toward quorum. pending_nodes() parses filenames only.
     checked_in &= eligible
 
     roster = (
@@ -1019,17 +900,11 @@ def _do_awaiting_checkpoints(
 
     if checked_in >= eligible:
         clear_missed_rounds(run, checked_in)
-        # quorum_k is a floor on how many nodes may contribute to a merge, but
-        # this fast path was written for the happy case and skipped it: once
-        # permanent exclusions shrink `eligible` below quorum_k, "everyone
-        # checked in" is trivially true and the merge proceeds anyway.
-        # factorial-tube-per_frame merged its last four rounds 10-wide against
-        # quorum_k=12, logged as a clean "MERGING (10 nodes)", and still
-        # reported DONE 40/40. Halt instead: a run that reaches DONE has to
-        # mean its configured floor held every round -- relaxed downward by
-        # effective_quorum_k (design §5.2) rather than fixed at quorum_k, so
-        # a tier with no idle replacement doesn't halt a run it could still
-        # legitimately finish.
+        # quorum_k is a floor on merge contributors, and this fast path must
+        # respect it too. Once exclusions shrink `eligible` below quorum_k,
+        # "everyone checked in" is trivially true, so halt rather than merge
+        # below the floor. The floor is the effective quorum, so a tier with
+        # no idle replacement can still finish.
         eff_quorum_k = effective_quorum_k(run_config, run, state, roster=roster)
         quorum_relaxed = (
             run_config.quorum_k is not None and eff_quorum_k < run_config.quorum_k
@@ -1070,14 +945,10 @@ def _do_awaiting_checkpoints(
         ):
             return None  # still below quorum, grace not yet expired
         if len(checked_in) >= run_config.quorum_k:
-            # Quorum reached before grace expired: merge now with whoever's
-            # here. No exclusion, no missed_rounds bump -- the stragglers
-            # haven't crashed, they just haven't finished yet, and get
-            # another chance next round. Still a partial merge from
-            # run_outer_step's point of view, so timeout_forced stays True
-            # (2.2: run_config.weighting="token" -- run_outer_step.py's
-            # _token_weights -- corrects the bias this used to carry via
-            # plain renormalization; run quorum-configured pools with it).
+            # Quorum reached before grace expired: merge with whoever checked in.
+            # Stragglers are not excluded and get another chance next round.
+            # This is still a partial merge, so timeout_forced stays True. Use
+            # weighting="token" for quorum-configured runs to avoid renormalization bias.
             clear_missed_rounds(run, checked_in)
             run.status = "MERGING"
             run.timeout_forced = True
@@ -1096,17 +967,13 @@ def _do_awaiting_checkpoints(
         return None  # still waiting, not timed out yet
 
     missing = sorted(eligible - checked_in)
-    # ASSIGNING (and therefore assign_locality_first) only runs once per run
-    # now (see SYNCING -> RUNNING, not ASSIGNING, above), so _replenish_pool
-    # is the only place that redistributes an excluded node's shards to a
-    # survivor afterward -- it always does so, even when no replacement
-    # node is found, so shard coverage does not silently shrink.
+    # _replenish_pool is the only path that moves an excluded node's shards to
+    # a survivor, and it runs even when no replacement is found, so shard
+    # coverage does not silently shrink.
     #
-    # Exclusion itself is gated on a replacement actually existing (design
-    # §5.1, the direct fix for the birds cascade): a tier with zero slack
-    # stops bleeding nodes it can never replace. The counter still bumps
-    # either way -- a node ineligible for exclusion today because no
-    # replacement exists is still excluded on a LATER miss once one does.
+    # Exclusion requires a replacement to exist, so a tier with no slack stops
+    # losing nodes it cannot replace. The miss counter still increments, so a
+    # node skipped today can be excluded on a later miss.
     excluded = []
     unreplaceable = set()
     for node in missing:
@@ -1133,9 +1000,8 @@ def _do_awaiting_checkpoints(
         is not None
     ]
     excluded_note = f", permanently excluded {excluded}" if excluded else ""
-    # Same floor as the all-checked-in path above, applied after the
-    # exclusion/replenish bookkeeping so the log still records what went wrong
-    # and a replacement still gets submitted for a human to pick up from.
+    # Same floor as the all-checked-in path, applied after exclusion so the log
+    # still records what went wrong.
     eff_quorum_k = effective_quorum_k(
         run_config, run, state, roster=roster, missing_unreplaceable=unreplaceable
     )
@@ -1177,14 +1043,10 @@ def _do_degraded(
     state: WatcherState,
     mesh_shared: Path,
 ) -> str | None:
-    """Recheck a DEGRADED run's current round for quorum before giving up.
+    """Re-check a DEGRADED run's round for quorum, so it can recover.
 
-    DEGRADED used to be a dead end: nothing dispatched on it, so a run that
-    halted below quorum_k stayed halted even after replenishment or a chunk
-    relaunch (both still act on it -- see RELAUNCHABLE in chunk_relaunch.py)
-    brought enough checkpoints back in. Observed repeatedly on e2b-b-birds,
-    2026-08-28: quorum was satisfied but only a manual status write ever
-    moved the run forward.
+    Replenishment and chunk relaunch can bring checkpoints back after a halt,
+    so the run must be re-checked each tick rather than left halted.
     """
     pending_dir = mesh_shared / "checkpoints" / "pending"
     checked_in = pending_nodes(pending_dir, run_config.run_id, round_num=run.round)
@@ -1220,28 +1082,15 @@ def _recover_pool(
     *,
     now: float,
 ) -> str | None:
-    """Put recovered nodes back to work, independent of any fresh failure.
+    """Return this run's healthy excluded nodes to the pool.
 
-    Nothing else in the system does this. tick.py filters mesh jobs out of
-    detect_dead before remediate_dead_job sees them (it hardcodes
-    train.sbatch, which cannot run a mesh worker), on the stated grounds that
-    mesh_tick owns recovery -- but mesh_tick's _replenish_pool fires only from
-    the branch where `record_missed_round` returns True, which happens exactly
-    once per node, on the tick it crosses the exclusion threshold. Once every
-    node that is going to fail has failed, no new exclusion occurs, nothing
-    calls _replenish_pool, and the pool is frozen at its degraded size for the
-    rest of the run. factorial-tube-per_frame finished its last four rounds
-    with 10 of 22 workers while twelve healthy machines sat idle beside it.
+    _replenish_pool only fires on the tick a node crosses the exclusion
+    threshold, so without this the pool would only ever shrink. Every
+    RECOVERY_INTERVAL_S this re-probes the run's excluded nodes.
 
-    So the pool could only ever shrink. This is the restoring term: every
-    RECOVERY_INTERVAL_S, re-probe this run's own excluded nodes and put back
-    the ones that are healthy again.
-
-    A recovered node is only resubmitted if it can be handed shards nobody is
-    training -- normally the ones dropped when it was excluded, which it still
-    physically holds. Submitting it with an empty assignment would raise in
-    read_my_shards and re-exclude it, so an under-filled pool stays the safe
-    failure mode here exactly as it is in _replenish_pool.
+    A node is resubmitted only if it can receive shards nobody is training,
+    normally the ones it still holds from before exclusion. An empty assignment
+    would fail on read_my_shards, so an under-filled pool is the safe outcome.
     """
     if run_configs_path is None:
         return None
@@ -1315,11 +1164,10 @@ def _recover_pool(
 
 
 def _append_nodes_to_run_config(path: Path, run_id: str, new_nodes: list[str]) -> None:
-    """Rewrites the run-configs JSON `load_run_configs` reads: finds the
-    entry matching run_id and extends its "nodes" list with any of
-    new_nodes not already present (idempotency guard -- a re-run of
-    this function with the same picked nodes is a no-op on the second
-    call), atomic tmp+rename."""
+    """Add `new_nodes` to a run's roster in the run-configs JSON.
+
+    Idempotent: nodes already listed are skipped. The write is atomic.
+    """
     payload = json.loads(path.read_text())
     for entry in payload:
         if entry["run_id"] == run_id:
@@ -1331,20 +1179,11 @@ def _append_nodes_to_run_config(path: Path, run_id: str, new_nodes: list[str]) -
 
 
 def _live_roster(run_configs_path: Path, run_id: str, fallback: list[str]) -> list[str]:
-    """Current on-disk roster for run_id, reflecting any nodes a prior
-    _replenish_pool call already appended earlier in this same tick.
+    """Current on-disk roster for run_id, including nodes added earlier this tick.
 
-    `run_config.nodes` is a snapshot frozen when advance_one_run's caller
-    loaded it -- it never updates mid-tick even after
-    _append_nodes_to_run_config writes a grown roster to disk. If two
-    nodes cross the crash-loop exclusion threshold in the same tick (e.g.
-    a shared NFS blip timing out several checkpoints at once),
-    _do_awaiting_checkpoints calls _replenish_pool once per newly-excluded
-    node -- reading the live roster here (instead of the stale
-    run_config.nodes) is what stops the second call from re-picking and
-    re-submitting the same idle node the first call already claimed.
-    Falls back to `fallback` if the file or this run's entry doesn't
-    exist yet.
+    run_config.nodes is a snapshot and does not see roster writes made during
+    the tick. Reading the file prevents two replenishments from picking the
+    same idle node. Falls back to `fallback` if the file or entry is missing.
     """
     if not run_configs_path.exists():
         return fallback
@@ -1364,26 +1203,16 @@ def submit_replacement(
     run_configs_path: Path | None,
     excluded_node: str,
 ) -> tuple[list[str], str | None]:
-    """Called right after `excluded_node` is freshly excluded (a NEW
-    exclusion this tick, not a pre-existing one from before this
-    feature existed -- see Task 5 call site). Tops the pool back up
-    toward run.target_pool_size with idle same-tier nodes. Returns
-    (picked_nodes, status_note) -- shard handoff for `picked` is the
-    caller's job via `redistribute_shards` (design §5.1: replacement
-    availability and shard redistribution are two separable decisions).
+    """Top the pool back up toward target size after `excluded_node` is excluded.
 
-    A picked replacement only ever receives shards via excluded_node's own
-    handoff in `redistribute_shards` -- if excluded_node has no entry (or an
-    empty one) in shard_assignments, a submitted replacement would start
-    with nothing to train on and crash immediately on read_my_shards, which
-    then excludes IT too and repeats the pick with the next idle node.
-    Observed live on login-node 2026-08-05 (pool-cars-2r, node066/node051 both
-    submitted with zero shard_assignments entries), so replenishment is
-    skipped rather than submitted in that case -- an under-filled pool is a
-    safe failure mode, a guaranteed-crash job is not. A missing assignments
-    file entirely (no shard-tracking started for this run yet) does not
-    gate replenishment; only a present file where excluded_node's own entry
-    is absent or empty does.
+    Returns (picked_nodes, status_note). The caller hands shards to the picks
+    via redistribute_shards, since choosing a replacement and moving shards are
+    separate decisions.
+
+    A replacement only gets shards from excluded_node's handoff. If that entry
+    is absent or empty, the replacement would crash on read_my_shards, so
+    replenishment is skipped. An under-filled pool is the safe failure. A
+    missing assignments file does not block replenishment.
     """
     held = class_hours.blocked(time.time())
     if held is not None:
@@ -1409,18 +1238,11 @@ def submit_replacement(
             candidates = candidate_replacements(
                 tier_roster, in_use=set(roster), excluded=set(state.excluded_nodes)
             )
-            # sinfo alone is not readiness: on 2026-08-21 it called all 12
-            # excluded birds nodes "idle" while 7 had ~21.7 GiB of their GPU
-            # held by a foreign process and 3 had never been seeded. All 6
-            # picked from that set crashed on submit (CUDA OOM /
-            # FileNotFoundError on manifest.json) and were themselves excluded
-            # two rounds later. Probe the GPU and the seed before submitting;
-            # only SLURM-idle candidates are worth an ssh round-trip, since
-            # truly_idle requires slurm_idle anyway.
-            # This run's own previously-excluded roster members are the best
-            # replacements available: unlike a fresh tier node they still hold
-            # their shards, so recovering one costs no transfer at all. Probe
-            # them alongside the fresh candidates.
+            # SLURM "idle" is not readiness: a node can have its GPU held by
+            # another process or lack its seed. Probe the GPU and seed before
+            # submitting. Only SLURM-idle candidates need the ssh probe.
+            # This run's own excluded nodes still hold their shards, so they
+            # are the cheapest replacements and are probed alongside the rest.
             recoverable = [
                 node
                 for node in roster
@@ -1491,17 +1313,11 @@ def redistribute_shards(
     excluded_node: str,
     picked: list[str],
 ) -> str | None:
-    """Always runs on a miss-with-no-checkin, independent of whether a
-    replacement was found (design §5.1) -- reassigns excluded_node's shards
-    to survivors so shard coverage never silently shrinks during a
-    replacement-suspension window.
+    """Move an excluded node's shards to survivors, with or without a replacement.
 
-    assign_locality_first only runs once per run (at ASSIGNING), so this is
-    the only place that ever updates shard_assignments_<run_id>.json again --
-    returning early here (as the old combined function did whenever deficit
-    <= 0 or no idle node was available) left excluded_node's shards assigned
-    to a node that will never train again, silently shrinking shard coverage
-    for the rest of the run.
+    This is the only path that updates shard_assignments after ASSIGNING, so it
+    must not return early. Otherwise the shards stay on a node that will never
+    train again, and coverage silently shrinks.
     """
     assignments_path = (
         mesh_shared / "metadata" / f"shard_assignments_{run_config.run_id}.json"
@@ -1517,14 +1333,10 @@ def redistribute_shards(
     assignments, dropped = reassign_failed(excluded_node, assignments, placement)
     note = f"{run_config.run_id}: reassigned {excluded_node}'s shards to survivors"
     if dropped and picked:
-        # No survivor holds these, but excluded_node still does -- it was
-        # excluded because it could not RUN a worker (foreign process on
-        # its GPU, or never seeded), not because it went away. It stays up
-        # and reachable, so copying the files to the replacement turns a
-        # permanent coverage loss back into a transfer. Replication is 1x
-        # for 40-68% of the corpus on every tier but fish, so this is the
-        # common path, not an edge case: it is what dropped 46 of birds'
-        # 260 shards on 2026-08-21.
+        # No survivor holds these, but excluded_node still does. It was excluded
+        # because it could not run a worker, not because it went away, so copy
+        # the shards to the replacement. Replication is 1x for much of the
+        # corpus, so this is a common path.
         recovered = copy_shards(excluded_node, picked[0], dropped)
         if recovered:
             assignments[picked[0]] = assignments.get(picked[0], []) + recovered
@@ -1535,10 +1347,8 @@ def redistribute_shards(
                 f"{' ...' if len(recovered) > 5 else ''})"
             )
     if dropped:
-        # Coverage genuinely shrank: no survivor holds these and the copy
-        # did not land them. Say so -- the alternative is handing them to
-        # a node that cannot open them, which raises inside the worker and
-        # gets IT excluded two rounds later.
+        # Coverage shrank: no survivor holds these and the copy failed. Do not
+        # hand them to a node that cannot open them.
         note += (
             f"; dropped {len(dropped)} shard(s) no survivor holds "
             f"({', '.join(dropped[:5])}{' ...' if len(dropped) > 5 else ''})"
@@ -1568,42 +1378,25 @@ def _replenish_pool(
 
 
 def _bootstrap_master(pending_dir: Path, run_id: str, master_path: Path) -> None:
-    """Seed master.pt before the first-ever merge of a run.
+    """Seed master.pt from round 0's first pending checkpoint.
 
-    merge_round (run_outer_step.py) unconditionally torch.loads master_path
-    to diff worker deltas against -- it has no cold-start fallback (only
-    outer_momentum.pt gets a missing-is-OK branch), and this plan's Global
-    Constraints forbid modifying that file. No earlier round writes
-    master.pt either, so without this, every run's first MERGING would
-    crash on FileNotFoundError and retry forever against the same missing
-    file. Promote one already-arrived worker checkpoint (deterministic:
-    lexicographically first pending filename) to the initial master --
-    mirrors mesh_round.py's own cold-start contract, where a worker with no
-    master.pt on disk trains from a freshly-initialized model.
-
-    Scoped to round 0 (mesh/pending_files.pending_files_for_round): nothing
-    else leaves master.pt missing, so the very first merge is always round
-    0's -- and scoping here for the same reason every other pending/ reader
-    now does (see _round_elapsed_s) rather than trusting an unscoped glob.
+    The merge loads master.pt unconditionally and has no cold-start fallback,
+    so the first merge of a run would otherwise fail. The seed is the
+    lexicographically first pending file, matching a worker's cold start.
     """
     candidates = sorted(pending_files_for_round(pending_dir, run_id, 0))
     if not candidates:
         return
     payload = torch.load(candidates[0], map_location="cpu", weights_only=False)
-    # Pending checkpoints are pushed in fp16 (mesh_round.py's
-    # push_checkpoint_and_wait, to halve NFS traffic) -- master.pt must
-    # start in fp32 or every later merge step (run_outer_step.py) silently
-    # accumulates the outer-optimizer momentum at half precision forever.
+    # Pending checkpoints are fp16. master.pt must start in fp32, or the
+    # outer-optimizer momentum accumulates at half precision on every merge.
     model_state_dict = {
         k: (v.float() if torch.is_floating_point(v) else v)
         for k, v in payload["model_state_dict"].items()
     }
     master_path.parent.mkdir(parents=True, exist_ok=True)
-    # BOOTSTRAP_MASTER_VERSION (-1) predates every real round_num merge_round
-    # stamps (Phase 3.2), so a worker's first real diff is never rejected as
-    # stale by comparison to this bootstrap master -- and, being negative, it
-    # can never collide with round 0, whose merge would otherwise be skipped
-    # by merge_round's already-merged recovery.
+    # BOOTSTRAP_MASTER_VERSION is negative, so it is older than every real
+    # round and never collides with round 0's already-merged check.
     ckpt_io.save(
         master_path,
         {
@@ -1615,31 +1408,18 @@ def _bootstrap_master(pending_dir: Path, run_id: str, master_path: Path) -> None
 
 
 def _uv_bin() -> str:
-    """Absolute path to uv, for subprocesses launched from the watcher.
+    """Absolute path to uv for merge subprocesses.
 
-    The watcher's own cron entry invokes ${HOME}/.local/bin/uv by absolute
-    path, but `uv run` only prepends the venv's bin dir to PATH -- it does
-    not add ~/.local/bin. A bare "uv" here therefore resolves fine from an
-    interactive shell and fails with FileNotFoundError on every tick that
-    runs from cron, stalling the merge indefinitely (observed 2026-07-27:
-    both mesh pools retried MERGING every tick until this was fixed).
-    run_mesh_worker.sh guards the same gap by exporting PATH; the watcher
-    resolves the binary instead of trusting its inherited environment.
+    Cron's PATH does not include ~/.local/bin, so a bare "uv" fails under cron
+    while working in a shell. Resolve the binary explicitly.
     """
     return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
 
 
-# Wall-clock budget for one merge subprocess. Measured 2026-08-28 on
-# e2b-c-cars: 210s for the durable phase alone (load a 191 MiB master plus 16
-# ~95 MiB deltas off NFS, upcast, average, Nesterov step, fp16 quantize, write
-# master + momentum + residual). 300s left ~90s of headroom, and NFS
-# contention plus the since-removed TB tail ate it on two runs the same day.
-# Overrunning this SIGKILLs a merge that may already have rewritten master.pt,
-# which run_outer_step now recovers from as a no-op rather than a crash loop
-# -- but a breach still throws away a round's merge work, so the budget is
-# sized for ~3x the measured cost instead of 1.4x. Ticks cannot pile up behind
-# it: watch_training.py holds a non-blocking flock for the whole tick, so a
-# long merge just means the next ticks exit immediately.
+# Wall-clock budget for one merge subprocess. The durable merge phase measured
+# ~210s, so this leaves about 3x headroom. A timeout SIGKILLs a merge that may
+# already have rewritten master.pt, so keep the budget well above the measured
+# cost. Ticks do not pile up: the watcher's flock makes overlapping ticks exit.
 MERGE_TIMEOUT_S = 900
 
 
@@ -1661,10 +1441,8 @@ def _do_merging(
     cmd = [
         _uv_bin(),
         "run",
-        # Without this, every merge re-syncs the 9.4 GB NFS-hosted venv
-        # before running -- `uv sync --dry-run` reports an unconditional
-        # reinstall even against an up-to-date lockfile, and this cron runs
-        # once a minute.
+        # Without this, every merge re-syncs the large NFS-hosted venv, since
+        # uv reports a reinstall even when the lockfile is current.
         "--no-sync",
         "python",
         "-m",
@@ -1701,19 +1479,10 @@ def _do_merging(
         ),
         "--eligible-nodes",
         ",".join(sorted(eligible_nodes(state, run_config.nodes))),
-        # No --tb-dir: TensorBoard scalars are deliberately NOT written from
-        # inside the merge subprocess. run_outer_step's _write_tb_scalars
-        # rescans every node's full metrics JSONL on every merge
-        # (tb_logger.write_mesh_round_scalars reads and json-parses all of
-        # it, then filters), so its cost grows with round count while the
-        # timeout below stays fixed. On 2026-08-28 that tail ran past the
-        # 300s budget on e2b-c-cars (round 27) and e2b-d-countries (round
-        # 42) roughly 90s AFTER the merge itself had durably completed, and
-        # the resulting SIGKILL -- which _write_tb_scalars' own "never fail
-        # the merge" except clause cannot catch -- made the watcher discard
-        # 722 finished merges and retry them forever. Diagnostics must not
-        # be able to spend the critical section's budget. The scalars are
-        # still written once per run by flush_final_tb_rounds at DONE.
+        # No --tb-dir: TensorBoard scalars are not written inside the merge. Their
+        # cost grows with round count, and a SIGKILL during that tail would
+        # discard a finished merge. Diagnostics must not spend the merge's time
+        # budget. Scalars are written once at DONE by flush_final_tb_rounds.
     ]
     if run.timeout_forced:
         cmd.append("--timeout-forced")
@@ -1725,12 +1494,9 @@ def _do_merging(
     )
     if run.round_effective_quorum_k is not None:
         cmd.extend(["--effective-quorum-k", str(run.round_effective_quorum_k)])
-    # misses_excused_job_absent/misses_correlated are omitted (default 0):
-    # this codebase counts every miss via the plain missed_round_count, not
-    # Task 9's blame-aware split. requeues_seen is also omitted (default 0):
-    # it's counted by the worker's own per-node journal
-    # (mesh_continue_allowed.sh), and aggregating that from the watcher
-    # side has no mechanism specified yet.
+    # misses_excused_job_absent, misses_correlated and requeues_seen are left at
+    # their defaults of 0. Every miss is counted by missed_round_count, and
+    # requeues are counted in the worker's own journal.
     try:
         result = subprocess.run(
             cmd,
@@ -1764,13 +1530,12 @@ RESULTS_ROOT = str(data_root() / "stern_mesh_results")
 
 
 def _transfer_results_to_node089(run_config: MeshRunConfig, mesh_shared: Path) -> str:
-    """Best-effort: rsync this run's checkpoint dir to the results host's local NVMe,
-    then delete the NFS copy on success to free quota.
+    """Best-effort: rsync the run's checkpoint dir to the results host, then
+    delete the NFS copy.
 
-    Never raises -- a failed transfer just leaves the run's results on NFS
-    (safe fallback: DONE runs are never re-advanced by advance_all_runs, so
-    there is no automatic retry, and losing the only surviving copy of a
-    finished run is far worse than leaving it on NFS a while longer).
+    Never raises. A failed transfer leaves the results on NFS. DONE runs are not
+    retried, and losing the only copy of a finished run is worse than keeping
+    it on NFS longer.
     """
     local_dir = mesh_shared / "checkpoints" / run_config.run_id
     if not local_dir.exists() or not any(local_dir.iterdir()):
@@ -1808,9 +1573,8 @@ def _transfer_results_to_node089(run_config: MeshRunConfig, mesh_shared: Path) -
                 f"(rsync exit {rsync_result.returncode}) -- results kept on NFS"
             )
 
-        # rsync exiting 0 doesn't guarantee the destination is intact (e.g.
-        # the results host ran out of disk mid-transfer) -- the next step deletes the
-        # only other copy, so verify before committing to that.
+        # rsync exiting 0 does not prove the copy is intact (the disk may have
+        # filled). Verify before deleting the only other copy.
         check_result = subprocess.run(
             ["ssh", RESULTS_HOST, "test", "-s", f"{remote_dir}/master.pt"],
             capture_output=True,
@@ -1832,19 +1596,11 @@ def _transfer_results_to_node089(run_config: MeshRunConfig, mesh_shared: Path) -
 
 
 def _cancel_run_workers(run_id: str, repo_root: Path) -> str:
-    """scancel any worker still running for a run that has reached DONE.
+    """Cancel any worker still running for a run that has reached DONE.
 
-    The state machine has never cancelled anything -- a worker exits when its
-    own round loop ends, which for a straggler is well after the run stopped
-    needing it. Every round it still computes is merged by nobody and swept
-    by _sweep_pending_checkpoints, so this is pure waste, and on a cluster
-    where a whole node is allocated per worker it is waste other people's
-    jobs are queued behind.
-
-    Best-effort by design: a failed scancel must not stop a run from
-    reporting DONE, transferring its results, or releasing its state. The
-    reason lands in the returned note either way -- a silent cancel is how
-    we would end up believing nodes are free when they are not.
+    Stragglers keep computing rounds that nothing merges, and each holds a
+    whole node. Best-effort: a failed scancel must not block DONE, the result
+    transfer, or state cleanup. The outcome is always returned in the note.
     """
     state_dir = repo_root / "runs" / "state"
     job_ids = cancellable_job_ids(
@@ -1873,15 +1629,10 @@ def _cancel_run_workers(run_id: str, repo_root: Path) -> str:
 
 
 def _sweep_pending_checkpoints(run_id: str, mesh_shared: Path) -> int:
-    """Delete this run's pending checkpoints once it reaches DONE.
+    """Delete this run's leftover pending checkpoints once it reaches DONE.
 
-    MERGING already clears them after each successful merge, but a run that
-    finishes on a *timed-out* round leaves behind whatever arrived late, and
-    nothing else ever collects it: _clean_stale_run_artifacts only fires on
-    run_id *reuse*, so a new run_id never sweeps a dead one's leftovers.
-    Observed in production: 15 pool-birds-5r checkpoints (2.6 GiB against a
-    30 GiB quota) still in pending/ hours after that run went DONE, where
-    the next run's merge would have averaged them in.
+    A run that ends on a timed-out round can leave late checkpoints behind.
+    Nothing else collects them, and a later merge would average them in.
     """
     pending_dir = mesh_shared / "checkpoints" / "pending"
     swept = 0
@@ -1894,17 +1645,11 @@ def _sweep_pending_checkpoints(run_id: str, mesh_shared: Path) -> int:
 def sweep_orphaned_pending(
     pending_dir: Path, active_run_ids: set[str], *, max_age_s: float
 ) -> int:
-    """Delete pending/ checkpoints whose run_id is not among the currently
-    configured runs, once they are older than max_age_s.
+    """Delete pending/ checkpoints from runs that are no longer configured.
 
-    Catches what _sweep_pending_checkpoints cannot: checkpoints from a run
-    that never reached SYNCING/DONE at all (killed mid-run, or dropped from
-    mesh_run_configs.json by hand) -- observed in production as 9.3 GiB of
-    orphans from five dead runs, against a 30 GiB NFS quota.
-
-    Critical guard: load_run_configs returns [] when its file is missing, so
-    an empty active_run_ids means "unknown", not "nothing is active" -- this
-    must no-op rather than delete every live checkpoint in pending/.
+    Only files older than max_age_s are removed. This covers runs that never
+    reached DONE. An empty active_run_ids means the config is unknown (the file
+    is missing), so this must no-op rather than delete live checkpoints.
     """
     if not active_run_ids or not pending_dir.exists():
         return 0
@@ -1923,14 +1668,10 @@ def sweep_orphaned_pending(
 def _stage_local_merge_state_for_archive(
     run_config: MeshRunConfig, mesh_shared: Path
 ) -> None:
-    """Copy the watcher-local momentum buffer into the run's NFS dir so the
-    existing node089 transfer still archives it.
+    """Copy the local momentum buffer into the run's NFS dir for archiving.
 
-    The buffer moved to local disk to keep it off the per-round NFS budget,
-    but it is part of a run's reproducible result (it was in every previous
-    archive) -- so it comes back exactly once, at DONE. The error-feedback
-    residual deliberately does not: it is a transient compression aid, not a
-    result.
+    The momentum is part of the run's result, so it is copied once, at DONE.
+    The error-feedback residual is not copied because it is not a result.
     """
     momentum_path = _mesh_local_root() / run_config.run_id / "outer_momentum.pt"
     if not momentum_path.exists():
@@ -1959,9 +1700,8 @@ def _do_syncing(
 
     if run.round >= run_config.rounds:
         run.status = "DONE"
-        # No merge cycle is coming next to flush the round(s) that
-        # write_mesh_round_scalars's straggler holdback always leaves
-        # pending on a live run -- final=True catches those up now.
+        # No merge is coming to flush the TB rounds held back for stragglers,
+        # so flush them now.
         flush_final_tb_rounds(
             _mesh_local_root() / run_config.run_id / "tb",
             mesh_shared,
@@ -1969,9 +1709,8 @@ def _do_syncing(
         )
         _stage_local_merge_state_for_archive(run_config, mesh_shared)
         transfer_note = _transfer_results_to_node089(run_config, mesh_shared)
-        # Before the sweep: a straggler cancelled here cannot push one more
-        # checkpoint into pending/ after _sweep_pending_checkpoints has run,
-        # which would leak it until sweep_orphaned_pending's age cutoff.
+        # Cancel before sweeping, so no straggler writes into pending/ after the
+        # sweep.
         cancel_note = _cancel_run_workers(run_config.run_id, repo_root)
         swept = _sweep_pending_checkpoints(run_config.run_id, mesh_shared)
         clear_run_state(state, run_config.run_id)
@@ -1986,16 +1725,10 @@ def _do_syncing(
                 "quorum, not a clean DONE"
             )
         return done_note
-    # Not ASSIGNING: Task 2's worker job is a single long-lived SLURM
-    # allocation that loops over every round internally, polling this exact
-    # flag between rounds -- it never exits and needs no resubmission. Shard
-    # assignment is also static for this plan (per-round throughput
-    # reweighting is explicitly out of scope), so there is nothing to
-    # recompute either. Re-entering ASSIGNING here would unconditionally
-    # sbatch a second job per node on top of the still-alive original.
-    # RUNNING already does exactly what's needed next: wait for the
-    # following round's checkpoints to land in pending/ (cleared by MERGING
-    # on success) and re-enter AWAITING_CHECKPOINTS once they do.
+    # Do not re-enter ASSIGNING here. The worker is one long-lived job that
+    # loops over rounds and polls this flag itself, and shard assignment is
+    # static. Re-entering would submit a second job per node. RUNNING waits for
+    # the next round's checkpoints.
     run.status = "RUNNING"
     run.round_started_at = now
     return (
@@ -2022,20 +1755,12 @@ def _atomic_touch(path: Path) -> None:
 
 
 def _clean_stale_run_artifacts(run_id: str, mesh_shared: Path) -> list[Path]:
-    """Delete sync flags and pending checkpoints left over from a prior
-    attempt at this run_id (e.g. after an aborted relaunch).
+    """Delete sync flags and pending checkpoints left by a prior attempt at run_id.
 
-    Left in place, these silently short-circuit the round-sync logic --
-    workers see a stale sync_complete flag and skip loading the merged
-    master checkpoint. Hyphen-suffixed collisions (cleaning "pool-fish"
-    must not touch "pool-fish-5r"'s flags) are already prevented by the
-    glob's literal "_" delimiter, which has no counterpart at that
-    position in the sibling run's filename. The flags glob additionally
-    uses a digit character class (not a bare trailing `*`) so
-    underscore-suffixed collisions are also rejected -- cleaning "pool"
-    must not delete "pool_extra"'s flags, which a bare `*` would wrongly
-    match. Missing flags/ or pending/ directories are not an error --
-    Path.glob on a non-existent directory returns no matches.
+    Stale flags would make workers skip the merged master. The globs must not
+    match sibling runs: the "_" delimiter and the digit class in the flag glob
+    keep "pool" from matching "pool-fish-5r" or "pool_extra". Missing
+    directories simply yield no matches.
     """
     flags_dir = mesh_shared / "checkpoints" / "flags"
     pending_dir = mesh_shared / "checkpoints" / "pending"

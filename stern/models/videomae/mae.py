@@ -43,36 +43,27 @@ def visible_isolation_weights(
     token_grid: tuple[int, int, int],
     device: torch.device,
 ) -> torch.Tensor:
-    """`w_i = 1 - exp(-d_i)` for each visible token, `d_i` its Euclidean distance
-    in the (H', W') *spatial* plane to the nearest visible token outside its own
-    tube.
+    """Isolation weight `w_i = 1 - exp(-d_i)` for each visible token.
 
-    A visible patch with a visible spatial neighbour can be reconstructed by
-    copying sideways, so it exerts no pressure to carry its own content through
-    depth. An isolated one has nowhere to copy from: the only route to its
-    reconstruction is its own token surviving all twelve blocks. Weighting by
-    isolation aims arm B's extra term at exactly the tokens whose loss the
-    residual stream has to preserve, which is what the ablation is about.
+    `d_i` is the Euclidean distance, in the (H', W') spatial plane, from the token
+    to the nearest visible token outside its own tube. A visible token with a
+    visible spatial neighbour can be reconstructed by copying sideways, so it has
+    no pressure to carry its own content through depth. An isolated one must
+    survive all blocks, so the weight aims the visible-loss term at those tokens.
 
     Two properties of the mask geometry force this definition (measured on the
-    production (8, 14, 14) grid; see test_mae_e2b_arms.py):
+    (8, 14, 14) production grid; see test_mae_e2b_arms.py):
 
-    - **Distance to the nearest *masked* token cannot work.** At mask_ratio 0.9
-      every visible token sits at d=1.0 from a hole -- only 10% of tokens
-      survive, so none is ever deep inside a visible region. It is still
-      degenerate at 0.75, and only spreads at 0.5, far below anything we run.
-    - **The distance must ignore T'.** Tube masking keeps or drops a whole
-      (h, w) column across every temporal position, so a token's own tube is
-      always visible at d=1 along T' and a 3D metric collapses to a constant
-      regardless of ratio.
+    - Distance to the nearest *masked* token is degenerate: at mask_ratio 0.9
+      every visible token sits at d=1 from a hole.
+    - The distance must ignore T': tube masking keeps or drops a whole (h, w)
+      column, so a token's own tube is always at d=1 along T' and a 3D metric
+      collapses to a constant.
 
-    Isolation behaves the other way round: it spreads *best* at the production
-    ratio (six distinct values, max 3.16, at 0.9) and degenerates as masking
-    falls -- so this arm is only meaningful in the regime we actually train in.
-
-    The length scale is one grid cell. It is fixed rather than configurable: the
-    arm already has a free parameter (`visible_loss_weight`) to be chosen by
-    smoke run, and a second interacting one would make that choice unreadable.
+    Isolation spreads best at the production ratio (0.9) and degenerates as
+    masking falls, so this arm only means something in the regime we train in.
+    The length scale is fixed at one grid cell, since `visible_loss_weight` is
+    already the free parameter to tune.
     """
     t, h, w = token_grid
     coords = torch.stack(
@@ -170,15 +161,15 @@ class VideoMAEForPreTraining(nn.Module):
             self.decoder_embed_dim, out_frames * 3 * self.patch_size * self.patch_size
         )
 
-        # --- E2b ablation knobs. All three default to the committed recipe, so
-        # arm A is bit-comparable to the runs already on the cluster.
+        # --- E2b ablation knobs. The defaults are the committed recipe (arm A), so
+        # existing runs stay comparable.
         self.visible_loss_weight = float(model_cfg.get("visible_loss_weight", 0.0))
         self.visible_loss_isolation_weighting = bool(
             model_cfg.get("visible_loss_isolation_weighting", False)
         )
         depth = int(model_cfg.depth)
-        # 1-based to match the prompt's [4, 8, 12]; 0 would silently mean "the
-        # last block" under Python indexing, which is the opposite of intent.
+        # 1-based (e.g. [4, 8, 12]): 0 would silently mean "the last block" under
+        # Python indexing.
         self.deep_supervision_layers = [
             int(i) for i in (model_cfg.get("deep_supervision_layers") or [])
         ]
@@ -223,20 +214,17 @@ class VideoMAEForPreTraining(nn.Module):
             raise ValueError("keep_indices and mask_indices must be provided")
 
         if self.decoder_mask_ratio > 0.0:
-            # V2 dual-masking: subsample which masked tokens contribute to loss/target.
-            # The decoder still processes the full token sequence (masked+visible);
-            # only the reconstruction target is subsampled, not the decoder's compute footprint.
-            # Independent subsample per row, same n_recon count for every
-            # row (decoder_mask_ratio is a fixed fraction of n_mask).
+            # V2 dual-masking: subsample which masked tokens contribute to the loss.
+            # The decoder still runs on the full sequence; only the target is
+            # subsampled. Each row draws independently, with the same count per row.
             n_mask = mask_indices.shape[1]
             n_recon = max(1, round(n_mask * (1.0 - self.decoder_mask_ratio)))
             noise = torch.rand(B, n_mask, device=pixel_values.device)
             perm = torch.argsort(noise, dim=1)[:, :n_recon]
             mask_indices = torch.gather(mask_indices, 1, perm)
 
-        # Positional embedding is added once, up front, so both the encoder
-        # (on visible tokens) and the decoder (on visible + mask tokens) know
-        # which spatiotemporal position each token corresponds to.
+        # Add the positional embedding once, up front, so the encoder (visible
+        # tokens) and decoder (visible + mask tokens) both know each token's position.
         x = x + self.encoder.pos_embed
 
         # Encode only the visible tokens (the whole point of MAE: the encoder
@@ -320,9 +308,8 @@ class VideoMAEForPreTraining(nn.Module):
         decoder_tokens = visible.new_zeros(B, N, self.decoder_embed_dim)
         keep_idx = keep_indices.unsqueeze(-1).expand(-1, -1, self.decoder_embed_dim)
         mask_idx = mask_indices.unsqueeze(-1).expand(-1, -1, self.decoder_embed_dim)
-        # Under autocast, `visible` is the AMP dtype (bf16/fp16) while the
-        # mask_token parameter stays fp32; match both to the destination dtype
-        # so the scatter doesn't raise a dtype-mismatch.
+        # Under autocast `visible` is bf16/fp16 while mask_token stays fp32, so cast
+        # both to the destination dtype or the scatter raises a dtype mismatch.
         decoder_tokens.scatter_(1, keep_idx, visible.to(decoder_tokens.dtype))
         decoder_tokens.scatter_(1, mask_idx, mask_tokens.to(decoder_tokens.dtype))
         decoder_tokens = decoder_tokens + self.decoder_pos_embed

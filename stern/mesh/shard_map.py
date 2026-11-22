@@ -6,9 +6,8 @@ beyond the explicit save/load functions; selection logic is pure so it can
 be fixture-tested like `stern/watcher/detectors.py`.
 
 Selection prefers a same-subnet holder: the cross-switch uplink caps at
-~0.94 Gbps *in total* while the intra-switch backplane is non-blocking
-(`2026-06-30-cluster-tier1-findings.md` T2.3), so a cross-subnet pull
-contends with every other job sharing that uplink. Among equally-preferred
+~0.94 Gbps *in total* while the intra-switch backplane is non-blocking, so a
+cross-subnet pull contends with every other job sharing that uplink. Among equally-preferred
 holders, a hash of the shard name spreads fetchers across replicas instead
 of funneling everyone onto `holders[0]`'s single 1GbE NIC.
 """

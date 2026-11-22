@@ -1,3 +1,9 @@
+"""Multi-view augmentation for LeVJEPA: one global view and several local crops per clip.
+
+Each local crop's box is returned too, so the encoder can place its RoPE
+coordinates in the global view's frame.
+"""
+
 from __future__ import annotations
 
 import hashlib

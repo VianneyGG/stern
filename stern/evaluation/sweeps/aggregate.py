@@ -4,8 +4,8 @@ Reads every `runs/results/*.json` (WHN schema; written by
 `training/tb_logger.write_result_json`), keys rows by `run_tag`, and reports:
 
 - a tidy CSV + aligned console table of config x metrics,
-- `scaling_efficiency` for Phase-1 cells that have an N=1 baseline at the same
-  local batch: efficiency = samples/s(N) / (N * samples/s(N=1)),
+- `scaling_efficiency` for cells that have an N=1 baseline at the same local
+  batch: efficiency = samples/s(N) / (N * samples/s(N=1)),
 - the Pareto-best throughput cell and the best-converging quality cell.
 
 Stdlib only — no pandas, so it runs on a bare checkout.
@@ -120,10 +120,9 @@ def main() -> None:
         f"(N={best_tp['world_size']}, batch={best_tp['local_batch']}, "
         f"accum={best_tp['accum_steps']}, peak={fmt(best_tp['peak_vram_gb'])}GB)"
     )
-    # math.isfinite excludes both None and NaN -- a NaN recon_loss (all steps
-    # in an epoch were non-finite, see `nan_steps`) must never win "best": NaN
-    # comparisons are always False, so an unfiltered min() over a NaN-mixed
-    # list is order-dependent and can silently pick the NaN row.
+    # isfinite drops None and NaN. A NaN recon_loss (every step in an epoch was
+    # non-finite, see `nan_steps`) must not win: NaN comparisons are always
+    # False, so min() over a list containing NaN depends on order.
     quality = [
         r
         for r in rows

@@ -1,3 +1,5 @@
+"""Feedforward variants for ViT blocks, selected by `mlp_type`."""
+
 from __future__ import annotations
 
 from torch import nn

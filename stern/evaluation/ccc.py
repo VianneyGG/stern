@@ -1,13 +1,13 @@
-"""Concordance correlation coefficient (Lin, 1989) — ABAW-standard VA metric.
+"""Concordance correlation coefficient (Lin, 1989): the headline VA metric and the training loss.
 
-CCC(x, y) = 2 * cov(x, y) / (var(x) + var(y) + (mean(x) - mean(y))^2)
+CCC(x, y) = 2 * cov(x, y) / (var(x) + var(y) + (mean(x) - mean(y))^2),
 
-Unlike Pearson r, CCC penalizes both shape mismatch (correlation) and
-location/scale mismatch (bias), which is why ABAW uses it for VA scoring.
+with population (1/N) moments. Unlike Pearson r, CCC penalises both shape
+mismatch (low correlation) and location/scale mismatch (bias). ABAW scores VA
+with it.
 
-`ccc_loss` reimplements this formula with torch ops so autograd works (the
-numpy version above is correct for eval but not differentiable) -- it's the
-training loss, this module's numpy version stays the eval metric.
+`ccc_loss` computes the same formula with torch ops so autograd works. The
+numpy function is the eval metric; the torch version is only the training loss.
 """
 
 from __future__ import annotations
@@ -32,9 +32,8 @@ def concordance_correlation_coefficient(x: np.ndarray, y: np.ndarray) -> float:
     covar = np.mean((x - mean_x) * (y - mean_y))
     denom = var_x + var_y + (mean_x - mean_y) ** 2
     if denom == 0:
-        # Both signals are constant (zero variance) and means coincide.
-        # np.allclose (not ==) tolerates float noise in upstream signals
-        # that are constant in principle but not bit-identical in practice.
+        # Both signals are constant. allclose, not ==, absorbs float noise in
+        # signals that are constant in principle but not bit-identical.
         return 1.0 if np.allclose(x, y) else 0.0
     return float((2 * covar) / denom)
 
@@ -48,10 +47,10 @@ def _torch_ccc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def ccc_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """`-(CCC_valence + CCC_arousal) / 2` -- maximise concordance by minimising this.
+    """`-(CCC_valence + CCC_arousal) / 2`, so minimising it maximises concordance.
 
-    CCC is a batch-level statistic (it needs covariance across the batch), so
-    `pred`/`target` must be `(B, 2)` with `B` large enough to estimate variance.
+    CCC is a batch-level statistic, so `pred` and `target` are `(B, 2)` and `B`
+    must be large enough to estimate variance.
     """
     ccc_v = _torch_ccc(pred[:, 0], target[:, 0])
     ccc_a = _torch_ccc(pred[:, 1], target[:, 1])

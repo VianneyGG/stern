@@ -1,3 +1,5 @@
+"""LeVJEPA encoder: a per-frame-tokenising ViT with block-causal attention and 3D RoPE."""
+
 from __future__ import annotations
 
 import torch

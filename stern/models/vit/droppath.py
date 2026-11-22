@@ -1,3 +1,5 @@
+"""Stochastic depth for residual branches."""
+
 from __future__ import annotations
 
 import torch

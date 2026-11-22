@@ -1,8 +1,8 @@
 """stern/watcher/class_hours.py
 
 No cluster job may run during class hours: Monday-Friday 08:00-20:00,
-Europe/Paris. The SallesInfo nodes are classroom machines; the admins cancel
-anything running then and warn the account holder (2026-09-21).
+Europe/Paris. The SallesInfo nodes are classroom machines, and admins cancel
+anything running in those hours.
 
 A job is refused when ANY part of [now, now + walltime] overlaps class hours,
 not just when it starts inside them -- a job started at 07:30 would still be

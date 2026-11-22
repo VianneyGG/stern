@@ -8,7 +8,7 @@ Choices the paper leaves open: features are the final normed output, CLS dropped
 one PCA is fitted per model over all frames of the clip, so colours are
 consistent across time; no foreground thresholding.
 
-Usage (on login-node; the released weights and AFEW-VA live there):
+Usage (on the GPU host that holds the released weights and AFEW-VA):
     uv run --no-sync python -m stern.evaluation.diagnostics.patch_pca \
         --clip 001 --query 8,5,7 --out levjepa_patch_pca.png
 """
@@ -65,7 +65,7 @@ def cosine_map(grid: torch.Tensor, query: tuple[int, int, int]) -> np.ndarray:
 
 
 def _load_clip(clip: str, num_frames: int, image_size: int) -> torch.Tensor:
-    """The clip's first window, built exactly as diag_probe builds AFEW-VA input."""
+    """The clip's first window, built exactly as the probe builds AFEW-VA input."""
     from stern.data.manifest import read_manifest
     from stern.evaluation.diagnostics.probe import _probe_dataset
 

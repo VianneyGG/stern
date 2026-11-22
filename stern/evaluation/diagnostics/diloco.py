@@ -1,7 +1,7 @@
-"""Plan 6 DiLoCo checks 1-5: does the merge's averaged pseudo-gradient agree?
+"""DiLoCo merge checks: does the averaged pseudo-gradient agree, and did the merge help?
 
 Every check here is CPU `state_dict` arithmetic over one round captured by
-`snapshot_mesh_checkpoints.sh` (Plan 1): no GPU, no shard reads, no forward
+`cluster/snapshot_mesh_checkpoints.sh`: no GPU, no shard reads, no forward
 pass. All merge math is imported from `stern.mesh.outer_step`, never
 re-derived, so a diagnostic can only disagree with the real merge if the
 captured inputs do.
@@ -48,8 +48,7 @@ from stern.evaluation.diagnostics.common import (
     paired_inputs,
 )
 
-# Fixed so `diagnostics.json` stays byte-for-byte reproducible (ssl-diag-05
-# compares it exactly across invocations).
+# Fixed so `diagnostics.json` stays byte-for-byte reproducible across invocations.
 _FLOOR_SEED = 0
 _CONTROL_SEED = 1
 
@@ -626,7 +625,7 @@ def history_only(metrics_dir: Path) -> dict[int, DiagReport]:
     """Per-round contributor count and val-loss dispersion from worker metrics.
 
     Reads `mesh_shared/metrics/<run_id>/<node>.jsonl` only, so it runs on any
-    past run without a Plan 1 capture. Rounds are keyed as the JSONL records
+    past run without a snapshot capture. Rounds are keyed as the JSONL records
     them (1-based), not as pending filenames number them.
     """
     by_round: dict[int, list[dict]] = defaultdict(list)
@@ -698,7 +697,7 @@ def _cell_key(row: dict) -> tuple:
 def _forward_reports(
     merge: MergeInputs, inputs: dict, base_meta: dict
 ) -> dict[str, DiagReport]:
-    """Checks 6-7, replicated over masking seeds. Each seed's sweep contains
+    """The two forward-pass checks, replicated over masking seeds. Each seed's sweep contains
     the configured cell (nesterov at the run's own weighting), which IS that
     seed's merge regression (same alphas, same step, same mask), so the
     regression is read off it rather than paid for twice."""
@@ -717,7 +716,7 @@ def _forward_reports(
 
     # A misconfigured eval set is the operator's error and raises; anything
     # after it (a refused weighting, an OOM) is this pair's failure alone and
-    # must not take the five 12a reports down with it.
+    # must not take the five weight-only reports down with it.
     assert_held_out(
         inputs["diloco_eval_shard"], inputs["diloco_assignments"], merge.worker_deltas
     )
@@ -835,7 +834,7 @@ def _forward_reports_unguarded(
 
 
 def check(bundle: DiagBundle, inputs: dict) -> dict[str, DiagReport]:
-    """Checks 1-5 on one captured round, keyed like `diag_depth.check`.
+    """Run every DiLoCo check on one captured round. Keys match `depth.check`.
 
     `bundle` is unused: every check reads the captured merge inputs, not the
     loaded encoder. The orchestrator calls every check on every run, so a
@@ -868,7 +867,7 @@ def check(bundle: DiagBundle, inputs: dict) -> dict[str, DiagReport]:
         "dropped_nonfinite": list(merge.dropped_nonfinite),
     }
 
-    # D8: the lexicographically first survivor stands in for a single-node run.
+    # The lexicographically first survivor stands in for a single-node run.
     source = min(merge.worker_deltas)
     single = {k: merge.master[k] - v for k, v in merge.worker_deltas[source].items()}
     controls = synthetic_controls(single, merge.master, n_workers=len(merge.worker_deltas))

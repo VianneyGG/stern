@@ -1,7 +1,7 @@
 """Label-free representation-quality metrics, hand-implemented in numpy.
 
-`reptrix` is rejected (design.md): it transitively pulls scikit-learn and
-torchvision into the single TF/PyTorch venv CLAUDE.md requires. Every metric
+`reptrix` is rejected: it transitively pulls scikit-learn and torchvision into
+the single TF/PyTorch venv. Every metric
 here is therefore pure numpy, checked against a cross-metric ground truth (a
 known `d`-dimensional linear subspace embedded in a higher-dimensional
 ambient space) rather than mere self-consistency.
@@ -132,7 +132,7 @@ def lidar(views_a, views_b, eps: float = 1e-7) -> float:
     trace_w = float(np.trace(s_w))
     if trace_t < eps or trace_w / (trace_t + eps) < 1e-6:
         # Degenerate: (near-)zero within-class scatter, e.g. identical view
-        # pairs. Flagged before regularisation, per design.md.
+        # pairs. Check before adding the regulariser, or eps * I hides it.
         return float("nan")
 
     s_b = s_t - s_w
@@ -194,11 +194,11 @@ def by_block(
     blocks: Iterable[int] | None = None,
     chunk: int = 16,
 ) -> dict[int, float]:
-    """`metric_name` at each of `blocks`' outputs (default: every block),
-    dispatched against an explicit name registry (never `__name__`/identity)
-    -- see design.md. Scored over one pooled embedding per window
-    (`pooled_embeddings`), the per-sample representation these metrics are
-    defined on."""
+    """`metric_name` at each of `blocks`' outputs (default: every block).
+
+    Dispatch goes through the explicit `_METRIC_REGISTRY`, not `__name__`. Each
+    block is scored over one pooled embedding per window, the per-sample
+    representation these metrics are defined on."""
     if metric_name not in _METRIC_REGISTRY:
         raise ValueError(
             f"unknown metric_name {metric_name!r}; choose from "
@@ -227,18 +227,16 @@ def check(bundle: DiagBundle, inputs: dict) -> dict[str, DiagReport]:
     replicated over three independently-drawn sets of
     `inputs["labelfree_n_windows"]` windows (default `LABELFREE_N_WINDOWS`),
     for both `"real"` and `"random"` input kinds -- one report per kind, keyed
-    `diag_labelfree_<kind>`. Requires `inputs["shard_path"]` -- see design.md's
-    documented follow-up for threading it through Plan 5's orchestrator.
+    `diag_labelfree_<kind>`. Requires `inputs["shard_path"]`.
 
     A metric whose replicate comes back NaN (`idest` on collapsed or
     underpowered tokens) is left out of `metrics` and recorded as
     `meta["<metric>_degenerate"]` -- collapse is a finding to report, not a
     reason to take the whole check down.
 
-    Known gap (task 3.6): `lidar`'s `check()` wiring -- the two-masking
-    positive pair it needs -- requires
-    `models.videomaev2.masking.build_masker` to produce the second view.
-    That is not wired here; a `lidar_pair` helper is a follow-up.
+    Known gap: `lidar` is not wired into `check()`. It needs a second masked
+    view from `stern.models.videomae.masking.build_masker` to form a positive
+    pair. A `lidar_pair` helper is the follow-up.
     """
     shard_path = inputs["shard_path"]
     n_windows = int(inputs.get("labelfree_n_windows", LABELFREE_N_WINDOWS))

@@ -1,24 +1,20 @@
 #!/usr/bin/env python
-"""Build a STERN manifest.csv from an already-built WDS shard set's
-manifest.json, without touching the raw mp4 corpus.
+"""Build manifest.csv from an existing WDS shard set's manifest.json.
 
-build_voxceleb2_full_manifest.py needs --raw-root (raw mp4 files); on the
-mesh fish nodes only the pre-built shards exist, not the raw corpus. The
-mesh SSL path (mesh_round.py) bypasses cfg.dataset/manifest.csv entirely, so
-this gap was never exercised until the non-mesh (traditional single-node)
-SSL path needed it -- build_ssl_loader unconditionally reads
-dataset.manifest_path.
+This works without the raw mp4 corpus, which is useful on nodes that hold
+only the shards. The mesh SSL path skips the manifest entirely, but the
+single-node SSL path needs one, since build_ssl_loader reads
+`dataset.manifest_path`.
 
-clip_key entries in shards_root/manifest.json are
-"<identity_id>/<video_id>/<clip_id>" (build_wds_shards.py, matching
-list_clips' raw-mp4 walk convention). duration_s is derived from num_frames
-at the shard build's fixed 2fps (build_wds_shards.py --fps default), not a
-placeholder.
+clip_key entries in shards_root/manifest.json look like
+"<identity_id>/<video_id>/<clip_id>", matching build_voxceleb2_manifest.py.
+duration_s comes from num_frames at the shard build's fps (--fps here must match
+build_wds_shards.py --fps).
 
 Usage:
     PYTHONPATH=. uv run python stern/prep/manifest_from_shard_index.py \\
-        --shards-root /Data/$USER/voxceleb2_shards \\
-        --manifest-out /Data/$USER/voxceleb2/manifest.csv
+        --shards-root $DATA_ROOT/voxceleb2_shards \\
+        --manifest-out $DATA_ROOT/voxceleb2/manifest.csv
 """
 
 from __future__ import annotations
@@ -33,6 +29,7 @@ from stern.data.wds_frames import load_shard_index
 def build_records(
     shard_index: dict[str, dict], *, fps: float = 2.0
 ) -> list[ManifestRecord]:
+    """One SSL record per shard index entry."""
     records = []
     for clip_key, entry in shard_index.items():
         identity_id = clip_key.split("/", 1)[0]

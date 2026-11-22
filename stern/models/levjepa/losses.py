@@ -1,10 +1,11 @@
+"""LeVJEPA objective: view invariance plus SIGReg (Epps-Pulley) on the embeddings."""
+
 from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
 
 import torch
-
 
 
 def invariance_loss(z_global: torch.Tensor, z_locals: torch.Tensor) -> torch.Tensor:
@@ -32,8 +33,8 @@ class SigregOptions:
     moment_weight: adds B * (log(1 + mean_p^2 / var_p) + log(var_p)^2 / 4)
         per direction. Epps-Pulley alone goes flat once projections are much
         wider than 1/t_max: cos/sin average to ~0, the loss plateaus and its
-        expected gradient vanishes under the noise (measured: scale 20-200
-        all give ~325) -- it loses its grip exactly when embeddings blow up.
+        gradient vanishes under the noise (scales 20-200 all give ~325 when
+        measured), so it loses its grip exactly when embeddings blow up.
         NOTE: this changes the objective.
     pool: SIGReg over all accum_steps micro-batches of an optimizer step
         (exact, two forward passes; see mesh_round._levjepa_pooled_window).
@@ -124,10 +125,10 @@ def _statistic(
 def _moment_statistic(
     p_mean: torch.Tensor, p2_mean: torch.Tensor, B: int | torch.Tensor
 ) -> torch.Tensor:
-    # Log-bounded on purpose: a plain (E[p^2] - 1)^2 grows as scale^4 and turns
-    # an exploding batch into an exploding gradient. Each term is ~chi^2_1 / B
-    # near N(0, 1) (null floor ~1.5 after x B at B >= 64; 1.74 at B=16) and pulls back logarithmically
-    # in scale and in mean shift -- exactly where Epps-Pulley goes flat.
+    # Log-bounded on purpose: a plain (E[p^2] - 1)^2 grows as scale^4, so an
+    # exploding batch would give an exploding gradient. Near N(0, 1) each term
+    # is ~chi^2_1 / B (null floor ~1.5 after x B at B >= 64, 1.74 at B=16), and
+    # the log pulls back in scale and mean shift, where Epps-Pulley goes flat.
     var = (p2_mean - p_mean.pow(2)).clamp_min(1e-6)
     return (torch.log1p(p_mean.pow(2) / var) + 0.25 * torch.log(var).pow(2)) * B
 

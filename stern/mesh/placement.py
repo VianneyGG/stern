@@ -1,55 +1,25 @@
-"""Capacity-aware seeding plan with replication for the P2P training mesh.
+"""Capacity-aware shard placement with replication for the P2P training mesh.
 
-`plan_placement` decides *where* each shard is physically stored before any
-training happens: `mesh/seed.py` (Task 9) rsyncs shards to match this plan,
-`mesh/assignment.py` (Task 4) later decides what each node *trains* this
-round from `compute_shard_counts` (Task 2) combined with this placement.
+`plan_placement` decides where each shard is stored before training starts.
+`seed_nodes.py` copies shards to match the plan. `assignment.py` later decides
+which node trains which shard, using the compute split from
+`scoring.compute_shard_counts`.
 
-Each node's storage share is `min(compute_share, capacity_share)` --
-capacity bounds compute, never the other way around. A node that cannot
-physically hold its proportional-to-compute share gets *less* work instead
-of overflowing its disk. This matters because the fish cluster's free disk
-ranges from 90 GB (node024) to 905 GB (node089) and drifts as other
-students use `/Data` -- a purely compute-proportional split would silently
-try to write more than some node's disk can hold.
+Each node's storage share is `min(compute_share, capacity_share)`: capacity
+bounds compute, never the reverse. A node that cannot hold its
+compute-proportional share gets less work instead of overflowing its disk.
+Free disk varies widely across nodes (90 GB to 905 GB in one measured pool),
+so a purely compute-proportional split would overflow some of them.
 
-**Feasibility check.** `compute_share_i = E_i / sum(E)` sums to exactly 1
-over the node pool by construction, so `sum(min(compute_share_i,
-capacity_share_i))` is *always* <= 1, and strictly < 1 the moment even one
-node is capacity-bound (its capped share is below its compute share). That
-makes "sum(min(...)) < 1" true in the overwhelmingly common case of a
-heterogeneous-disk cluster -- exactly the case this module exists to
-handle -- even when the *total* free capacity across the mesh is enormous
-(e.g. one small node alongside several large ones). Gating
-`InsufficientCapacityError` on that sum would raise on healthy, plainly
-placeable pools. The condition that actually answers "can the mesh hold
-`replication` copies of the dataset at all" is `sum(capacity_share_i) >= 1`
-(total headroom-adjusted free space, in units of one full replicated
-dataset) -- that is what is checked here.
+Feasibility is `sum(capacity_share) >= 1`: the total headroom must hold
+`replication` copies of the dataset. Gating on `sum(min(...)) < 1` would reject
+healthy heterogeneous pools, so it is not the test. Shares are then
+water-filled to sum to exactly 1 without exceeding any node's capacity share.
 
-**Renormalization.** Given feasibility, shares are brought up to sum to
-exactly 1 by water-filling: capacity-bound nodes keep their capacity-capped
-share (never pushed higher -- that would be the overflow this module exists
-to prevent), and the shortfall is redistributed, proportional to compute
-share, only among nodes not (yet) capacity-bound, iterating since a
-redistribution can itself push a previously-fine node onto its own cap.
-This always converges to `sum(w_i) == 1` without exceeding any node's
-`capacity_share_i`, whenever `sum(capacity_share_i) >= 1`.
-
-Shard-to-host assignment then greedily gives each shard's `replication`
-slots to the most-under-target *distinct* hosts, with each node's integer
-slot budget hard-capped at its true physical capacity (floored, so
-floating-point error can only under- not over-allocate). The continuous
-feasibility check above bounds *aggregate* capacity, not each node's
-floored capacity individually -- per-node flooring can independently
-shave up to ~1 slot off each node, so `sum(max_slots)` can still fall
-short of `total_slots` in a near-tight pool even though
-`sum(capacity_share_i) >= 1`. If discretization ever runs out of eligible
-distinct hosts for a shard because of that flooring loss, it raises
-`InsufficientCapacityError` rather than exceeding any node's floored
-`max_slots` -- so this module never overflows a disk, full stop, even at
-the cost of occasionally rejecting a continuous-feasible but
-integer-infeasible input.
+Shards go to the most under-target distinct hosts. Each node's slot count is
+floored at its physical capacity. Flooring can leave a near-tight pool one slot
+short, and then `plan_placement` raises `InsufficientCapacityError` rather than
+overflow any disk.
 """
 
 from __future__ import annotations
@@ -72,6 +42,7 @@ def plan_placement(
     replication: int = 2,
     min_free_gb: float = 50.0,
 ) -> dict[str, list[str]]:
+    """Return `hostname -> [shard, ...]` with `replication` distinct holders per shard."""
     if replication < 1:
         raise ValueError(f"replication must be >= 1, got {replication}")
     if dataset_gb <= 0:
@@ -129,17 +100,10 @@ def plan_placement(
                 if h not in chosen and assigned_count[h] < max_slots[h]
             ]
             if not candidates:
-                # The continuous feasibility check (sum(capacity_share) >= 1)
-                # guarantees enough *aggregate* capacity, but per-node floor
-                # rounding of `max_slots` can independently shave up to
-                # ~1 slot off each node's true physical capacity -- so
-                # `sum(max_slots)` can still fall short of `total_slots` in a
-                # near-tight pool. There is no host left that can take this
-                # slot without exceeding its own floored physical capacity;
-                # raise rather than silently overflow one (this is exactly
-                # the "never an overflow" invariant this module exists to
-                # hold, even when it costs rejecting a technically-tight
-                # continuous-feasible input).
+                # Aggregate capacity passed the continuous check, but floor
+                # rounding of `max_slots` can leave `sum(max_slots)` short of
+                # `total_slots`. No host can take this slot without exceeding
+                # its floored capacity, so raise rather than overflow one.
                 raise InsufficientCapacityError(
                     f"plan_placement: per-node floor rounding of physical "
                     f"slot capacity left no eligible host to hold "
@@ -164,11 +128,11 @@ def plan_placement(
 def _water_fill(
     compute_share: dict[str, float], capacity_share: dict[str, float]
 ) -> dict[str, float]:
-    """Redistribute the shortfall left by capacity-bound nodes among the
-    not-(yet)-bound nodes, proportional to their compute share, until every
-    node's share sums to exactly 1 -- without ever exceeding a node's own
-    `capacity_share`. See module docstring for why this differs from a
-    single-pass scalar renormalization.
+    """Spread the shortfall from capacity-bound nodes over the unbound nodes.
+
+    The spread is proportional to compute share, repeated until shares sum to
+    1. No node ever exceeds its `capacity_share`. A single scalar rescale
+    would push capacity-bound nodes over their cap.
     """
     share = {h: min(compute_share[h], capacity_share[h]) for h in compute_share}
     unbound = {h for h in share if capacity_share[h] > compute_share[h] + _EPS}

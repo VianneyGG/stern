@@ -24,9 +24,8 @@ from stern.models.videomae.encoder import preprocess_window
 def shuffle_frames(window: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
     """Randomly permute a window's frames along T.
 
-    The control that makes the temporal-order probe interpretable: it destroys
-    temporal order while preserving every frame, so a CCC drop cannot be blamed
-    on the domain gap or the missing face-crop stage.
+    Destroys temporal order but keeps every frame. A CCC drop under this
+    control therefore reflects the order, not the content or domain shift.
     """
     perm = torch.randperm(window.shape[1], generator=generator)
     return window[:, perm]
@@ -35,8 +34,8 @@ def shuffle_frames(window: torch.Tensor, generator: torch.Generator) -> torch.Te
 def freeze_frames(window: torch.Tensor, index: int | None = None) -> torch.Tensor:
     """Replace every frame with one source frame (default: the middle one).
 
-    Reported as a secondary reference point rather than the gate -- unlike
-    shuffling, this changes the content distribution as well as the order.
+    A secondary reference, not the gate. Unlike shuffling, it also changes the
+    content distribution.
     """
     t = window.shape[1]
     i = t // 2 if index is None else index
@@ -50,12 +49,11 @@ def make_temporal_transform(
     if condition == "normal":
         return None
     if condition == "shuffled":
-        # One generator per DataLoader worker, created on first use inside that
-        # worker. A single closed-over generator is copied at fork, so every
-        # worker would replay the same permutation sequence -- still a valid
-        # shuffle, but with 1/num_workers of the diversity and reproducible only
-        # if worker assignment was. This condition is the control the temporal
-        # gate rests on, so its randomness must not depend on the loader.
+        # One generator per DataLoader worker, created lazily inside that worker.
+        # A generator closed over before fork would be copied into every worker,
+        # and they would replay the same permutations. The shuffled condition is
+        # the control for the temporal gate, so its randomness must not depend
+        # on how the loader assigns workers.
         generators: dict[int, torch.Generator] = {}
 
         def _shuffle(window: torch.Tensor) -> torch.Tensor:

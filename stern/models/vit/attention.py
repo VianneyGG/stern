@@ -1,3 +1,5 @@
+"""Multi-head self-attention with optional QK-norm, weight-compatible with nn.MultiheadAttention."""
+
 from __future__ import annotations
 
 import torch

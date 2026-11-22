@@ -1,3 +1,5 @@
+"""MLP projector from [cls] embeddings into the LeVJEPA objective space."""
+
 from __future__ import annotations
 
 import torch

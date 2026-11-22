@@ -1,11 +1,13 @@
-"""CLI wrapper around watcher.registry.append_job_record, called from
-submit_to_cluster.sh's remote ssh block right after `sbatch` returns a job id.
+"""CLI wrapper around registry.append_job_record.
+
+submit_to_cluster.sh calls this from its remote block right after `sbatch`
+returns a job id.
 
 Usage:
   uv run python stern/watcher/append_job_registry.py \
       --registry-path runs/state/jobs_registry.json \
       --job-id 36901 --experiment videomae_ssl_pretrain_voxmini \
-      --run-tag p2-eb256 --nodelist node001
+      --run-tag p2-eb256 --nodelist node01
 """
 
 from __future__ import annotations

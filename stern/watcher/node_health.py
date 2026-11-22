@@ -1,12 +1,11 @@
 """Real node readiness, as opposed to what SLURM is willing to say.
 
-`cluster.query_idle_nodes` asks sinfo and believes the answer. On 2026-08-22
-that answer was wrong for 10 of 12 birds nodes: sinfo reported every excluded
-node "idle" while 7 still had ~21.7 GiB of their 24.5 GiB GPU held by a
-foreign process and 3 had never been seeded. `_replenish_pool` picked 6 of
-them and all 6 crashed on submit -- 3 with `torch.OutOfMemoryError`, 3 with
-`FileNotFoundError: .../mesh/manifest.json` -- each burning the two missed
-rounds that permanently exclude a node.
+`cluster.query_idle_nodes` asks sinfo and believes the answer. That answer
+can be wrong: sinfo reported nodes "idle" while their GPU was held by a
+foreign process (~21.7 GiB of 24.5) or their shards were never seeded. A
+pool replenished from that answer submitted jobs that crashed on start
+(`torch.OutOfMemoryError`, or a missing `mesh/manifest.json`), and each crash
+burned one of the two missed rounds that exclude a node.
 
 Readiness is three independent facts from three sources: SLURM says nobody
 else is scheduled here, nvidia-smi says the GPU is actually free, and the
@@ -27,13 +26,10 @@ from dataclasses import dataclass
 # forward pass, not at allocation time.
 #
 # NOT "most of the card": cards differ by tier, so a fraction-of-total rule
-# written against 24 GiB silently bans whole tiers. Free MiB on an IDLE node,
-# measured across all four tiers on 2026-08-22: fish 23973-24080, birds 23954,
-# cars 17560-19860, countries 13392-15817. An occupied node reads 1495-2453.
-# The old 20_000 floor therefore rejected every cars and countries node as
-# unhealthy -- on a cross-tier roster that leaves replenishment able to draw
-# from only half the cluster, while the gap it actually has to detect (2453 vs
-# 13392) is enormous. 10 GiB sits in that gap with room on both sides.
+# written against 24 GiB silently bans whole tiers. Free MiB on idle nodes:
+# fish 23973-24080, birds 23954, cars 17560-19860, countries 13392-15817.
+# An occupied node reads 1495-2453. A 20_000 floor would reject every cars
+# and countries node. 10 GiB sits in the gap between occupied and idle.
 DEFAULT_MIN_GPU_FREE_MIB = 10_000
 
 _MESH_DATA_DIR = "/Data/$USER/mesh"

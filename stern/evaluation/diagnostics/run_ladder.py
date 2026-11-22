@@ -596,11 +596,11 @@ def run(
                 }
             )
             continue
-        e, a, err, sk = call_checks(bundle, inputs, checks, run_id=run_id)
-        envelopes += e
-        arrays += a
-        errors += err
-        skipped += sk
+        envs, arrs, errs, skips = call_checks(bundle, inputs, checks, run_id=run_id)
+        envelopes += envs
+        arrays += arrs
+        errors += errs
+        skipped += skips
 
     stamp_verdicts(envelopes, ladder_tiers)
     skipped += write_plots(envelopes, arrays, out_dir / "plots")
@@ -889,34 +889,34 @@ def run_ladder(
             inputs["control_bundle"] = _to_device(inputs["control_bundle"], device)
             if probe_layers is not None:
                 inputs["layers"] = list(probe_layers)
-            e, a, err, sk = call_checks(
+            envs, arrs, errs, skips = call_checks(
                 bundle, inputs, redrawn, run_id=bundle.run_id, rung=name
             )
-            errors += [{**x, "draw": d} for x in err]
+            errors += [{**x, "draw": d} for x in errs]
             if d == 0:
-                first, first_arrays = e, a
-                skipped += sk
+                first, first_arrays = envs, arrs
+                skipped += skips
                 redrawn = _redrawn(checks, first)
                 if not redrawn:
                     break
             else:
-                extra.append(e)
-        e, a = _merge_draws(
+                extra.append(envs)
+        merged, merged_arrays = _merge_draws(
             first,
             first_arrays,
             extra,
             {c for k in redrawn for c in EMITS.get(k, frozenset({k}))},
             draw_seeds,
         )
-        arrays += a
-        per_rung[rung] = e
-        envelopes += e
+        arrays += merged_arrays
+        per_rung[rung] = merged
+        envelopes += merged
         cache.write_bytes(
             pickle.dumps(
                 {
                     "settings": key,
-                    "envelopes": e,
-                    "arrays": a,
+                    "envelopes": merged,
+                    "arrays": merged_arrays,
                     "errors": errors[n_errors:],
                     "skipped": skipped[n_skipped:],
                 }
@@ -1078,17 +1078,19 @@ def run_rounds(
                 }
             )
             continue
-        e, a, err, sk = call_checks(bundle, inputs, checks, run_id=run_id, round=r)
+        envs, arrs, errs, skips = call_checks(
+            bundle, inputs, checks, run_id=run_id, round=r
+        )
         if ref is None:
-            for entry in sk:
+            for entry in skips:
                 if entry["reason"] == "no ref_bundle supplied":
                     entry["reason"] += (
                         f": round {r - 1} reference snapshot not captured"
                     )
-        envelopes += e
-        arrays += a
-        errors += err
-        skipped += sk
+        envelopes += envs
+        arrays += arrs
+        errors += errs
+        skipped += skips
 
     stamp_verdicts(envelopes, ladder_tiers)
     skipped += write_plots(envelopes, arrays, Path(out_dir) / "plots")
@@ -1106,6 +1108,7 @@ def _csv(text: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Parse the CLI and run the ladder, round or run axis."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ladder", action="store_true", help="the ladder axis")
     parser.add_argument(

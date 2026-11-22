@@ -1,3 +1,5 @@
+"""VideoMAE encoder, MAE pretraining, masking and the VA regressor."""
+
 from stern.models.videomae.encoder import (
     VideoMAEEncoder,
     preprocess_window,

@@ -1,4 +1,4 @@
-"""Small helpers shared by training/train.py and training/pretrain.py."""
+"""Small helpers shared by the training loops (finetune.py and pretrain.py)."""
 
 from __future__ import annotations
 

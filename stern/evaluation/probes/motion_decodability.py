@@ -1,10 +1,9 @@
 """Can motion be linearly read out of the frozen encoder's tokens?
 
 "Motion is absent from the representation" and "motion is present but the
-decoder ignores it" are different diseases with different fixes -- the first is
-target-side, the second objective/decoder-side -- and no measurement in this
-investigation so far distinguishes them. A linear readout from frozen tokens to
-per-patch frame-difference magnitude does, scored against a random_init control.
+decoder ignores it" need different fixes: the first is target-side, the second
+objective/decoder-side. A linear readout from frozen tokens to per-patch
+frame-difference magnitude tells them apart, scored against a random_init control.
 
     ~/.local/bin/uv run --no-sync python -m stern.evaluation.probes.motion_decodability \\
         --shard-path <shard> --mesh-shared ~/stern_mesh --out runs/results/motion_decodability.json
@@ -60,17 +59,15 @@ def ridge_r2(
 ) -> float:
     """Cross-validated R^2 of a ridge readout, solved in closed form.
 
-    Cross-validated because the token count is comparable to the feature
-    dimension: an in-sample fit would report R^2 ~ 1.0 for every checkpoint,
-    which is exactly the degenerate result that invalidated an earlier
-    positional probe in this investigation.
+    Cross-validated because the token count is close to the feature dimension.
+    An in-sample fit would give R^2 near 1.0 for every checkpoint, including
+    random init.
 
-    The intercept is exempt from the penalty. The probe's targets are
-    frame-difference *magnitudes* -- absolute values with a large positive mean
-    -- and shrinking the intercept toward zero stops the ridge from reaching
-    that mean, driving R^2 arbitrarily negative as alpha grows for reasons
-    unrelated to the features (measured: -32.8 at alpha=100 on a random-init
-    encoder, where the honest answer is ~0).
+    The intercept is not penalised. The targets are frame-difference magnitudes
+    with a large positive mean. Shrinking the intercept toward zero would stop
+    the ridge from reaching that mean, and R^2 would go strongly negative as
+    alpha grows for reasons unrelated to the features (-32.8 at alpha=100 on a
+    random-init encoder, where the honest value is ~0).
     """
     rng = np.random.default_rng(seed)
     order = rng.permutation(len(targets))

@@ -1,23 +1,19 @@
-"""How much motion does time-averaging actually destroy?
+"""How much target motion does time-averaging destroy?
 
-Both motion-blindness hypotheses assume the training data contains inter-frame
-change worth preserving, and nothing in the investigation measured that. It is
-measurable without training anything: time-averaging a tubelet is a linear
-operator, so the target variance it removes follows in closed form from the two
-layouts' per-token sigmas.
+Motion-blindness hypothesis H1 assumes the training data has inter-frame change
+worth keeping. This measures that without training anything. Time-averaging a
+tubelet is linear, so the variance it removes has a closed form in the two
+layouts' per-token sigmas:
 
     frac_var_lost = 1 - (sigma_time_avg / sigma_per_frame)^2
 
-That IS H1's premise as a number. If it comes back negligible on real shards,
-`time_avg` erases almost nothing, `per_frame` is a null intervention, and the
-factorial would return four indistinguishable numbers that read as "no
-mechanism found" when the truth is "there was no motion in the target to lose".
+If this is negligible on real shards, the per_frame arm is a null intervention.
+The factorial would then show no effect for a reason unrelated to the model.
 
-The same measurement answers H3, which is not in the factorial at all:
-stern/data/windows.py builds stride-1 windows, so with tubelet_size 2
-a tubelet spans two adjacent frames -- 80ms at 25fps. Reporting the budget
-across sampling strides shows whether widening the stride restores the signal,
-and that is a one-line config change rather than a retrain.
+The same measurement covers H3, which is not in the factorial. Windows are built
+at stride 1, so with tubelet_size 2 a tubelet spans two adjacent frames. Reporting
+the budget across strides shows whether a wider stride restores the signal. That
+is a config change, not a retrain.
 
     ~/.local/bin/uv run --no-sync python -m stern.evaluation.diagnostics.motion_budget \\
         --shard-path <shard> --out runs/results/motion_budget.json
@@ -56,20 +52,14 @@ def motion_budget(
 ) -> dict:
     """Fraction of within-token target variance that time-averaging destroys.
 
-    Pooled over tokens -- the ratio of summed variances, not the mean of
-    per-token ratios. Averaging can only remove variance, so pooling is bounded
-    in [0, 1) by construction, and it weights each token by how much variance it
-    actually has.
+    Pooled as a ratio of summed variances, not a mean of per-token ratios. This
+    stays in [0, 1) and weights each token by its variance. Do not average
+    per-token ratios: a black patch has sigma = 0 in both layouts, and its
+    guarded ratio then yields a negative fraction. Letterboxing and dark scenes
+    make such patches common.
 
-    The per-token mean is not merely noisier, it is wrong on real footage. A
-    genuinely black patch has sigma = 0 in both layouts, the division guard then
-    makes the ratio 1e-6 / 2e-6 = 0.5, and 1 - 1/0.5**2 = -3 for every such
-    token. The first real-data run returned frac_var_lost = -1.12 that way, on
-    a quantity that cannot be negative. Letterboxing and dark scenes make those
-    patches common; synthetic clips have none.
-
-    Still a ratio of variances, so still invariant to the clip's overall
-    brightness and contrast -- it tracks motion, not exposure.
+    The pooled ratio is still invariant to clip brightness and contrast, so it
+    tracks motion rather than exposure.
     """
     _, _, sigma_avg, _ = patch_stats(
         pixel_values, tubelet_size, patch_size, per_frame=False

@@ -1,9 +1,9 @@
-"""Frame windowing per REPO_SETUP.md D9 (window size 1-4s, multi-scale ablation).
+"""Fixed-length frame windows for the SSL and probe datasets.
 
-Windowing is upstream of the SSL objective config: a 1s window leaves
-S-JEPA-style latent prediction little to predict across, while 4s changes
-masking ratios. D9 must be confirmed against Aff-Wild2 annotation
-granularity before SSL hyperparameters are fixed (REPO_SETUP.md §4 D9).
+Window length (1-4 s, under multi-scale ablation) sits upstream of the SSL
+objective. A 1 s window leaves latent prediction little to predict across, and
+4 s changes the effective masking ratio. Confirm it against the annotation
+granularity before fixing SSL hyperparameters.
 """
 
 from __future__ import annotations
@@ -18,11 +18,10 @@ from stern.data.frame_decoder import list_frame_files
 def make_windows(
     frames: np.ndarray, fps: float, len_s: float, overlap: float
 ) -> list[np.ndarray]:
-    """Slice `frames` into windows of `len_s` seconds with `overlap` fraction.
+    """Slice `frames` into `len_s`-second windows with `overlap` fraction.
 
-    Trailing partial windows are dropped (every window has identical length).
-    An empty `frames` array yields an empty window list (not an error) since
-    "no data" is a valid upstream state, not a usage mistake.
+    Trailing partial windows are dropped. An empty `frames` array yields no
+    windows and is not an error, since empty input is a valid upstream state.
     """
     if not 0.0 <= overlap < 1.0:
         raise ValueError(f"overlap must be in [0, 1), got {overlap}")
@@ -48,18 +47,15 @@ def make_windows(
 def window_starts(
     n_frames: int, window_len: int, overlap: float, frame_stride: int = 1
 ) -> list[int]:
-    """Start indices of `window_len`-long windows over `n_frames` with `overlap`.
+    """Start indices of `window_len`-frame windows over `n_frames`.
 
-    Frame-index analogue of `make_windows` (which slices arrays): used to align
-    a fixed `num_frames` model window with its label rows without decoding the
-    whole clip into memory first. Trailing partial windows are dropped.
+    The index-level twin of `make_windows`. It aligns a model window with its
+    label rows without decoding the clip first. Trailing partial windows are
+    dropped.
 
-    `frame_stride` samples every n-th frame, so a window covers
-    `(window_len - 1) * frame_stride + 1` frames of wall-clock time while still
-    yielding `window_len` frames to the model. Overlap and the trailing-window
-    bound both apply to that span, not to `window_len`, otherwise strided
-    windows would overlap despite `overlap=0`. Default 1 leaves every existing
-    window unchanged.
+    With `frame_stride` > 1, a window spans `(window_len - 1) * frame_stride + 1`
+    frames but still feeds the model `window_len` of them. Overlap and the
+    trailing bound use that span, or strided windows overlap at `overlap=0`.
     """
     if not 0.0 <= overlap < 1.0:
         raise ValueError(f"overlap must be in [0, 1), got {overlap}")
@@ -82,15 +78,13 @@ def build_frame_windows(
     n_frames: int | None = None,
     frame_stride: int = 1,
 ) -> list[tuple[list[Path], list[int]]]:
-    """List `clip_dir`'s frame files and build `(frame_files, idx)` windows.
+    """List `clip_dir`'s frames and build `(frame_files, idx)` windows.
 
-    Shared by SSLWindowDataset and the VA-probe window dataset -- both need
-    the same `list_frame_files` -> `window_starts` -> idx-list construction;
-    only what happens with `idx` after (mean VA label vs. nothing) differs.
+    Shared by SSLWindowDataset and VAWindowDataset. They differ only in what
+    they do with `idx` afterwards.
 
-    `n_frames` overrides the frame count used for `window_starts` (the probe
-    dataset clamps to `min(len(frame_files), va.shape[0])` so windows never
-    run past the label array); defaults to `len(frame_files)`.
+    `n_frames` caps the frame count used for windowing. The probe passes
+    `min(len(frame_files), va.shape[0])` so no window runs past its labels.
     """
     frame_files = list_frame_files(clip_dir)
     n = len(frame_files) if n_frames is None else n_frames

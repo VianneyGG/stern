@@ -1,9 +1,9 @@
 """Watcher state: per-job tracking + the adaptive backoff timer.
 
 Persisted to runs/state/watcher_state.json. The watcher has no long-lived
-process (it's cron-driven, spec §2) -- this file *is* its memory between
-invocations: loaded fresh each tick, mutated in memory by tick.run_full_check,
-written back atomically by the caller.
+process (it is cron-driven), so this file is its memory between invocations:
+loaded fresh each tick, mutated in memory by tick.run_full_check, and written
+back atomically by the caller.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ class RunState:
     round/status track outer-optimizer progress; missed_rounds counts
     consecutive rounds a node failed to check in (keyed by node name),
     reset to 0 by a successful round, and read by epoch_advance's
-    crash-loop exclusion (spec: docs/superpowers/plans mesh training).
+    crash-loop exclusion.
     """
 
     run_id: str
@@ -68,22 +68,17 @@ class RunState:
     quorum_relaxed: bool = False  # set by _do_awaiting_checkpoints each time
     # it decides AWAITING_CHECKPOINTS -> MERGING (every branch, so it never
     # carries a stale value); read by _do_merging to pass run_outer_step.py's
-    # --quorum-relaxed, recorded into the round metrics JSONL (design §5.2).
-    any_round_quorum_relaxed: bool = False  # OR'd, never cleared -- a run
-    # that relaxed quorum even once must not be reported as a clean DONE
-    # (design §5.2).
+    # --quorum-relaxed and record it in the round metrics JSONL.
+    any_round_quorum_relaxed: bool = False  # OR'd, never cleared. A run that
+    # relaxed quorum even once must not be reported as a clean DONE.
     # All four set once, in _do_awaiting_checkpoints, every branch that
-    # transitions to MERGING -- read once by _do_merging for this round's
-    # metrics record, same lifecycle as timeout_forced/quorum_relaxed
-    # (design §8).
+    # transitions to MERGING. _do_merging reads them once for this round's
+    # metrics record, same lifecycle as timeout_forced/quorum_relaxed.
     # Last terminal note _relaunch_chunk_if_finished returned for this run.
-    # That function runs before advance_one_run dispatches, and a non-None
-    # return short-circuits the whole state machine for the tick -- so a
-    # condition that cannot clear itself (no node has a shard assignment)
-    # would otherwise re-report the identical note every 60s forever, pin
-    # the backoff at FAST_INTERVAL_S, and block the merge/timeout handlers
-    # that are the only things left that could make progress. Repeating the
-    # same note means nothing changed: report it once, then fall through.
+    # A non-None return short-circuits the state machine for the tick, so a
+    # condition that cannot clear itself would re-report the same note every
+    # 60s and block the merge/timeout handlers. Repeating the same note means
+    # nothing changed: report it once, then fall through.
     # Defaulted, so a state file written before this field existed loads.
     last_stall_note: str = ""
     round_misses_charged: int = 0
@@ -108,10 +103,10 @@ class WatcherState:
     # explicit pop (see escalate.remediate_nan_node).
     nan_escalations_in_flight: dict[str, float] = field(default_factory=dict)
     # Epoch seconds of the last cron tick, stamped unconditionally at the
-    # top of watch_training.main() -- even on a fast-path tick that returns
-    # before run_full_check. Read by mesh_continue_allowed.sh's fifth stop
-    # signal (design §1.2/§3b) to detect a dead/wedged watcher in ~10 min
-    # instead of a multi-hour futile-requeue cycle.
+    # top of watch_training.main(), even on a fast-path tick that returns
+    # before run_full_check. mesh_continue_allowed.sh reads it to detect a
+    # dead or wedged watcher within ~10 min, instead of a multi-hour
+    # futile-requeue cycle.
     last_tick_at: float = 0.0
 
     def job(self, slurm_job_id: str) -> JobState:
@@ -176,7 +171,7 @@ def _chunk_wave_starts(registry, run_id: str) -> list[float]:
     A chunk is one pool-wide relaunch, not one slurm job -- the registry has
     one JobRecord per node, so this clusters those by submission burst
     rather than reporting per-job-id data (a pool's chunk identity is the
-    run_id/wave, e.g. "e2b-a", not any individual node's slurm job id).
+    run_id/wave, e.g. "pool-a", not any individual node's slurm job id).
     """
     timestamps = sorted(
         ts
@@ -259,15 +254,15 @@ def write_status_summary(
     results_dir = state_dir.parent / "results" / "mesh"
     now = _time.time()
 
-    def _run_entry(rc) -> dict:
-        run = state.run(rc.run_id)
-        avg_round_s, recent_round_s = _round_pace(results_dir, rc.run_id, now)
-        rounds_remaining = max(rc.rounds - run.round, 0)
+    def _run_entry(run_config) -> dict:
+        run = state.run(run_config.run_id)
+        avg_round_s, recent_round_s = _round_pace(results_dir, run_config.run_id, now)
+        rounds_remaining = max(run_config.rounds - run.round, 0)
         eta_s = avg_round_s * rounds_remaining if avg_round_s is not None else None
         return {
             "status": run.status,
             "round": run.round,
-            "rounds": rc.rounds,
+            "rounds": run_config.rounds,
             "quorum_relaxed": run.any_round_quorum_relaxed,
             "missed_rounds": run.missed_rounds,
             "readmitted": run.readmitted,
@@ -281,14 +276,16 @@ def write_status_summary(
             if eta_s is not None
             else None,
             "past_chunk_durations_h": [
-                _hours(d) for d in _chunk_durations(registry, rc.run_id)
+                _hours(d) for d in _chunk_durations(registry, run_config.run_id)
             ],
         }
 
     payload = {
         "updated_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(now)),
         "excluded_nodes": state.excluded_nodes,
-        "runs": {rc.run_id: _run_entry(rc) for rc in run_configs},
+        "runs": {
+            run_config.run_id: _run_entry(run_config) for run_config in run_configs
+        },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -331,7 +328,7 @@ def clear_run_state(state: WatcherState, run_id: str) -> None:
 
 
 def advance_backoff(state: WatcherState, *, now: float, action_taken: bool) -> None:
-    """Mutate state's interval/next-check-time per spec §4 step 5."""
+    """Set the next check time: reset the interval on action, else back off."""
     if action_taken:
         state.current_interval_s = FAST_INTERVAL_S
     else:

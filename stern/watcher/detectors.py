@@ -1,8 +1,8 @@
 """Pure, read-only detectors over squeue/registry/mtime state.
 
-No I/O, no subprocess calls -- every one is a plain pytest against fixture
-data (spec §6). `now` is always injected as an epoch-seconds float so tests
-never depend on wall-clock time.
+No I/O and no subprocess calls. Tests run them against fixture data, and
+`now` is always injected as an epoch-seconds float so tests never depend on
+wall-clock time.
 """
 
 from __future__ import annotations
@@ -201,17 +201,17 @@ def detect_nan(
     """Flag mesh nodes whose latest per-round metric is NaN/Inf train_loss.
 
     Reads mesh_shared/metrics/<run_id>/<node>.jsonl (appended once per round
-    by training/mesh_round.py::_append_round_metrics) -- only the LAST line
+    by stern/training/mesh_round.py::_append_round_metrics) -- only the LAST line
     per node is live; a node that NaN'd once and then recovered on a later
     round must not keep getting flagged.
 
     A relaunch of an existing run_id reuses the same metrics directory (unlike
     the checkpoint dir, nothing renames or clears it), so until a worker
-    appends its first round the last line is still the *previous* attempt's
-    -- typically a NaN, since a failed attempt is what prompted the relaunch.
-    On 2026-08-21 that window excluded 8 healthy nodes and shrank one arm's
-    roster from 16 to exactly quorum. Records older than the current round's
-    start therefore cannot describe this round and are skipped.
+    appends its first round the last line is still the *previous* attempt's,
+    typically a NaN since a failed attempt prompted the relaunch. Acting on
+    that line once excluded 8 healthy nodes, down to exactly quorum. Records
+    older than the current round's start cannot describe this round and are
+    skipped.
     """
     flags: list[Flag] = []
     run_state = state.runs.get(run_id)
@@ -245,12 +245,11 @@ def detect_nan(
             if job_state is not None and job_state.auto_resubmit_count > 0
             else "nan"
         )
-        # Detection-only annotation (design §2): a coarse proxy for "a
-        # MERGING->SYNCING transition just preceded this NaN" -- a bad peer
-        # may have been averaged in before exclusion, not necessarily this
-        # node's own divergence. Reconstructing exact round history from the
-        # metrics JSONL is out of scope; this changes the diagnosis in the
-        # detail string, not the action.
+        # Detection-only annotation: a coarse proxy for "a MERGING->SYNCING
+        # transition just preceded this NaN". A bad peer may have been averaged
+        # in before exclusion, so this is not necessarily the node's own
+        # divergence. It changes the diagnosis in the detail string, not the
+        # action.
         poisoned_merge = (
             run_state is not None
             and run_state.status in ("SYNCING", "RUNNING")

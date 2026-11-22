@@ -1,13 +1,15 @@
-"""Export ViT-internals diagnostics (attention maps, PCA-RGB tokens, per-layer
-cosine similarity, per-layer attention-norm density) from cars-sweep DiLoCo
-checkpoints, for `plot_vit_internals.py` to render.
+"""Export ViT-internals diagnostics from DiLoCo checkpoints, for
+`plot_vit_internals` to render.
 
-Runs on a pool node (has both the node-local WebDataset shards and the
-shared-NFS `stern_mesh/checkpoints`), e.g.:
+Exports attention maps, PCA-RGB tokens, per-layer cosine similarity, and
+per-layer attention-norm density.
+
+Run on a pool node. It needs both the node-local WebDataset shards and the
+shared `stern_mesh/checkpoints` directory, e.g.:
 
     ssh <node> "cd ~/stern && ~/.local/bin/uv run --no-sync python -m \\
         stern.evaluation.diagnostics.export_vit_internals \\
-        --shard-path /Data/$USER/voxceleb2_shards/shard-000000.tar \\
+        --shard-path <data root>/voxceleb2_shards/shard-000000.tar \\
         --mesh-shared ~/stern_mesh \\
         --run-ids sw3-cars-lr060m090,sw3-cars-lr080m090,sw3-cars-accum128,sw3-cars-lrmult15,sw3-cars-wd010,pool-cars-full-50r \\
         --include-random-init --out internals.npz"
@@ -85,8 +87,8 @@ def load_sample_windows(
     shard_path: Path, n_windows: int, num_frames: int, image_size: int, seed: int
 ) -> list[tuple[str, list[np.ndarray]]]:
     """Returns `[(clip_key, frames), ...]`, `frames` a list of `num_frames`
-    HxWx3 uint8 arrays -- reads only the sampled clips' shard members, never
-    the whole (~850MB) shard."""
+    HxWx3 uint8 arrays. Reads only the sampled clips' members, never the whole
+    shard."""
     shard_index = load_shard_index(shard_path.parent)
     clip_keys = sample_clip_keys(
         shard_path, n_windows, seed, shard_index=shard_index, num_frames=num_frames
@@ -103,18 +105,16 @@ def load_sample_windows(
 
 
 def model_cfg_for_run(base_cfg, run_id: str):
-    """`base_cfg` assumes one target_mode/decoder shape for every run_id, but
-    recipe2x2-style comparisons mix per_frame (predict_head width 1536) vs
-    time_avg (768) checkpoints, and legacy (decoder 256/8) vs paper (384/6)
-    recipes, in the same `--run-ids` list. Clone + override per-run from the
-    run_id string so `load_encoder`'s strict state_dict load matches shape,
-    same convention `diagnose_conditioning.py` uses."""
+    """`base_cfg` fixes one target_mode and decoder shape, but a single
+    `--run-ids` list can mix per_frame (predict_head width 1536) and time_avg
+    (768) checkpoints, and legacy (decoder 256/8) and paper (384/6) recipes.
+    Clone and override per run from the run_id, so the strict state_dict load
+    matches shapes. `conditioning.py` uses the same convention."""
     cfg = base_cfg.copy()
     if "per_frame" in run_id:
         cfg.target_mode = "per_frame"
-    # e2b-* arms all launched from videomae_mesh_paper_a_stride1_timeavg.yaml
-    # (EXPERIMENTS.md) -- the paper decoder shape, but the id doesn't say
-    # "paper" since it names the pool (fish/birds/cars/countries), not the recipe.
+    # e2b-* runs use the paper decoder shape. The id does not say "paper": it
+    # names the data pool, not the recipe.
     if "paper" in run_id or run_id.startswith("e2b-") or run_id.startswith("e2b2-"):
         cfg.decoder_embed_dim = 384
         cfg.decoder_num_heads = 6
@@ -134,8 +134,8 @@ def load_encoder(run_id: str, mesh_shared: Path, model_cfg) -> VideoMAEEncoder:
     would mean plotting a random encoder's internals under a trained run's
     label.
     """
-    # Local import: _diag_common imports load_sample_windows from this module,
-    # so a module-level import here would be circular.
+    # Local import: common imports load_sample_windows from this module, so a
+    # module-level import here would be circular.
     from stern.evaluation.diagnostics.common import load_bundle, random_init_bundle
 
     model_cfg = model_cfg_for_run(model_cfg, run_id)

@@ -28,7 +28,7 @@ def pending_nodes(
 ) -> set[str]:
     """Nodes that have dropped a checkpoint for run_id this round.
 
-    Parses `[RUN_ID]_[ROUND]_[NODE].pt` filenames (mesh/pending_files.py).
+    Parses `[RUN_ID]_[ROUND]_[NODE].pt` filenames (stern/mesh/pending_files.py).
     Files are overwritten each round (peak disk bounded by node count, not
     round count), so a directory listing usually reflects only the current
     round's check-ins -- except right after a timeout-forced merge clears
@@ -87,9 +87,9 @@ def record_missed_round(
 def missed_round_count(state: WatcherState, run_id: str, node: str) -> int:
     """Bump `node`'s missed_rounds counter for `run_id` and return the new
     count. Counting only -- the caller decides whether the count crosses an
-    exclusion threshold (design §5.1: a node must not be excluded while no
-    replacement is available for it, so the count-then-decide split lets a
-    call site bump the counter without committing to an exclusion)."""
+    exclusion threshold. A node must not be excluded while no replacement is
+    available, so the count-then-decide split lets a call site bump the
+    counter without committing to an exclusion."""
     run = state.run(run_id)
     count = run.missed_rounds.get(node, 0) + 1
     run.missed_rounds[node] = count
@@ -102,8 +102,8 @@ def clear_missed_rounds(run: RunState, checked_in: Collection[str]) -> None:
     Nothing else in the codebase resets this counter -- state.py's own
     docstring claimed a successful round did, but no call site ever existed.
     Over a 40-100 round run this made any node that hiccupped twice EVER
-    (not consecutively) permanently excluded, which is a better explanation
-    of the e2b-b-birds node loss than "the threshold is too strict".
+    (not consecutively) permanently excluded. That explains node losses
+    better than "the threshold is too strict" does.
     """
     for node in checked_in:
         if node in run.missed_rounds:
@@ -121,19 +121,18 @@ def readmit_healthy_nodes(
 
     `exclude_node` is permanent by design, and for its original causes (quota
     exhaustion, a node that really is broken) that is right. But the dominant
-    cause in practice is neither: on 2026-08-21 all 12 nodes excluded from
-    factorial-tube-per_frame were up, reachable and still holding their
-    shards. They had missed rounds because a foreign process held their GPU,
-    or because they had never been seeded -- both transient, both since
-    checkable via `node_health.truly_idle`. Banning them for the rest of the
-    run cost that arm 6 of its 16 workers and 46 of its 260 shards.
+    cause in practice is neither. In one real run, all 12 excluded nodes were
+    up, reachable and still holding their shards. They had missed rounds
+    because a foreign process held their GPU, or because they had never been
+    seeded. Both are transient and checkable via `node_health.truly_idle`.
+    Banning them for the rest of the run cost it 6 of its 16 workers.
 
     So a missed-round exclusion is reversible once the node passes the health
     gate, and only then. Two things it deliberately will not do:
 
-    * touch an exclusion whose reason does not name `run_id` -- another run's
-      ban, or a hand-written one, keeps `exclude_node`'s original contract
-      that only a human clears it;
+    * touch an exclusion whose reason does not name `run_id`. Another run's
+      ban, or a hand-written one, keeps `exclude_node`'s contract that only a
+      human clears it;
     * re-admit without limit. A node that probes healthy but keeps dying (our
       bug, not the cluster's) would otherwise rejoin every round and take the
       pool down with it. `max_readmissions` is the same one-retry tolerance

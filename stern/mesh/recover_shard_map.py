@@ -2,14 +2,14 @@
 """Rebuild shard_map.json from each already-seeded mesh node's live holdings.
 
 Use when the shard_map metadata file was lost (or never written) even
-though the underlying shard placement across nodes is still correct --
-this SSHes into each node, lists what it actually has on disk, and inverts
-that into the shard -> holders map `mesh/fetch.py` needs at training time.
-Do NOT re-run `seed_mesh.py` for this: free space drifts over time, and a
-fresh placement computation would not match what is physically on disk.
+though the shard placement across nodes is still correct. This SSHes into
+each node, lists what it actually has on disk, and inverts that into the
+shard -> holders map the workers read at training time. Do not re-run
+`seed_nodes.py` for this: free space drifts, and a fresh placement would not
+match what is physically on disk.
 
-Reuses `seed_mesh.py`'s existing `_list_remote_shards`/`_run_ssh` SSH glue
-rather than a second SSH wrapper.
+Reuses `seed_nodes.py`'s SSH helper (`_list_remote_shards`) rather than a
+second SSH wrapper.
 """
 
 from __future__ import annotations
@@ -86,14 +86,14 @@ def main() -> int:
             )
             return 1
 
-    # design spec S5 requires byte-identical val shard sets across nodes --
-    # a naming mismatch here is the cheap, catchable proxy for that.
+    # Val shard sets must be identical across nodes. Comparing names is the
+    # cheap check that catches a mismatch.
     reference_host, reference_val = next(iter(val_shard_sets.items()))
     for host, val_set in val_shard_sets.items():
         if val_set != reference_val:
             print(
                 f"recover_shard_map: val shard set on {host!r} does not match "
-                f"{reference_host!r} (design spec S5 requires byte-identical "
+                f"{reference_host!r} (val shard sets must be byte-identical "
                 f"val sets) -- diverging entries: {sorted(val_set ^ reference_val)}",
                 file=sys.stderr,
             )

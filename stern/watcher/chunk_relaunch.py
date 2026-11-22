@@ -1,8 +1,7 @@
 """Detect a finished worker chunk so the next one can be submitted.
 
-The cluster was rebuilt on 2026-08-22 and the new slurm.conf caps SallesInfo
-at a 2h walltime (down from 3 days). A 40-round DiLoCo run is ~11h, so a
-worker no longer spans a run: `mesh.chunk_rounds` makes each job exit cleanly
+SallesInfo caps walltime at 2h, so a worker can no longer span a run (a
+40-round DiLoCo run is ~11h). `mesh.chunk_rounds` makes each job exit cleanly
 after a few rounds, and the watcher submits the next chunk from the round the
 last one reached, resuming through master.pt.
 
@@ -48,7 +47,7 @@ _TERMINAL = frozenset(
 # every worker at once regardless of quorum, so a run can land in DEGRADED
 # with its whole roster already gone. Without relaunching here, that roster
 # never comes back and the run can only progress via a manual status write
-# (observed repeatedly on e2b-b-birds, 2026-08-28).
+# Without this, a DEGRADED run only progresses after a manual status write.
 RELAUNCHABLE = frozenset({"RUNNING", "AWAITING_CHECKPOINTS", "DEGRADED"})
 
 
@@ -94,12 +93,11 @@ def needs_worker_relaunch(
         if submitted is not None and now - submitted < visibility_s:
             return False
         entry = snapshot.get(record.slurm_job_id)
-        # Job ids are NOT unique over time here -- the 2026-08-22 cluster
-        # rebuild reset the counter to 1, so a registry record can collide
-        # with a live id that now belongs to someone else's job. The
-        # nodelist is what tells a genuine still-running worker apart from
-        # a stranger's job wearing a recycled id (same guard as
-        # `cancellable_job_ids` below).
+        # Job ids are not unique over time: a cluster rebuild reset the
+        # counter, so a registry record can collide with a live id that now
+        # belongs to someone else's job. The nodelist tells a genuine
+        # still-running worker apart from a stranger's job wearing a recycled
+        # id (same guard as `cancellable_job_ids` below).
         if (
             entry is not None
             and entry.get("state") not in _TERMINAL
@@ -123,9 +121,7 @@ def cancellable_job_ids(
     Nothing reaps it: the worker loop counts its own rounds
     (`range(start_round, stop_round)`), never consults the coordinator, and
     the sync flag it waits on was written long ago, so it runs to the end of
-    its chunk burning a GPU for output that will be swept unread. Observed on
-    2026-08-23: node067 was on round 39 of a run that reported DONE at 40 seven
-    minutes earlier.
+    its chunk burning a GPU for output that will be swept unread.
 
     Two guards, because `scancel` is irreversible and this runs unattended:
 
@@ -133,11 +129,10 @@ def cancellable_job_ids(
       A job id absent from the snapshot has already exited; asking SLURM to
       cancel it again is noise at best.
     * Only jobs whose snapshot nodelist still matches the node we recorded
-      at submission. Job ids are NOT unique over time here -- the 2026-08-22
-      cluster rebuild reset the counter to 1, so old registry records collide
-      with live ids belonging to other people's jobs. The nodelist is what
-      tells a genuine straggler apart from a stranger's job wearing a
-      recycled id.
+      at submission. Job ids are not unique over time: a cluster rebuild
+      reset the counter, so old registry records collide with live ids
+      belonging to other people's jobs. The nodelist tells a genuine
+      straggler apart from a stranger's job wearing a recycled id.
 
     Returns ids, not a cancellation: the caller owns the side effect, and a
     pure selection is what makes the collision guard testable.
@@ -170,8 +165,7 @@ def stale_jobs_for_nodes(
     `--exclusive` node. squeue reports no `nodes` for a pending job, so
     `cancellable_job_ids`'s live-nodelist match can't see it -- SLURM's own
     requeue and this module's chunk relaunch then both try to claim the
-    node, and the requeued job loses and sits PD forever (observed
-    2026-09-07, lev-fix16c).
+    node, and the requeued job loses and sits PD forever.
 
     The record's OWN nodelist -- fixed at submission by `_submit_worker_job`,
     unlike the live snapshot -- is what disambiguates here: a self-requeued

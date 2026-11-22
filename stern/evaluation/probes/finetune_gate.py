@@ -1,11 +1,10 @@
 """AFEW-VA fine-tune acceptance gate.
 
-The framework's one non-intrinsic check: no SSL checkpoint is accepted on
-intrinsic diagnostics alone (design doc, "Acceptance gate"). The checkpoint,
-a `random_init` floor and a ladder ceiling are each fine-tuned end to end on
-AFEW-VA for the same fixed epoch count and the same seeds, through the
-training path that ships (`training/train.py::run_train_stage`). This module
-adds only the gate logic on top.
+The framework's only non-intrinsic check: no SSL checkpoint is accepted on
+intrinsic diagnostics alone. The checkpoint, a `random_init` floor and a ladder
+ceiling are each fine-tuned end to end on AFEW-VA for the same epoch count and
+seeds, through the shipping path (`stern.training.finetune.run_train_stage`).
+This module adds only the gate logic on top.
 """
 
 from __future__ import annotations
@@ -34,38 +33,34 @@ from stern.training import finetune as train_mod
 
 CONF_DIR = Path(__file__).resolve().parents[3] / "configs"
 
-# Two-sided 95% Student-t critical values by degrees of freedom (n_seeds - 1).
-# Tabulated because scipy is not a dependency; the table is what bounds
-# n_seeds to [3, 10].
+# Two-sided 95% Student-t critical values by n_seeds - 1. Tabulated because scipy
+# is not a dependency; the table bounds n_seeds to [3, 10].
 _T975 = {2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262}
 
-# A non-PASS whose MDE exceeds this CCC difference says more about the
-# experiment than the checkpoint: the seeds could not have resolved a gap this
-# size. A judgment call, named so step 14's re-calibration can revise it.
+# A non-PASS whose MDE exceeds this CCC difference says more about the experiment
+# than the checkpoint: the seeds could not resolve a gap this size. A judgment
+# call, kept as a named constant so it can be revised.
 MDE_OF_INTEREST = 0.05
 
-# Held-out share of identities, pinned so every arm and every cached result
-# scores on the same split (diag_probe's PROBE_SPLIT_FRACTION, same value).
+# Held-out share of identities. Pinned so every arm and cached result scores on
+# the same split (same value as the diagnostics probe's PROBE_SPLIT_FRACTION).
 SPLIT_FRACTION = 0.2
-# The gate's fine-tune recipe departs from Stage 2's defaults in two ways, both
-# from ssl-diag-08 job 362: at lr 1e-4 the regressor's tanh pre-activation hit
-# ~7 within 20 steps, pinning every output at +-1 (CCC exactly 0 on every arm).
-# An unbounded readout at the probe's lr (ssl-diag-03) keeps the gradient alive.
+# The fine-tune recipe departs from Stage 2's defaults. At lr 1e-4 the regressor's
+# tanh pre-activation saturates within ~20 steps and pins every output at +-1
+# (CCC exactly 0). An unbounded readout at the probe's lr keeps the gradient alive.
 GATE_LR = 1e-5
 GATE_HEAD_BOUNDED = False
-# The live gate (ssl-diag-08 jobs 446, 485-489) scored the 10th epoch, but
-# job 446's held-out CCC peaks at epoch 1 and then only overfits, so the last
-# epoch read every weak arm at its overfit worst. One epoch scores the peak
-# without selecting on the scored split. Ten seeds (the most `_T975` tabulates)
-# take the paired interval's MDE from 0.25 at n=3 to roughly a quarter of it;
-# a 1-epoch fine-tune costs about a tenth of a 10-epoch one, so the run is
-# cheaper than the old gate despite the extra seeds.
+# One epoch is scored. Held-out CCC peaks early and then overfits, so a longer
+# run reads every weak arm at its overfit worst; one epoch also avoids selecting
+# on the scored split. Ten seeds (the most `_T975` tabulates) bring the paired
+# interval's MDE to about a quarter of its n=3 value, and a 1-epoch fine-tune
+# costs about a tenth of a 10-epoch one.
 GATE_MIN_EPOCHS = 1
 GATE_SEEDS = 10
-# train.seed is applied only by train.run_training, which the gate bypasses, so
-# before 2026-11-01 a "seed" was really the RNG state left by the previous run
-# in the process: parallel seed-subset jobs repeated each other's seeds.
-# Recorded in gate_params so caches from before the fix are never extended.
+# train.seed is applied only by train.run_training, which the gate bypasses. Before
+# the fix, a "seed" was the RNG state left by the previous run in the process, so
+# parallel seed-subset jobs repeated each other's seeds. Recorded in gate_params
+# so caches from before the fix are never extended.
 GATE_RNG_SEEDED = True
 
 # Arm label -> cache directory name. The checkpoint's key adds its run id.
@@ -83,23 +78,20 @@ def finetune_ccc(
     head_lr_mult: float = 1.0,
     persist_dir: Path | None = None,
 ) -> dict:
-    """One end-to-end fine-tune of `encoder` on AFEW-VA, run for exactly
-    `min_epochs`, scored on the final epoch over the identity-disjoint
-    held-out split.
+    """One fine-tune of `encoder` on AFEW-VA for exactly `min_epochs`, scored on
+    the final epoch over the identity-disjoint held-out split.
 
-    `epochs` is the count `run_train_stage`'s loop ran (plus the epochs a
-    resume skipped) -- never `min_epochs` echoed back, so a shortened run is
-    visible to the gate.
+    The returned `epochs` is what the training loop ran, including epochs a
+    resume skipped, not `min_epochs` echoed back, so a shortened run is visible
+    to the gate.
 
-    `head_lr_mult != 1` switches to AdamW (weight decay 0, so Adam's update)
-    because only `_build_optimizer`'s AdamW path gives the head its own LR.
+    `head_lr_mult != 1` switches to AdamW with weight decay 0, since only that
+    optimizer path gives the head its own LR.
 
-    `persist_dir` makes a seed survive a walltime kill: it trains in
-    `<persist_dir>/<encoder fingerprint>/seed<N>/` with resume on, so the next
-    job continues from the last finished epoch. A finished seed's result is
-    kept in `final.json` and its checkpoints are deleted (several GB for the
-    ViT-L). Without it, behaviour is the historical gate's: a temp dir, no
-    resume.
+    With `persist_dir`, a seed survives a walltime kill: it trains in
+    `<persist_dir>/<encoder fingerprint>/seed<N>/` with resume on. A finished
+    seed keeps `final.json` and its checkpoints are deleted (several GB for
+    ViT-L). Without it, a temp dir and no resume.
     """
     if persist_dir is None:
         with tempfile.TemporaryDirectory() as work:

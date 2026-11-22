@@ -1,19 +1,11 @@
 """Decode-once WDS shard cache for VoxCeleb2 SSL pretraining.
 
-Replaces the loose-JPEG-directory cache (cache_voxmini_frames.py) with 100
-size-balanced WebDataset .tar shards. Each shard member is one clip's full
-2fps frame sequence, stored as a pickled list of individually JPEG-encoded
-(quality=95, optimize=True) byte strings -- frames stay JPEG-compressed on
-disk (small, and Pillow's libjpeg-turbo backend does the codec work at read
-time in ssl_windows.py), rather than raw arrays.
+Writes 100 size-balanced WebDataset .tar shards. Each member is one clip's
+frames at 2 fps, stored as a pickled list of JPEG byte strings (quality 95).
+Frames stay compressed on disk, and ssl_windows.py decodes them at read time.
 
-decord.VideoReader seeks directly to the frame indices matching target_fps,
-instead of decoding every native-fps frame and discarding most of them (the
-old cache_voxmini_frames.py behavior) -- decord's C++ seek index is the
-standard choice for this sparse-frame-sampling access pattern (also used by
-the original VideoMAE codebase). Run in CPU-only mode: no decord-gpu, so no
-new CUDA-wheel coupling in a repo that already treats CUDA coexistence
-(TF + torch) as fragile.
+decord seeks straight to the target frame indices rather than decoding every
+native frame. It runs CPU-only, so there is no CUDA wheel coupling.
 """
 
 from __future__ import annotations
@@ -59,8 +51,7 @@ def encode_frames_jpeg(frames: list[np.ndarray], quality: int = 95) -> list[byte
 def decode_clip_frames(
     clip_path: Path, target_fps: float, size: int
 ) -> list[np.ndarray]:
-    """decord-backed: seek to compute_frame_step-spaced indices only (not
-    every native frame), resize each to size x size RGB uint8."""
+    """Decode with decord, seeking only to the kept frames, resized to size x size RGB uint8."""
     import decord
 
     vr = decord.VideoReader(str(clip_path), num_threads=1)
@@ -80,11 +71,10 @@ def encode_clip(clip_path: Path, target_fps: float, size: int) -> list[bytes]:
 
 
 class BalancedShardWriter:
-    """Greedy min-loaded-bin writer across a fixed number of .tar shards.
+    """Greedy min-size writer across a fixed number of .tar shards.
 
-    Keeps every clip's frames in a single shard (one WDS sample per clip),
-    tracked via {out_dir}/manifest.json so a killed/restarted run resumes
-    without re-encoding or duplicating already-written clips.
+    A clip's frames never split across shards. `{out_dir}/manifest.json` records
+    what is written, so a restarted run neither re-encodes nor duplicates clips.
     """
 
     def __init__(self, out_dir: Path, n_shards: int = 100):
@@ -131,18 +121,12 @@ class BalancedShardWriter:
             "num_frames": len(frame_jpegs),
             "size": len(payload),
         }
-        # Manifest persist is batched (see flush()) rather than done here per
-        # clip: re-serializing the whole dict on every write() call makes the
-        # per-clip cost grow with total clips written, so throughput degrades
-        # as the run progresses (observed 63->30 clips/s over the first 40k
-        # of ~1.1M clips). Callers that write clips one-off without a
-        # surrounding flush() (e.g. direct BalancedShardWriter use in tests)
-        # still get a correct manifest.json via close()'s flush().
+        # Persist the manifest in flush(), not here. Re-serialising the whole dict
+        # on every write costs more as the run grows. close() flushes too, so a
+        # writer used without flush() still ends with a correct manifest.json.
 
     def flush(self) -> None:
-        """Persist the in-memory manifest to disk. Call once per batch of
-        write()s (build_shards() does this once per chunk) rather than after
-        every single write() -- see write()'s docstring note."""
+        """Persist the in-memory manifest. Call once per batch of writes, not per write."""
         # Atomic write: a kill mid-write must never leave manifest.json
         # truncated/invalid, since __init__ crashes the whole restart if
         # json.loads() fails on it (losing resumability entirely).
@@ -157,6 +141,7 @@ class BalancedShardWriter:
 
 
 def _safe_encode(clip_path: Path, target_fps: float, size: int) -> _EncodeResult:
+    """Encode one clip; return (frames, None) or ([], error message)."""
     try:
         return encode_clip(clip_path, target_fps, size), None
     except Exception as exc:  # noqa: BLE001 -- best-effort over an untrusted external corpus
@@ -185,23 +170,16 @@ def build_shards(
     run_encode: _RunEncode | None = None,
     chunk_size: int = 64,
 ) -> tuple[int, int]:
-    """Encode every clip in `manifest_path` from `raw_root` (mp4s) into
-    `out_dir`'s balanced WDS shards, skipping clips already in the manifest.
+    """Encode every clip in `manifest_path` from `raw_root` into balanced shards.
+
+    Clips already in the output manifest are skipped, so a killed run resumes.
     Returns (n_encoded, n_skipped_as_unreadable).
 
-    `run_encode` is injectable (defaults to a real ProcessPoolExecutor run) at
-    the batch level -- jobs in, results out -- so tests can exercise the
-    resumability/failure-counting logic with a synchronous stand-in instead
-    of real multiprocessing + video files, without needing a picklable
-    per-clip callable (mirrors cache_voxmini_frames.py's run_transcode).
+    `run_encode` takes a batch of jobs and returns their results. Tests inject a
+    synchronous version so they need neither multiprocessing nor video files.
 
-    `todo` is processed in `chunk_size`-sized chunks, with `writer.write()`
-    calls (and the manifest persisted to disk) happening after each chunk
-    rather than only after the entire remaining backlog is encoded. This
-    bounds both the work lost to a mid-run kill and the peak memory held for
-    in-flight encoded JPEG payloads to one chunk's worth, instead of the
-    whole (~100k-clip) backlog. `writer.sizes` persists across chunks, so
-    this doesn't change the greedy load-balancing quality.
+    Work runs in `chunk_size` chunks, and the manifest is flushed after each one.
+    That bounds the work lost to a kill and the memory held for encoded frames.
     """
     records = read_manifest(manifest_path, expected_role="ssl")
     writer = BalancedShardWriter(out_dir, n_shards=n_shards)

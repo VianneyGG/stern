@@ -1,25 +1,17 @@
-"""DDP setup/teardown tuned for the SallesInfo cluster.
+"""DDP setup and teardown for the cluster's SLURM allocations.
 
-Cluster context (T1/T2/T3 findings, docs/superpowers/specs/
-2026-06-30-cluster-tier1-findings.md):
+- One GPU per node (whole-node SLURM allocation), so `LOCAL_RANK` is always 0.
+- The fabric is 1GbE. NCCL bus bandwidth saturates around 0.115 GB/s for
+  messages of 16 MB and up, so bandwidth, not latency, is the bottleneck.
+- Uses `env://` init, with SLURM env vars mapped in when torchrun did not
+  set them.
 
-- 1 GPU per node (SLURM whole-node allocation, no GPU GRES). `LOCAL_RANK`
-  is always 0.
-- 1GbE fabric; NCCL busBW saturates around 0.115 GB/s for messages ≥16 MB
-  (T3). Bandwidth, not latency, is the bottleneck.
-- Uses `env://` init, with SLURM env vars mapped in when torchrun didn't
-  set them (mirrors the WHN train.py pattern).
+Two knobs matter on this fabric:
 
-Two knobs that matter for this fabric:
-
-- `bucket_cap_mb=25` (vs. torch's 25 MB default, WHN uses 200). Smaller
-  buckets pipeline the allreduce with compute better when total gradient
-  volume is small (LoRA runs move <20 MB/step per T5 proxy) and the pipe
-  is thin.
-- `grad_compress='fp16'` (opt-in). fp16 compression hook halves NCCL
-  bytes at negligible convergence cost for anything larger than a handful
-  of layers. Off by default because it can degrade tiny models; opt in
-  for LoRA + full-encoder runs.
+- `bucket_cap_mb` defaults to 25. Smaller buckets pipeline the allreduce
+  with compute better when the gradient volume per step is small.
+- `grad_compress='fp16'` (opt-in) halves NCCL bytes for a small convergence
+  cost. It is off by default because it can degrade tiny models.
 """
 
 from __future__ import annotations
@@ -95,9 +87,8 @@ def wrap_ddp(
 
     grad_compress = str(_get(cfg, "train.ddp.grad_compress", default="")).lower()
     if grad_compress == "fp16":
-        # Halves NCCL bytes at the cost of a small numerical error. The
-        # highest-value knob on our 1GbE fabric — enable for any run that
-        # spends >5% of step time in allreduce.
+        # Halves NCCL bytes for a small numerical error. Worth enabling on
+        # this fabric for any run that spends over 5% of step time in allreduce.
         from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import (
             fp16_compress_hook,
         )
@@ -131,7 +122,7 @@ def _slurm_to_torch_env() -> None:
 
     Only fills gaps: if torchrun already injected RANK/WORLD_SIZE/LOCAL_RANK
     this is a no-op. MASTER_ADDR / MASTER_PORT must be exported by the
-    batch script before `srun` (see slurm/train.sbatch).
+    batch script before `srun`.
     """
     if "RANK" in os.environ or "SLURM_PROCID" not in os.environ:
         return

@@ -30,11 +30,10 @@ def parse_pending_filename(stem: str, run_id: str) -> tuple[int, str] | None:
     pattern, else `None`.
 
     Returns `None` rather than raising on any non-matching or malformed
-    remainder: callers glob `"{run_id}_*.pt"` first (a plain prefix match,
-    which -- per the existing "pool-fish" vs "pool-fish-5r_..." scoping
-    concern in run_outer_step.py -- can already include a hyphen-suffixed
-    sibling run's files), so a bad parse here means "not really this run's
-    file" or "predates the round-tagged format," not a crash-worthy error.
+    remainder. Callers glob `"{run_id}_*.pt"` first, a plain prefix match that
+    also catches sibling runs whose ids extend this one (`pool-fish` matches
+    `pool-fish-5r_...`). A bad parse therefore means "not this run's file" or
+    "predates round tagging", not an error.
     """
     prefix = f"{run_id}_"
     if not stem.startswith(prefix):

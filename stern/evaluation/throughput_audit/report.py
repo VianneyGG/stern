@@ -1,7 +1,7 @@
-"""Assembles the final Markdown audit report from the three checkers'
-JSON evidence (Tasks 1-3). Pure rendering -- no cluster access here; the
-evidence must already be pulled (see main()'s docstring for the ssh
-commands) and passed in as parsed JSON.
+"""Assemble the Markdown throughput audit report from the checkers' JSON evidence.
+
+Pure rendering with no cluster access. The evidence must already be pulled
+(see the ssh commands in main()'s help) and passed in as parsed JSON.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def render_report(
             "",
         ]
         if watcher_gaps:
-            largest = sorted(watcher_gaps, key=lambda g: -g["gap_s"])[:5]
+            largest = sorted(watcher_gaps, key=lambda gap: -gap["gap_s"])[:5]
             lines.append(f"- {len(watcher_gaps)} gaps detected; 5 largest:")
             for gap in largest:
                 lines.append(
@@ -75,7 +75,7 @@ def render_report(
         "Source: `configs/experiment/videomae_mesh_ssl.yaml` (`mesh.round_budget_s`).",
         f"- pacing_enabled: {pacing['pacing_enabled']} (round_budget_s={pacing['round_budget_s']})",
         "",
-        "Source: static grep of `scripts/run_outer_step.py` / `training/diloco/mesh_round.py`.",
+        "Source: static grep of `stern/mesh/run_outer_step.py` / `stern/training/mesh_round.py`.",
         f"- quantize on master broadcast: {quantize['master_broadcast']}",
         f"- quantize on worker push: {quantize['worker_push']}",
         "",

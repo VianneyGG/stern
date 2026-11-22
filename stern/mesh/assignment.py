@@ -1,21 +1,16 @@
-"""Locality-first shard assignment and replica-aware failure reassignment.
+"""Shard assignment for a training round, and reassignment after a node dies.
 
-`compute_shard_counts` (Task 2) says *how many* shards each node trains this
-round; `plan_placement` (Task 3) says *where* shards physically live. Those
-two are computed independently -- a compute-weighted split and a
-capacity-weighted storage layout are uncorrelated in general -- so naively
-handing out shards without regard to placement would send nearly every
-shard over the network for no reason. `assign_locality_first` closes that
-gap: each node trains shards it already stores first, and only reaches into
-the network-fetch path (Task 7) to fill out the remainder.
+`scoring.compute_shard_counts` says how many shards each node trains this
+round, and `placement.plan_placement` says where shards are stored. The two
+are computed independently, so handing out shards without regard to placement
+would send most shards over the network for no reason.
 
-`reassign_failed` handles a node dying mid-round. Its in-flight shards need
-a new trainer; routing them to a survivor that already holds a replica costs
-zero network. A shard no survivor holds is dropped, not parked on an
-arbitrary survivor -- there is no HTTP fetch path left to rescue it.
+`assign_static` gives each shard to one of the nodes that already hold it, so
+a node is only ever assigned a shard on its own disk.
 
-`assign_static` supersedes `assign_locality_first` for launching a round;
-the latter survives only for its own tests.
+`reassign_failed` handles a node dying mid-round. Its in-flight shards go to a
+surviving replica holder, which costs no network. A shard no survivor holds is
+dropped, since nothing can fetch it.
 """
 
 from __future__ import annotations
@@ -31,23 +26,18 @@ def reassign_failed(
 ) -> tuple[dict[str, list[str]], list[str]]:
     """Redistribute a dead node's shards among survivors that hold them.
 
-    Each orphaned shard goes to a surviving *replica holder* (per
-    `placement`), so the reassignment costs zero network -- this is what
-    storing multiple copies bought. Among several qualifying holders the
-    least-loaded wins (ties broken by hostname for determinism); load is
-    tracked as shards are handed out so one holder doesn't get every shard
-    dumped on it.
+    Each orphaned shard goes to a surviving replica holder (per `placement`),
+    so the reassignment costs no network. Among several holders the least
+    loaded wins, ties broken by hostname. Load is updated as shards are handed
+    out, so one holder does not take them all.
 
     A shard **no survivor holds is dropped** and returned in the second
-    element, not parked on the least-loaded survivor. That fallback is the
-    2026-08-20 fault in its second location: the named node cannot open a
-    shard it does not have, and with the P2P fetch removed
-    (`mesh_shard_dataset.resolve_shard`) it now raises rather than silently
-    skipping. Losing coverage of the shard is the honest outcome; the
-    caller logs the drop so a degraded round is visible.
+    element. It is not parked on a survivor that lacks it, because that node
+    cannot read the shard (`mesh_shard_dataset.resolve_shard` raises on a
+    missing shard). The caller logs the drop so a degraded round is visible.
 
-    `placement` must be real, verified holdings -- `verified_holdings.json`
-    as written by `validate_seeding.py`, never a placement *plan*.
+    `placement` must be verified holdings (`verified_holdings.json` from
+    `validate_seeding.py`), never a placement plan.
     """
     if failed_node not in assignments:
         raise ValueError(
@@ -79,15 +69,13 @@ def read_my_shards(assignments_path: Path, hostname: str) -> list[str]:
     """Read this node's shard list out of a round's assignments file.
 
     `assignments_path` is `~/stern_mesh/metadata/shard_assignments_[RUN_ID].json`,
-    written by whatever assigns the round (`assign_locality_first` /
-    `reassign_failed` above) with schema `{hostname: [shard, ...]}`. Called by
-    `run_mesh_worker.sh` before the trainer starts.
+    written by the round's assigner (`assign_static` or `reassign_failed`) with
+    schema `{hostname: [shard, ...]}`. Called by `cluster/run_mesh_worker.sh`
+    before the trainer starts.
 
-    Raises `KeyError` naming the host, not a generic one, if `hostname` has no
-    entry, OR if `hostname` maps to an empty list: training on an
-    empty/default shard list would silently produce a meaningless checkpoint
-    that still gets merged into the master, so an unassigned OR
-    zero-shard host must fail loud instead of falling back to `[]`.
+    Raises `KeyError` naming the host if it has no entry or an empty list.
+    Training on zero shards would produce a meaningless checkpoint that still
+    gets merged into the master, so fail loudly instead of returning `[]`.
     """
     payload = json.loads(Path(assignments_path).read_text())
     if hostname not in payload:
@@ -110,25 +98,18 @@ def assign_static(
 ) -> dict[str, list[str]]:
     """Partition `expected` across the nodes that physically hold each shard.
 
-    This replaces the locality-first/remainder-fill scheme, whose phase 2
-    handed a node shards nobody local held and left the worker to fetch them
-    over HTTP. When the shard map went stale on 2026-08-20 that path became
-    the only path, nothing was serving, and every affected worker trained on
-    zero samples while reporting it as a warning.
+    A node is only ever assigned a shard it already has, so attribution cannot
+    disagree with the disk. An older scheme let a node fetch leftover shards
+    over HTTP. Once the shard map went stale, that fetch path was the only one,
+    and workers trained on zero samples while logging a warning.
 
-    Here a node can only ever be assigned a shard it already has, so
-    attribution cannot disagree with reality. The result is disjoint: each
-    shard goes to exactly one of its holders, chosen least-loaded-first so
-    that replicated pools spread evenly rather than piling onto whichever
-    node sorts first. Ties break on node name, so the output is
-    deterministic.
+    Each shard goes to exactly one holder, least loaded first, so replicated
+    pools spread evenly. Ties break on node name, so the output is
+    deterministic. Holdings may overlap; disjointness is a property of the
+    partition, not of the disk.
 
-    Note this does NOT require the pool to be deduplicated to 1x. Holdings
-    may overlap freely; disjointness is a property of the partition, not of
-    the disk.
-
-    Raises ValueError if any expected shard has no holder -- an unsatisfiable
-    assignment must fail here, loudly, rather than at 3am inside a worker.
+    Raises ValueError if any expected shard has no holder, so an unsatisfiable
+    assignment fails here rather than inside a worker.
     """
     assignment: dict[str, list[str]] = {node: [] for node in sorted(holdings)}
     holders = {
@@ -143,14 +124,11 @@ def assign_static(
             f"{', '.join(orphans[:10])}" + (" ..." if len(orphans) > 10 else "")
         )
 
-    # Seed pass: every node that holds anything gets one shard before any
-    # node gets a second. Without this, a node whose small holding is fully
-    # replicated on earlier-sorting nodes loses every load tie while they
-    # are all still at load 0 and ends up with nothing -- which
-    # `mesh_round` reports as train_loss=nan / 0.0 samp/s and then skips
-    # the push for, silently dropping merge quorum. Scarcest node first, and
-    # each takes its most-constrained shard, so seeding a starved node never
-    # strands another one.
+    # Seed pass: every node that holds anything gets one shard before any node
+    # gets a second. Otherwise a node whose holdings are all replicated on
+    # earlier-sorted nodes loses every load tie and trains nothing, and its
+    # round reports train_loss=nan and skips the push, silently dropping quorum.
+    # Scarcest node first, each taking its most constrained shard.
     unassigned = set(expected)
     scarcity = {node: len(set(held) & expected) for node, held in holdings.items()}
     for node in sorted(holdings, key=lambda n: (scarcity[n], n)):

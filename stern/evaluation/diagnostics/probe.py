@@ -1,7 +1,7 @@
-"""The attentive probe: the design doc's "scientific floor" check.
+"""The attentive probe: what is actually recoverable for the downstream task.
 
-Every per-depth diagnostic in this series (`diag_depth.py`) reads weights
-only. This module is the one check that says what is actually recoverable
+Every per-depth diagnostic in `depth.py` reads weights only. This module is the
+one check that says what is actually recoverable
 for the downstream VA task -- a frozen-encoder probe fit at each requested
 depth, read against a `random_init` capacity control so the reading is a
 paired difference, never an unpaired absolute.
@@ -44,32 +44,24 @@ PROBE_NUM_HEADS = 16
 PROBE_N_BLOCKS = 3
 
 # Fit-budget constants. Every quantity that changes how well the probe fits is
-# pinned here rather than read from a per-dataset Hydra config or varied per
-# call -- see design.md's "probe_ccc owns its dataset contract" decision.
-# 1e-5, not 1e-3: at 1e-3 the fit's raw predictions blew up within one epoch
-# on real AFEW-VA and ccc_loss's gradient vanished (design.md, "The probe fits
-# at 1e-5").
+# pinned here, not read from a per-dataset config or varied per call.
+# 1e-5, not 1e-3: at 1e-3 the raw predictions blew up within one epoch on real
+# AFEW-VA and ccc_loss's gradient vanished.
 PROBE_FIT_LR = 1e-5
 PROBE_FIT_EPOCHS = 20
-# ccc_loss estimates two variances from the batch; a batch this small turns
-# sampling noise into MetricValue.sd for reasons that have nothing to do with
-# the encoder under test (design.md's fit-budget decision).
+# ccc_loss estimates two variances from the batch. A batch this small turns
+# sampling noise into MetricValue.sd, which has nothing to do with the encoder.
 PROBE_BATCH_SIZE = 16
 PROBE_WINDOW_OVERLAP = 0.0
-# AFEW-VA is ~30fps; the SSL corpus these checkpoints trained on is 8.33fps.
-# At stride 1 a 16-frame window spans 0.53s here against 1.92s in pretraining,
-# so every per-frame displacement the encoder sees is ~3.6x smaller than
-# anything in its training distribution. Stride 4 would match exactly (2.03s)
-# but spans 61 frames, and AFEW-VA's clips have a median of 46: it keeps only
-# 170 of 600 clips and 179 windows, too few to fit a probe against. Stride 2
-# halves the mismatch at 1.03s and keeps 450 clips / 667 windows, which is the
-# usable end of that trade (measured 2026-09-23). Pinned rather than
-# configurable for the same reason as the fit budget: varying it per arm would
-# make the depth profile a temporal-scale profile.
+# AFEW-VA is ~30fps, but the SSL corpus is 8.33fps. At stride 1 a 16-frame
+# window spans 0.53s, against 1.92s in pretraining, so per-frame motion is
+# ~3.6x smaller than in training. Stride 4 matches the span but leaves too few
+# clips to fit a probe. Stride 2 halves the mismatch and keeps 450 clips, the
+# usable trade-off. Pinned like the fit budget: varying it per arm would turn
+# the depth profile into a temporal-scale profile.
 PROBE_FRAME_STRIDE = 2
 PROBE_VA_RANGE = (-1.0, 1.0)
-# 48 of AFEW-VA's 240 actors held out at 0.2 -- design.md weighs 90/10 against
-# 80/20 and leaves the fraction "fixed once here and not tuned per checkpoint".
+# 48 of AFEW-VA's 240 actors are held out. Fixed here, not tuned per checkpoint.
 PROBE_SPLIT_FRACTION = 0.2
 # Chunk size for the scoring forward pass. Not a fit-budget constant: the probe
 # is in eval mode with no cross-window term, so chunking is numerically inert
@@ -77,13 +69,10 @@ PROBE_SPLIT_FRACTION = 0.2
 # scale and will not go through a GPU in one piece.
 _SCORE_CHUNK = 32
 
-# probe_by_depth's default depth sweep -- design.md's "default sweep (4 layers
-# x 3 seeds x 2 arms x PROBE_FIT_EPOCHS)", matching the spec's own
-# layers=[1, 4, 8, 12] scenario for a 12-block ViT-B encoder.
+# Default depth sweep for probe_by_depth, for a 12-block ViT-B encoder.
 DEFAULT_PROBE_DEPTH_LAYERS = (1, 4, 8, 12)
 # Rung 4 is the 24-block HF LeVJEPA ViT-L. Its layers are read at the same
-# RELATIVE depth as the ViT-B rungs' (design.md's rung-4 geometry exception):
-# layer 2k there stands against layer k here.
+# relative depth as the ViT-B rungs, so layer 2k there stands against layer k here.
 RUNG4_PROBE_DEPTH_LAYERS = tuple(2 * layer for layer in DEFAULT_PROBE_DEPTH_LAYERS)
 
 # The two arms' replicate seed bases for probe_by_depth: independent of each
@@ -107,8 +96,7 @@ class AttentiveProbe(torch.nn.Module):
     Reuses `LinearVAHead` rather than re-implementing cross-attention pooling
     -- it is the shipped VA head `train.py` trains, and this probe being
     architecturally identical to the real head is worth more here than
-    protocol fidelity to V-JEPA 2's four-block-with-residual probe (see
-    design.md's Decisions).
+    protocol fidelity to V-JEPA 2's four-block-with-residual probe.
     """
 
     def __init__(
@@ -125,8 +113,8 @@ class AttentiveProbe(torch.nn.Module):
         # num_heads passed explicitly: LinearVAHead's own default is 12, and a
         # readout running at a different head count from the blocks in front
         # of it is a silent construction bug, not a configuration choice.
-        # bounded=False: the tanh saturated to exactly +-1 on real AFEW-VA
-        # within two fit epochs (job 2943) and every score was a dead fit.
+        # bounded=False: a tanh output saturated to exactly +-1 within two fit
+        # epochs on real AFEW-VA, which killed every fit.
         self.head = LinearVAHead(embed_dim, num_heads=num_heads, bounded=False)
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
@@ -197,10 +185,8 @@ def _materialize_tokens(
     to halve resident memory at real-dataset scale; upcast to fp32 per-batch
     in `_fit_and_score_probe` just before the fp32-parameter probe consumes it.
 
-    Writes into a preallocated tensor rather than list-append + `torch.cat`:
-    `cat` needs every per-batch chunk and the concatenated result alive at
-    once, a transient doubling that OOM-killed a real-dataset run at the full
-    cache's size on top of itself.
+    Writes into a preallocated tensor rather than list-append + `torch.cat`.
+    `cat` holds every chunk and the result at once, which doubles peak memory.
     """
     device = _resolve_device() if device is None else device
     encoder.to(device)
@@ -229,17 +215,13 @@ def _materialize_tokens_for_layers(
 ) -> tuple[dict[int, "torch.Tensor"], "torch.Tensor"]:
     """One forward pass over `loader`, caching every requested layer's tokens.
 
-    `forward_with_hidden_states` returns all `depth + 1` states from a single
-    pass, so this is what lets `probe_by_depth` sweep several layers without
-    a forward pass per layer -- only the requested `layers` are kept, not
-    every depth, per design.md's memory-mitigation fallback. Cached as fp16
-    to halve resident memory at real-dataset scale; upcast to fp32 per-batch
-    in `_fit_and_score_probe` just before the fp32-parameter probe consumes it.
+    `forward_with_hidden_states` returns all `depth + 1` states from one pass,
+    so `probe_by_depth` can sweep several layers without a forward pass per
+    layer. Only the requested `layers` are kept, to limit memory. Cached as fp16
+    to halve resident memory; upcast to fp32 per batch in `_fit_and_score_probe`.
 
     Writes into a preallocated tensor per layer rather than list-append +
-    `torch.cat`: `cat` needs every per-batch chunk and the concatenated
-    result alive at once, a transient doubling that OOM-killed a real-dataset
-    run at the full cache's size on top of itself.
+    `torch.cat`, for the same peak-memory reason as `_materialize_tokens`.
     """
     device = _resolve_device() if device is None else device
     encoder.to(device)
@@ -282,14 +264,12 @@ def standardise_on_fit(
     collapsed LeVJEPA arm). `LinearVAHead` ends in a tanh: fed activations of
     that size, a freshly-initialised head emits pre-tanh logits in the hundreds,
     saturates to exactly +-1, loses its gradient and predicts a constant
-    forever. `ccc_loss` then returns exactly 0.0 for every seed, which reads as
-    a precise null rather than as a dead fit -- measured on 2026-09-23, every
-    arm would have reported 0.0000.
+    forever. `ccc_loss` then returns exactly 0.0 for every seed. That looks like
+    a precise null, not a dead fit, so every arm would silently report 0.0000.
 
-    Standardising also removes stream norm as a confound in its own right, which
-    is why `claims_oof.py` carries a `z` variant for the ridge readout: at
-    alpha=1 a norm-12 stream is penalised far more than a norm-450 one, so the
-    unstandardised comparison partly ranks arms by scale.
+    Standardising also removes stream norm as a confound. Without it, a ridge
+    penalty penalises a norm-12 stream far more than a norm-450 one, so the
+    comparison would partly rank arms by scale.
 
     `mu`/`sigma` come from the fit split alone -- taking them from the scored
     split, or from both, would leak it. Statistics accumulate in float64 over
@@ -619,7 +599,7 @@ def _skip_report(reason: str) -> DiagReport:
 
 
 def check(bundle: DiagBundle, inputs: dict) -> dict[str, DiagReport]:
-    """Plan 5's orchestrator entry point: `probe_by_depth` against real
+    """Orchestrator entry point: `probe_by_depth` against real
     AFEW-VA data, or a clean skip -- never a raise, never an empty mapping
     (indistinguishable from "this check does not exist" to a caller merging
     reports from every module).

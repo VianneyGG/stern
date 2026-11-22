@@ -17,17 +17,15 @@ from typing import Any
 def refresh_squeue_snapshot(out_path: Path, *, user: str) -> None:
     """Run `squeue -u <user>`, write a squeue-`--json`-shaped snapshot to `out_path`.
 
-    This cluster's Slurm build has no JSON serializer plugin (`squeue --json`
-    fails with `serializer_required: could not find plugin for
-    application/json`), so we parse squeue's plain `-o` format instead and
-    reassemble the same `{"jobs": [{"job_id", "job_state", "nodes"}, ...]}`
-    shape `load_squeue_snapshot` expects -- that on-disk contract stays
-    unchanged even though the source command differs.
+    The cluster's Slurm build has no JSON serializer plugin, so `squeue
+    --json` fails. This parses the plain `-o` format and rebuilds the
+    `{"jobs": [{"job_id", "job_state", "nodes"}, ...]}` shape that
+    `load_squeue_snapshot` reads. The on-disk contract is unchanged.
 
-    Tmp-write + rename mirrors poll_squeue.sh / checkpoint.save -- a crash
+    Tmp-write + rename mirrors checkpoint.save -- a crash
     mid-write must never leave a truncated squeue.json for the next tick.
     Raises `subprocess.CalledProcessError` on failure; the caller
-    (scripts/watch_training.py) decides how to log/skip that tick.
+    (watch_training.py) decides how to log or skip that tick.
     """
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     result = subprocess.run(

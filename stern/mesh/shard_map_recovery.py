@@ -1,9 +1,9 @@
 """Rebuild `shard_map.json` from each mesh node's actual on-disk holdings.
 
 Used when the shard_map metadata file was lost (or never written) even
-though the underlying shard placement across nodes is still correct --
-recomputing from live holdings avoids a fresh `seed_mesh.py` placement run,
-which would drift from what's physically on disk as free space changes.
+though the shard placement across nodes is still correct. Recomputing from
+live holdings avoids a fresh `seed_nodes.py` placement run, which would drift
+from what is physically on disk as free space changes.
 """
 
 from __future__ import annotations
@@ -19,10 +19,9 @@ def build_shard_map_from_holdings(
 ) -> dict[str, list[Holder]]:
     """Invert `{host: [shard, ...]}` into `{shard: [Holder, ...]}`.
 
-    Every host in `holdings` must have an entry in `node_subnets` --
-    `pick_holder`'s same-subnet preference silently degrades to always
-    cross-subnet if a subnet is missing or defaulted, so a missing entry
-    raises `KeyError` naming the host rather than guessing.
+    Every host in `holdings` must have an entry in `node_subnets`. The
+    same-subnet holder preference silently degrades to cross-subnet when a
+    subnet is missing, so a missing entry raises `KeyError` naming the host.
 
     Iterates hosts in sorted order so holder lists come out in the same
     order regardless of `holdings`' insertion order.

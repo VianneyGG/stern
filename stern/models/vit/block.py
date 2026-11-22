@@ -1,3 +1,5 @@
+"""Pre-norm transformer block, assembled from the swappable `vit` components."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -1,4 +1,4 @@
-"""Tube masking for VideoMAE pretraining.
+"""Tube masking and its variants for VideoMAE pretraining.
 
 VideoMAE masks "tubelets" — the same spatial positions (H', W') across all
 temporal positions (T'). This differs from random per-frame masking because
@@ -101,26 +101,19 @@ class RandomTubeMasking(_PerSampleMaskingMixin):
 class RandomFrameMasking(_PerSampleMaskingMixin):
     """Mask whole timesteps, then top up with scattered tokens.
 
-    The complement of tube masking. Tube masking leaves every masked spatial
-    column visible at every *other* timestep, so a model can solve the task by
-    pooling its own column over time and never learn temporal structure. Here
-    whole timesteps are hidden, so reconstructing them requires predicting
-    across time.
+    The complement of tube masking. Tube masking leaves each masked column visible
+    at every other timestep, so the model can pool over time and never learn
+    temporal structure. Hiding whole timesteps forces prediction across time.
 
-    `min_visible_timesteps` bounds how far that goes. Without it the production
-    geometry (T'=8, mask_ratio 0.9) hides int(0.9*8) = 7 of 8 timesteps, leaving
-    the encoder a single frame -- that is not "no guaranteed temporal twin", it
-    is single-frame MAE plus seven-step extrapolation, and it confounds the
-    factorial: a worse score could equally mean the encoder was starved of
+    `min_visible_timesteps` bounds how many timesteps can be hidden. Without it the
+    production geometry (T'=8, mask_ratio 0.9) leaves a single frame visible, which
+    confounds the factorial: a worse score could mean the encoder was starved of
     input rather than that temporal modelling is hard. One token per surviving
-    timestep is also held back from the scattered top-up, so the floor is a
-    guarantee and not merely likely.
+    timestep is also reserved from the top-up, so the floor is guaranteed.
 
-    The remaining budget is taken as scattered tokens from the surviving
-    timesteps, so the total masked count matches RandomTubeMasking and the two
-    are comparable at a fixed token budget. The reserved tokens cap that budget:
-    at mask_ratio 1.0 the count falls short by `min_visible_timesteps`, because
-    masking everything and keeping a visible timestep cannot both hold.
+    The total masked count matches RandomTubeMasking, so the two compare at a fixed
+    budget. The reserved tokens cap that budget: at mask_ratio 1.0 the count falls
+    short by `min_visible_timesteps`.
     """
 
     def __init__(self, mask_ratio: float = 0.9, min_visible_timesteps: int = 2):
@@ -223,9 +216,9 @@ class MotionGuidedTubeMasking(_PerSampleMaskingMixin):
     getting to "cheat" by keeping every visible-motion patch.
 
     Same tube structure as RandomTubeMasking: identical spatial positions
-    masked across all T' tubelets. Motion energy is averaged over time; the
-    batch-dimension mean below is a no-op squeeze, since _PerSampleMaskingMixin
-    hands each call a batch of one.
+    masked across all T' tubelets. Motion energy is averaged over time. The
+    batch mean below is a no-op, since _PerSampleMaskingMixin always passes a
+    batch of one.
     """
 
     def __init__(self, mask_ratio: float = 0.9):
@@ -274,10 +267,8 @@ class MotionGuidedTubeMasking(_PerSampleMaskingMixin):
 def build_masker(model_cfg):
     """Select the masking strategy from a model config.
 
-    Lives here rather than in pretrain.py because both training entrypoints
-    need it and pretrain.py <-> mesh_round.py is already a real import cycle
-    (broken only by a function-local import); importing the selector from
-    either one into the other would tighten it.
+    Lives here because both training entrypoints (training/pretrain.py and
+    training/mesh_round.py) need it, and those two already import each other.
 
     `motion_mask` predates `mask_type` and stays authoritative, so no existing
     config changes meaning when `mask_type` is absent.

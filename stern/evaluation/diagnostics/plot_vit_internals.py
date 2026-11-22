@@ -1,6 +1,6 @@
-"""Render the two ViT-internals diagnostic PNGs from an
-`export_vit_internals.py` `.npz` -- pure plotting, no torch, no checkpoints,
-fast to iterate on locally.
+"""Render the two ViT-internals PNGs from an `export_vit_internals` `.npz`.
+
+Pure plotting: no torch and no checkpoints, so it is fast to iterate on locally.
 
     uv run python -m stern.evaluation.diagnostics.plot_vit_internals \\
         --npz internals.npz --out-dir runs/results/vit_internals/<timestamp>/

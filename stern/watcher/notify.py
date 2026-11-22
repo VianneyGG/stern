@@ -1,7 +1,6 @@
-"""stern/watcher/notify.py
-Dependency-free-of-claude-p notification (design §3). Every automatic
-escalation call site posts here instead of spawning `claude -p`; a broken
-LLM invocation must never silently disable notification too.
+"""Notify a human about an automatic escalation, without spawning `claude -p`.
+
+A broken LLM invocation must never silently disable notification too.
 """
 
 from __future__ import annotations

@@ -1,14 +1,13 @@
-"""Error-feedback fp16 quantization, shared by both DiLoCo NFS directions:
-the master broadcast (`run_outer_step.py`) and, from Phase 3.2, the
-worker's pseudo-gradient push (`training/diloco/mesh_round.py`) -- one
-primitive instead of two copies that would drift apart.
+"""Error-feedback fp16 quantization for both DiLoCo NFS directions.
 
-Plain fp16 casting biases every round in the same direction, and both the
-master weights and the pseudo-gradient DiLoCo computes from them are small
-differences of large numbers -- repeated correlated rounding accumulates
-over a multi-day run. Persisting the residual `(x - fp16(x))` and adding it
-back on the next call makes the compression unbiased over time (standard
-error feedback from the gradient-compression literature).
+Used for the master broadcast (`run_outer_step.py`) and the worker's
+pseudo-gradient push (`training/mesh_round.py`), so the two cannot drift apart.
+
+Plain fp16 casting biases every round in the same direction. Master weights
+and pseudo-gradients are small differences of large numbers, so the bias
+accumulates over a multi-day run. Persisting the residual `(x - fp16(x))` and
+adding it back on the next call makes the compression unbiased over time
+(standard error feedback from the gradient-compression literature).
 """
 
 from __future__ import annotations
@@ -24,13 +23,11 @@ from stern.training.checkpoint import save as _atomic_save
 def quantize_with_error_feedback(
     state_dict: StateDict, residual_path: Path | None
 ) -> StateDict:
-    """Cast every floating-point tensor in `state_dict` to fp16, carrying
-    the rounding residual across calls via `residual_path`.
+    """Cast every floating-point tensor to fp16, carrying the rounding residual.
 
-    `residual_path` lives on local disk, never NFS: it is a pure
-    optimization. If missing (first call, or a wiped local dir) this
-    degrades to a plain cast rather than failing -- unlike the outer
-    momentum buffer, losing it costs precision, not correctness.
+    `residual_path` must be on local disk, never NFS. It is only an
+    optimization: if it is missing, this falls back to a plain cast. Losing it
+    costs precision, not correctness (unlike the outer momentum buffer).
     """
     residual: StateDict = {}
     if residual_path is not None and residual_path.exists():

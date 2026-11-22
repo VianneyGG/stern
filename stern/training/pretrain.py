@@ -1,13 +1,12 @@
 """Hydra entrypoint: VideoMAE self-supervised pretraining on unlabelled video.
 
-Invoked by scripts/run_experiment.sh as:
-  `python -m stern.training.pretrain experiment=videomae_ssl_pretrain_voxmini [overrides...]`
+Run as `python -m stern.training.pretrain experiment=<name> [overrides...]`.
 
-Training loop mirrors training/train.py but:
-- Consumes unlabelled video (VoxCeleb2 via build_ssl_loader)
-- Loss = reconstruction MSE (not CCC)
-- Saves checkpoints with is_ssl=True (lower loss = better)
-- Produces a frozen encoder checkpoint for Stage 2 (probe training)
+The loop follows finetune.py's structure, with three differences:
+- Consumes unlabelled video (built by `build_ssl_loader`).
+- Loss is reconstruction MSE, not CCC.
+- Checkpoints are saved with is_ssl=True (lower loss is better).
+Its encoder checkpoint feeds Stage 2 (probe training).
 """
 
 from __future__ import annotations
@@ -62,19 +61,17 @@ def run_pretrain_stage(
     device: torch.device,
     dataset: torch.utils.data.Dataset | None = None,
 ) -> dict:
-    """Main pretraining loop (mirrors training/train.py structure).
+    """Run the SSL pretraining loop for one process.
 
     Args:
-        cfg: Hydra config with experiment, dataset, train, model fields
-        rank: global rank in DDP
-        world_size: total ranks
-        local_rank: rank on this node
-        device: torch device
-        dataset: pre-built dataset to train on. When None (default), built
-            internally from cfg.dataset via build_ssl_loader/SSLWindowDataset,
-            unchanged from prior behavior. When supplied (e.g. a molab
-            notebook's StreamingShardDataset), that internal construction --
-            including the local manifest read -- is skipped entirely.
+        cfg: Hydra config with experiment, dataset, train, model fields.
+        rank: global DDP rank.
+        world_size: total number of ranks.
+        local_rank: rank on this node.
+        device: torch device.
+        dataset: optional prebuilt dataset, e.g. a streaming shard dataset from
+            a notebook. When None it is built from cfg.dataset, and when given
+            the manifest read and that construction are skipped.
     """
     # Isolate each sweep cell under its run_tag: every cell shares the same
     # experiment.name, so without this they would clobber / cross-resume from
@@ -104,17 +101,11 @@ def run_pretrain_stage(
         num_workers=int(cfg.train.get("num_workers", 4)),
     )
 
-    # Build the RAW (unwrapped) model + optimizer + scheduler and resume BEFORE
-    # wrap_ddp. This cluster has no shared filesystem: checkpoints live on
-    # node-local /Data, so only the physical node holding rank 0 ever has the
-    # file. Resuming after wrap_ddp with every rank reading its own local disk
-    # made ranks disagree on start_epoch (rank 0 sees the checkpoint, others
-    # silently don't) -- which desyncs the training-loop range across ranks
-    # and deadlocks the next DDP collective. Fix: only rank 0 reads the file;
-    # wrap_ddp's constructor-time parameter broadcast then propagates the
-    # resumed weights to every rank, and _maybe_resume_pretrain explicitly
-    # broadcasts (start_epoch, best_loss, optimizer/scheduler state) so all
-    # ranks agree before entering the loop.
+    # Resume on the raw model, before wrap_ddp. Only rank 0 reads the
+    # checkpoint: it lives on node-local disk, so ranks that each read their
+    # own copy can disagree on start_epoch and deadlock the next collective.
+    # wrap_ddp's constructor broadcast then sends the weights to every rank,
+    # and _maybe_resume_pretrain broadcasts the rest.
     model = VideoMAEForPreTraining(cfg.model).to(device)
     amp = str(cfg.train.get("amp", "off")).lower()
     optimizer = torch.optim.AdamW(
@@ -277,40 +268,30 @@ def _train_epoch_ssl(
     abandon_check_every: int = 50,
     ema: "WeightEMA | None" = None,
 ) -> dict:
-    """Train one epoch (or `max_steps` micro-steps) of SSL pretraining.
+    """Train one epoch, or `max_steps` micro-steps, of SSL pretraining.
 
-    Mirrors training/train.py's `_train_epoch` but applies masking, computes
-    reconstruction loss, and measures throughput/VRAM for the scaling sweep.
-    Returns a dict
-    with `loss`, `samples_per_s_per_gpu`, `step_time_ms_mean`, `peak_vram_gb`,
-    `steps`, `samples`.
+    Applies masking, computes reconstruction loss, and measures throughput and
+    VRAM for the scaling sweep. Returns a dict with `loss`,
+    `samples_per_s_per_gpu`, `step_time_ms_mean`, `peak_vram_gb`, `steps`,
+    `samples`, `nan_steps` and `abandoned`.
 
-    Timing notes (this feeds a systems benchmark, so accuracy matters):
-    - The loss is accumulated on-device and read once at the end; a per-step
-      `.item()` would force a CUDA sync every step and hide compute/comm
-      overlap, biasing multi-node throughput downward.
-    - Only steps after `timing_warmup_steps` are timed (cuDNN autotune +
-      allocator growth make the first steps unrepresentative), with a single
-      `cuda.synchronize()` at each end of the timed window.
+    Timing notes:
+    - The loss is summed on-device and read once at the end. A per-step
+      `.item()` would force a CUDA sync and hide compute/comm overlap.
+    - Only steps after `timing_warmup_steps` are timed, since cuDNN autotune
+      and allocator growth make the first steps unrepresentative.
 
-    `abandon_check`: polled every `abandon_check_every` steps; when it
-    returns True the epoch stops early and the returned dict carries
-    `abandoned=True`. The mesh round loop uses it to drop a round whose merge
-    has already happened without this node -- every further step would be
-    computed against a superseded master and merged by nobody. Left None (the
-    default) nothing is polled and behaviour is byte-identical to before.
-    Whatever work was done before the break is still reflected in `loss`,
-    `steps` and `samples`; the caller decides whether to keep it.
+    `abandon_check` is polled every `abandon_check_every` boundary steps. When
+    it returns True, the epoch stops and the result carries `abandoned=True`.
+    The mesh round loop uses this to drop a round that was merged without this
+    node. The break only happens after an optimizer step, so no accumulated
+    gradients are discarded.
 
-    `progress_desc`: when set, wraps the loader in a tqdm progress bar with
-    this label (used by the mesh round loop to show "round N" progress on an
-    interactive terminal). Purely cosmetic -- it only wraps the iterator, so
-    every numeric field in the returned dict is identical with or without it.
-    Default `None` preserves the exact existing behavior/output for every
-    call site that doesn't pass it.
+    `progress_desc` wraps the loader in a tqdm bar. It is cosmetic and does not
+    change any returned value.
 
-    `ema`: when set, `.update(model)` is called after every optimizer step
-    boundary. Never affects `model`'s own weights or the returned dict.
+    `ema`, when set, is updated after each optimizer step. It never touches
+    `model`'s weights.
     """
     model.train()
     # Unwrap once. `model` may be bare (world_size=1 / mesh), DDP-wrapped, or
@@ -373,21 +354,16 @@ def _train_epoch_ssl(
             with torch.autocast(
                 device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled
             ):
-                # return_aux is the *training* path only: the E2b arms add their
-                # terms here, while evaluate_val_loss deliberately omits them so
-                # val loss stays plain masked MSE and stays comparable across
-                # arms (and save_best's all-time-best guard keeps its meaning).
+                # return_aux is training only. evaluate_val_loss omits the aux
+                # terms so val loss stays plain masked MSE, which keeps
+                # save_best's comparison meaningful.
                 pred, target, aux = model(
                     pixel_values, keep_indices, mask_indices, return_aux=True
                 )
                 loss = core.compute_loss(pred, target, aux=aux) / accum_steps
-            # bf16/fp16 forward on a freshly-initialized deep ViT occasionally
-            # produces a non-finite loss on an isolated batch (observed on real
-            # data; not reproducible in fp32). Skip backward entirely rather
-            # than let it through: backward() would broadcast NaN into every
-            # parameter's .grad, permanently corrupting the model for all
-            # later steps -- one bad batch would end the whole run. Reported
-            # via `nan_steps` so a genuinely unhealthy run stays visible.
+            # A bf16/fp16 forward can give a non-finite loss on one batch.
+            # Skip backward for it: NaN grads would corrupt every parameter
+            # for all later steps. Counted in `nan_steps` so a sick run shows.
             if not torch.isfinite(loss):
                 nan_steps += 1
             elif scaler is not None:
@@ -473,19 +449,13 @@ def _payload(*, model, optimizer, scheduler, epoch: int, best_loss: float) -> di
 
 
 def _scaled_lr(cfg, world_size: int, *, local_batch: int | None = None) -> float:
-    """Linear-scaling-rule LR: base_lr * effective_batch/256 * lr_mult.
+    """Linear-scaling-rule LR: base_lr * effective_batch / 256 * lr_mult.
 
-    Falls back to the flat `train.learning_rate` when `base_lr` is unset, so
-    throughput-only Phase-1 cells that don't care about convergence still run.
+    Falls back to `train.learning_rate` when `base_lr` is unset.
 
-    `local_batch` overrides `cfg.train.batch_size` as the per-step sample
-    count fed into `eff_batch`. Every existing (non-mesh) caller omits it, so
-    `eff_batch` still reads `cfg.train.batch_size` for them -- behavior is
-    unchanged. The mesh round loop passes its real per-step batch
-    (`_MESH_BATCH_SIZE`, currently 1) explicitly: `cfg.train.batch_size` (16
-    in ssl.yaml) is never the mesh path's actual per-optimizer-step sample
-    count, so scaling off it would silently mis-tune the LR for every mesh
-    run regardless of `accum_steps`.
+    `local_batch` overrides `cfg.train.batch_size` as the per-step sample count.
+    The mesh round loop must pass its real per-step batch, because
+    `cfg.train.batch_size` is not the mesh path's per-step sample count.
     """
     base_lr = cfg.train.get("base_lr", None)
     if base_lr is None:
@@ -525,15 +495,10 @@ def _maybe_resume_pretrain(
 ) -> tuple[int, float]:
     """Resume from checkpoint. Returns (start_epoch, best_loss).
 
-    Only rank 0 reads the checkpoint file: this cluster has no shared
-    filesystem, so a node-local checkpoint only exists on whichever physical
-    node held rank 0 when it was written -- every other rank's local read
-    would silently miss it. Model weights reach the other ranks for free via
-    wrap_ddp's constructor-time broadcast (called right after this returns);
-    (start_epoch, best_loss, optimizer/scheduler state) are broadcast here
-    explicitly so every rank agrees on the training-loop range before it
-    starts (a mismatch here desyncs ranks and deadlocks the first DDP
-    collective in the loop body).
+    Only rank 0 reads the file, since a node-local checkpoint exists only on
+    rank 0's node. Model weights reach the other ranks through wrap_ddp's
+    broadcast. The rest is broadcast here, so every rank enters the loop with
+    the same range. A mismatch would deadlock the first DDP collective.
     """
     if not resume:
         return 0, float("inf")
@@ -592,9 +557,8 @@ def _make_ssl_loader(
 ) -> DataLoader:
     """Create a distributed SSL data loader.
 
-    IterableDataset (e.g. a molab StreamingShardDataset) has no __len__, so
-    DistributedSampler can't wrap it; that path is single-node only (see
-    design doc non-goals), so no sampler is needed for it either.
+    An IterableDataset has no __len__, so DistributedSampler cannot wrap it.
+    That path is single-node only and uses no sampler.
     """
     if isinstance(dataset, IterableDataset):
         return DataLoader(
@@ -629,17 +593,16 @@ def _select_stage(
     local_rank: int,
     device: torch.device,
 ) -> functools.partial:
-    """Return a zero-arg-callable (functools.partial) for whichever training
-    stage this process should run.
+    """Return a zero-arg callable for the stage this process should run.
 
-    Mesh dispatch is gated on the MESH_RUN_ID env var (set by
-    run_mesh_worker.sh before this process starts), not a Hydra config
-    field: every non-mesh SLURM entrypoint (train.sbatch) must stay
-    byte-for-byte unchanged, and an env-var gate keeps this dispatch purely
-    additive. Returns a `functools.partial` (not a lambda) so callers/tests
-    can inspect `.func` to see which stage was selected without running it.
+    Mesh dispatch is gated on the MESH_RUN_ID env var, which
+    cluster/run_mesh_worker.sh sets before launch. An env var keeps non-mesh
+    entrypoints unaffected. Returns a `functools.partial` so tests can inspect
+    `.func` without running it.
     """
     if os.environ.get("MESH_RUN_ID"):
+        # Local import: mesh_round.py imports this module at top level, so a
+        # module-level import here would be circular.
         from stern.training.mesh_round import run_mesh_pretrain_stage
 
         return functools.partial(run_mesh_pretrain_stage, cfg, device=device)

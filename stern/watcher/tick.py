@@ -1,11 +1,10 @@
-"""Orchestrates one full-check tick (spec §4): load inputs, run the 3
-detectors, remediate-or-escalate each flag, advance the backoff timer.
+"""Run one full-check tick: load inputs, run the detectors, remediate or
+escalate each flag, advance the backoff timer.
 
-Impure by nature (calls remediate/escalate, which shell out) -- the
-detectors it calls stay pure; this module is the one place their outputs
-turn into subprocess calls. `state` is mutated in place and NOT persisted
-here -- the caller (scripts/watch_training.py) owns save_state, so this
-function stays trivially testable against an in-memory WatcherState.
+This is the one impure step: the detectors it calls stay pure, and this
+module turns their output into subprocess calls. `state` is mutated in place
+and not persisted here. The caller (watch_training.py) owns save_state, so
+this function is testable against an in-memory WatcherState.
 """
 
 from __future__ import annotations

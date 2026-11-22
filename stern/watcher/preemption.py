@@ -15,9 +15,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-# Matches mesh_round._ABANDON_ALERT_STREAK. Three consecutive is past the
-# point where a transient explains it -- node055 was contended for 23 rounds
-# and node032 for 19 on 2026-08-22, both recovering unaided afterwards.
+# Matches mesh_round._ABANDON_ALERT_STREAK. Three in a row is past what a
+# transient explains. Contended nodes have recovered unaided after 19 and 23
+# abandoned rounds, so a streak alone does not mean the node is broken.
 DEFAULT_STREAK = 3
 
 

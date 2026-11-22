@@ -1,19 +1,14 @@
 """Hydra entrypoint: end-to-end training of a from-scratch VideoMAE + VA head.
 
-Invoked by scripts/run_experiment.sh as
-`python -m stern.training.finetune experiment=<name> [overrides...]`.
+Run as `python -m stern.training.finetune experiment=<name> [overrides...]`.
 
-Decode fixed 16-frame windows, feed them through a `VideoMAEEncoder` + a 2-D
-VA regression head, and optimise CCC end-to-end. No LoRA, no cached
-embeddings (those "recipes" were deleted -- they came from a V-JEPA/MARLIN-
-oriented spec that does not fit training VideoMAE itself). Optionally loads
-a Stage 1 SSL-pretrained encoder (`train.pretrain_encoder_path`) and
-optionally freezes it (`train.freeze_backbone`) for a frozen-encoder probe,
-per `docs/superpowers/specs/2026-07-15-videomae-config-model-upgrade-design.md`.
+Decodes fixed 16-frame windows, passes them through a backbone and a 2-D VA
+regression head, and optimises CCC end to end. Optionally loads a Stage 1
+SSL-pretrained encoder (`train.pretrain_encoder_path`) and freezes it
+(`train.freeze_backbone`) for a frozen-encoder probe.
 
-CI tests inject a lightweight fake backbone (see tests/test_train_stage.py)
-because a full ViT-B forward per step is slow; the real encoder has its own
-CPU-sized unit test in tests/test_videomae_encoder.py.
+Tests inject a lightweight fake backbone (see tests/training/test_train_stage.py),
+because a full ViT-B forward per step is too slow for CI.
 """
 
 from __future__ import annotations
@@ -58,19 +53,13 @@ def _temporal_transform(cfg: DictConfig):
 
 
 def _extract_encoder_state(state: dict, *, encoder_kind: str) -> dict:
-    """Isolate the encoder's own state-dict keys from a Stage-1 checkpoint.
+    """Pick the encoder's own keys out of a Stage 1 checkpoint.
 
-    VideoMAE's checkpoint wraps `VideoMAEForPreTraining`, whose `encoder`
-    submodule keys are saved under an `"encoder."` prefix -- strip it.
-    LeVJEPA has two checkpoint shapes: the single-node path
-    (`pretrain_levjepa.py`'s `_payload` -> `checkpoint.base_payload(model=
-    encoder, ...)`) saves the encoder directly with no prefix, but the
-    DiLoCo mesh path (`mesh_round.py`'s `_LeVJEPAPretrainModule`) wraps
-    encoder+projector as submodules, so its checkpoint keys are
-    `"encoder."`/`"projector."`-prefixed. Detect which shape this is by
-    whether any key already starts with `"encoder."` -- stripping
-    unconditionally would match zero keys and silently load nothing for the
-    single-node shape.
+    VideoMAE checkpoints prefix the encoder keys with `"encoder."`, which is
+    stripped. LeVJEPA has two shapes. The single-node checkpoint saves the
+    encoder with no prefix. The DiLoCo mesh checkpoint nests encoder and
+    projector, so its keys carry the `"encoder."` prefix. Only strip when the
+    prefix is present, or the single-node shape would load nothing.
     """
     if encoder_kind == "levjepa":
         if any(k.startswith("encoder.") for k in state):
@@ -240,10 +229,8 @@ def run_train_stage(
             if bool(cfg.train.get("save_latest", True)):
                 ckpt_io.save(latest_path, payload)
 
-            # Emit the current result each epoch (overwrite=True -> one stable
-            # file per run_tag), mirroring pretrain.py's heartbeat -- gives the
-            # SLURM training watcher's stall detector a live mtime signal for
-            # probe-stage runs too, not just SSL pretraining.
+            # Rewrite the result each epoch, as pretrain.py does. The watcher's
+            # stall detector then sees a live mtime for probe runs too.
             write_result_json(
                 val or result,
                 cfg,
@@ -384,12 +371,11 @@ def _train_epoch(
     scheduler=None,
     amp_bf16: bool = False,
 ) -> float:
-    """Trains one epoch with `accum_steps` micro-batches per optimizer step.
+    """Train one epoch, with `accum_steps` micro-batches per optimizer step.
 
-    Also used (in spirit) by training/pretrain.py's `_train_epoch_ssl`:
-    `no_sync()` skips DDP's allreduce on non-boundary micro-steps, and
-    `grad_clip` (when >0) clips the accumulated gradient right before
-    `optimizer.step()`.
+    `no_sync()` skips DDP's allreduce on non-boundary micro-steps. `grad_clip`,
+    when positive, clips the accumulated gradient before `optimizer.step()`.
+    pretrain.py's `_train_epoch_ssl` follows the same pattern.
     """
     model.train()
     total, count = 0.0, 0

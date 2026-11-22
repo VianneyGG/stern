@@ -1,10 +1,10 @@
-"""Per-block depth-collapse checks, read directly against `_diag_common`'s
-`load_bundle` harness (see module docstring there for why: the harness exists
-so a check like this one is never written against a hand-mirrored forward
-that can drift from the real model).
+"""Per-block depth-collapse checks.
 
-Three of the four checks here read weights only, which is what makes them
-affordable on the *round* axis where a forward pass per round is not.
+Each check takes a bundle from `common`'s `load_bundle` harness. None re-implements
+the forward pass by hand, since a hand-mirrored forward can drift from the model.
+
+Several checks read weights only. That keeps them cheap on the round axis, where
+a forward pass per round would not be.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def residual_branch_norm(
     """Per-block `attn`/`mlp` residual-branch norm, normalised against
     `ref_bundle`. `ref_bundle` is required positionally -- no default, no
     inference -- because a checkpoint silently compared against itself
-    reports 1.0 for every block regardless of how broken it is."""
+    reports 1.0 for every block, however broken it is."""
     result: dict[int, dict[str, MetricValue]] = {}
     for i, (block, ref_block) in enumerate(
         zip(bundle.encoder.blocks, ref_bundle.encoder.blocks, strict=True)
@@ -84,8 +84,7 @@ def branch_norm_ratio(
     each branch's ratio to the residual -- the quantity the depth-collapse
     reading is made on. Captures branch outputs via temporary forward hooks
     on the real `.attn`/`.mlp` submodules rather than re-deriving
-    `ViTBlock.forward` by hand, which is what let `export_vit_internals`
-    drift from the model it described."""
+    `ViTBlock.forward` by hand, so the numbers track the real model."""
     encoder = bundle.encoder
     attn_outputs: list[torch.Tensor] = []
     mlp_outputs: list[torch.Tensor] = []
@@ -192,11 +191,10 @@ def _is_valid_init_reference(bundle: DiagBundle, ref_bundle: DiagBundle) -> bool
 def delta_from_init(bundle: DiagBundle, ref_bundle: DiagBundle) -> dict[int, float]:
     """Per-block L2 norm of the parameter delta against `ref_bundle`.
 
-    This is a "did this block move" check, not a damage detector: zeroing an
-    already-small tensor can remove less norm than training added to that
-    block's other weights, so a damaged block is not guaranteed to separate
-    from a healthy one here. `residual_branch_norm` is the mutilation
-    detector; see its module docstring's rung-(-1) test.
+    This is a "did this block move" check, not a damage detector. Zeroing an
+    already-small tensor can remove less norm than training added elsewhere in
+    the block, so a damaged block may not separate from a healthy one.
+    `residual_branch_norm` is the damage detector.
     """
     if not _is_valid_init_reference(bundle, ref_bundle):
         raise ValueError(
@@ -263,9 +261,10 @@ def _flat_tokens(state: torch.Tensor) -> "np.ndarray":
 def cka_matrix(
     bundle: DiagBundle, pixel_values: torch.Tensor
 ) -> dict[str, "np.ndarray"]:
-    """Block-by-block CKA -- always `full`, `trimmed`, and `diff` together
-    (design.md: reporting only one would silently discard the evidence that
-    distinguishes a real depth signal from an outlier-token artifact)."""
+    """Block-by-block CKA, always returning `full`, `trimmed`, and `diff` together.
+
+    Reporting only one would hide the difference between a real depth signal and
+    an outlier-token artifact."""
     states = [_flat_tokens(s) for s in _hidden_states(bundle, pixel_values)]
     n = len(states)
     full = np.zeros((n, n))
@@ -296,7 +295,7 @@ def cka_between(
 
 def _z_target(pixel_values: torch.Tensor, bundle: DiagBundle) -> torch.Tensor:
     """Time-averaged z-space patch target -- the same target
-    `diag_reconstruction`'s temporal-holdout metrics score against."""
+    `reconstruction`'s temporal-holdout metrics score against."""
     tubelet_size = int(bundle.encoder.model_cfg.tubelet_size)
     patch_size = int(bundle.encoder.model_cfg.patch_size)
     target, mu, sigma, _grid = patch_stats(
@@ -361,7 +360,7 @@ def decode_from_depth(
     fully bidirectional, so every `mask` token has already attended to every
     `keep` token before the head sees it. This MSE answers "how linearly
     decodable is patch content from block k" and is NOT on
-    `diag_reconstruction.holdout_mse_z`'s scale -- that metric's encoder only
+    `reconstruction.holdout_mse_z`'s scale -- that metric's encoder only
     ever sees the `keep` tokens -- so never read the two side by side."""
     grid = bundle.encoder.token_grid
     keep, mask, _cut = temporal_split(grid, pixel_values.device, keep_frac=0.5)
@@ -383,11 +382,12 @@ def decode_from_depth(
 
 
 def check(bundle: DiagBundle, inputs: dict) -> dict[str, DiagReport]:
-    """Plan 5's orchestrator reaches every check in this module only through
-    here, so a check `check()` never calls is dead code. Always emits one
-    report per check -- a skip is a report with empty metrics and
-    `meta["skipped"]`, never an omission, since an absent report is
-    indistinguishable from a check that was never defined."""
+    """Run every check in this module. The orchestrator reaches them only
+    through here, so a check that `check()` never calls is dead code.
+
+    Always emits one report per check. A skip is a report with empty metrics
+    and `meta["skipped"]`, never an omission, because a missing report looks
+    the same as a check that was never defined."""
     ref_bundle = inputs.get("ref_bundle")
 
     if ref_bundle is None:

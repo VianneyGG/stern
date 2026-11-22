@@ -12,7 +12,7 @@ Two artifacts are written to --metadata-dir on every run, pass or fail:
 
 `verified_holdings.json` is written ONLY from a successful scan. It is never
 hand-edited and never inferred from a placement plan -- that inference is
-what produced the stale shard map behind the 2026-08-20 incident.
+what produced a stale shard map in the past.
 
 Cluster/cron usage:
     ~/.local/bin/uv run --no-sync python -m stern.mesh.validate_seeding \
@@ -34,12 +34,12 @@ from stern.mesh.topology import tier_nodes
 from stern.mesh.seed_nodes import MESH_DIR, _VAL_SUBDIR
 
 GOLDEN_HOST = setting("STERN_SOURCE_NODE")
-GOLDEN_DIR = "/Data/voxceleb2_shards_8fps"  # 8fps corpus, default since 2026-09-19
+GOLDEN_DIR = "/Data/voxceleb2_shards_8fps"  # the 8 fps corpus
 DEFAULT_METADATA_DIR = Path.home() / "stern_mesh" / "metadata"
 
-# `-L` follows symlinks: seed_mesh._symlink_source_node links the source
-# node's own shards rather than copying them, so without -L every one of
-# them would report as a wrong-size (symlink-sized) shard.
+# `-L` follows symlinks: seed_nodes._symlink_source_node links the source
+# node's own shards rather than copying them. Without -L every one of them
+# would report as wrong-size (symlink-sized).
 _LIST_CMD = "ls -lL --time-style=+ {d} 2>/dev/null | awk '{{print $5, $NF}}'"
 
 
@@ -206,12 +206,9 @@ def main(argv: list[str] | None = None) -> int:
     all_holdings = json.loads(holdings_path.read_text()) if holdings_path.exists() else {}
     fresh = holdings_from_scan(scan)
     # A node holds one payload, so it belongs to one pool. Drop it from every
-    # other pool's entry: mesh_tick._verified_holdings flattens all pools into
-    # {node: shards} and the last key wins, and keys are written sorted -- so a
-    # node moved from "cars" to an arm-named pool would silently resolve to its
-    # stale "cars" holdings purely because "cars" sorts later. That is the
-    # 2026-08-20 failure mode (attribution disagreeing with reality) with a
-    # different cause.
+    # other pool's entry. mesh_tick._verified_holdings flattens all pools into
+    # {node: shards} and the last key wins. Keys are sorted, so a stale pool
+    # name that sorts later would silently override the fresh entry.
     for pool, held in all_holdings.items():
         if pool == args.pool:
             continue

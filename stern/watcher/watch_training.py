@@ -1,14 +1,10 @@
-"""stern/watcher/watch_training.py
-
-Single cron entrypoint for the SLURM training watcher
-(docs/superpowers/specs/2026-07-15-slurm-training-watcher-design.md), replacing
-the never-installed scripts/cron/poll_squeue.sh + aggregate_results.sh pair.
+"""Single cron entrypoint for the SLURM training watcher.
 
 Every tick: refresh squeue.json (flock-guarded, cheap), then either exit (fast
 path, most ticks) or run a full check (detectors -> remediate/escalate ->
 backoff update -> one log line) once the adaptive backoff timer says it's due.
 
-Install: crontab -e on login-node ->
+Install in the watcher host's crontab:
   * * * * *  cd ~/stern && uv run --no-sync python -m stern.watcher.watch_training
 
 --no-sync is load-bearing, not tidiness: the project venv is on the NFS home
@@ -45,8 +41,8 @@ RESULTS_DIR = REPO_ROOT / "runs" / "results"
 LOG_PATH = STATE_DIR / "watcher.log"
 LOCK_PATH = STATE_DIR / "watch_training.lock"
 HOST_PATH = STATE_DIR / "watcher_host"
-# Short name: systemd/SLURM report login-node, socket.gethostname() reports
-# login-node.polytechnique.fr. The designation file records the short form.
+# Short name: socket.gethostname() can return an FQDN, while the designation
+# file holds the short form.
 HOSTNAME = socket.gethostname().split(".")[0]
 # Applies only to pending/ checkpoints whose run_id is not currently
 # configured -- an active run's own checkpoints are never touched
@@ -90,7 +86,7 @@ def main() -> int:
         fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return (
-            0  # previous tick still running -- skip silently (poll_squeue.sh pattern)
+            0  # previous tick still running -- skip silently
         )
 
     now = time.time()
@@ -190,9 +186,9 @@ def main() -> int:
     # finished (or was dropped from mesh_run_configs.json by hand) still leaves
     # dead worker jobs in jobs_registry.json; scoping the exemption to the live
     # config let those fall through to remediate_dead_job, which hardcodes
-    # train.sbatch and resubmitted 39 junk jobs on 2026-07-27. Those jobs then
-    # queue AHEAD of the mesh worker submissions _replenish_pool needs, so the
-    # leak also stalls recovery of the runs that are still going.
+    # train.sbatch and resubmitted 39 junk jobs. Those jobs then queue AHEAD of
+    # the mesh worker submissions _replenish_pool needs, so the leak also
+    # stalls recovery of the runs that are still going.
     result = run_full_check(
         repo_root=REPO_ROOT,
         state_dir=STATE_DIR,

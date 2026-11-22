@@ -1,14 +1,11 @@
-"""Per-clip VA label loading (docs/superpowers/specs/2026-07-01-training-pipeline-design.md).
+"""Per-frame VA label CSVs, the `ManifestRecord.label_path` contract.
 
-Defines the `ManifestRecord.label_path` CSV contract: two columns
-`valence,arousal`, one row per annotated frame at the dataset's
-`annotation_hz` (matches Aff-Wild2's actual per-frame annotation export --
-no explicit timestamp column, row index implies frame number).
+Each label file has two columns, `valence,arousal`, and one row per annotated
+frame at the dataset's annotation rate. There is no timestamp column: the row
+index is the frame number.
 
-Two readers: `load_per_frame_va` keeps the full per-frame `(F, 2)` trajectory
-(used by the end-to-end trainer, which windows frames and takes a per-window
-mean), while `load_clip_va_label` mean-pools a whole clip to a single
-(valence, arousal) pair (legacy clip-level granularity).
+`load_per_frame_va` keeps the full `(F, 2)` trajectory for the trainer, which
+windows frames. `load_clip_va_label` mean-pools a clip to one pair.
 """
 
 from __future__ import annotations
@@ -24,12 +21,11 @@ from stern.data.harmonise import harmonise_va
 def load_clip_va_label(
     label_path: Path, annotation_hz: float, va_range: tuple[float, float]
 ) -> tuple[float, float]:
-    """Read a per-frame VA CSV, harmonise to [-1, 1], mean-pool to one
-    (valence, arousal) pair for the whole clip.
+    """Read a per-frame VA CSV, harmonise to [-1, 1], and mean-pool to one
+    (valence, arousal) pair for the clip.
 
-    `annotation_hz` is accepted for signature symmetry with
-    `harmonise_rate` but not used yet -- there's no resampling target rate
-    at clip-label granularity, only the mean-pool.
+    `annotation_hz` is unused. It matches `harmonise_rate`'s signature, and
+    clip-level pooling has no resampling target.
     """
     with Path(label_path).open(newline="") as f:
         reader = csv.DictReader(f)
@@ -48,11 +44,10 @@ def load_clip_va_label(
 
 
 def load_per_frame_va(label_path: Path, va_range: tuple[float, float]) -> np.ndarray:
-    """Read a per-frame VA CSV and return an `(F, 2)` array of `[valence,
-    arousal]` harmonised to `[-1, 1]` -- WITHOUT mean-pooling.
+    """Read a per-frame VA CSV as an `(F, 2)` array of `[valence, arousal]`,
+    harmonised to [-1, 1]. Does not mean-pool.
 
-    Used by the end-to-end trainer, which windows frames and takes a per-window
-    mean, so it needs the full per-frame trajectory rather than one clip label.
+    The trainer takes a per-window mean itself, so it needs every frame.
     """
     with Path(label_path).open(newline="") as f:
         reader = csv.DictReader(f)
@@ -68,12 +63,10 @@ def load_per_frame_va(label_path: Path, va_range: tuple[float, float]) -> np.nda
 
 
 def write_label_csv(path: Path, rows: list[tuple[float, float]]) -> None:
-    """Write the `valence,arousal` per-frame CSV this module's readers expect.
+    """Write the `valence,arousal` per-frame CSV that the readers above expect.
 
-    Shared by every dataset ingestion script (build_afewva_manifest.py,
-    build_veatic_manifest.py, ...) so the write side of the contract lives in
-    one place next to the read side, instead of each script re-implementing
-    the same few lines.
+    Every ingestion script in stern/prep uses this, so the write side lives
+    next to the read side.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:

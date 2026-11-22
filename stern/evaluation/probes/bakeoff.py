@@ -1,22 +1,19 @@
-"""AFEW-VA frozen-probe bake-off: one arm's CCC at depth, against random init.
+"""AFEW-VA frozen-probe bake-off: one arm's probe CCC at each depth, against random init.
 
-`diag_probe.probe_by_depth` is the measurement; this is the entry point that
-makes it runnable on the cluster, one arm per invocation, writing a
-`DiagReport` JSON per arm so arms can be launched independently and merged
-afterwards.
+`stern.evaluation.diagnostics.probe.probe_by_depth` does the measurement. This
+is the cluster entry point: one arm per invocation, one `DiagReport` JSON per
+arm, so arms can run as separate jobs and be merged afterwards.
 
-Why probe CCC and not `val_loss` or motion R^2: `val_loss` cannot see the depth
-profile at all (arms differing hugely in profile land within ~0.005 of each
+Probe CCC is used rather than `val_loss` or motion R^2. `val_loss` cannot see
+the depth profile (arms with very different profiles land within ~0.005 of each
 other), and motion R^2 at the final block ties random init. Probe CCC against a
-paired random-init control is the only reading that answers whether a
-checkpoint is worth anything downstream, and at which depth to read it.
+paired random-init control is the reading that shows whether a checkpoint is
+useful downstream, and at which depth to read it.
 
 The model config comes from the run's recorded `experiment` yaml plus its
-recorded `model.*` overrides -- never from the run_id string. A run_id says
-nothing reliable about geometry, and a config that differs from the one the
-checkpoint was trained under either raises on a shape mismatch (depth, widths)
-or, for a parameter-free knob, loads silently wrong and reports a different
-architecture under the run's name.
+recorded `model.*` overrides, never from the run_id string. A run_id does not
+reliably encode geometry. A mismatched config either fails on a shape mismatch
+or, for a parameter-free knob, loads silently and reports the wrong architecture.
 """
 
 from __future__ import annotations
@@ -49,23 +46,21 @@ from stern.evaluation.diagnostics.probe import (
 
 __all__ = ["main", "model_cfg_for_run", "permute_labels", "probe_by_depth"]
 
-# The control arm's own name. `random_init_bundle` leaves `run_id` empty --
-# fine for a control embedded in another arm's report, but this CLI writes one
-# report per arm and an arm with no name cannot be merged with the others.
+# The control arm's name. `random_init_bundle` leaves `run_id` empty, which is
+# fine inside another arm's report. This CLI writes one report per arm, and an
+# unnamed arm cannot be merged with the others.
 RANDOM_INIT_RUN_ID = "random_init"
 
-# The control encoder's init seed. Pinned so that jobs splitting one arm's
-# layers across nodes (`--arm control`) all score against the same random
-# encoder rather than one per job.
+# Pinned so that jobs splitting one arm's layers across nodes (`--arm control`)
+# all score against the same random encoder.
 RANDOM_INIT_SEED = 0
 
 
 def _coerce(raw: str):
     """Parse an override's right-hand side the way Hydra would.
 
-    `model.depth=3` must reach the encoder as an int: `int(cfg.depth)` inside
-    the encoder would hide a string, but `len(encoder.blocks)` comparisons in
-    the readout would not.
+    `model.depth=3` must arrive as an int. An `int()` cast in the encoder would
+    hide a string, but comparisons like `len(encoder.blocks)` would not.
     """
     return OmegaConf.create(f"value: {raw}").value
 
@@ -73,11 +68,10 @@ def _coerce(raw: str):
 def _overlay(cfg: DictConfig, updates: dict, source: str) -> None:
     """Apply `updates` to `cfg`, rejecting any key the base config lacks.
 
-    Fail-closed on purpose. A `model.*` key that exists in a run's recorded
-    overrides but not in `videomae_base.yaml` means the checkpoint was trained
-    under a config this checkout no longer has; if the knob happened to add no
-    parameters, loading proceeds without a shape mismatch and the report
-    describes an architecture that was never trained.
+    Fails closed on purpose. A `model.*` key missing from the base config means
+    the checkpoint was trained under a config this checkout no longer has. If the
+    knob adds no parameters, loading would succeed and the report would describe
+    an architecture that was never trained.
     """
     for key, value in updates.items():
         if key not in cfg:
@@ -92,12 +86,12 @@ def _overlay(cfg: DictConfig, updates: dict, source: str) -> None:
 def model_cfg_for_run(
     base_cfg: DictConfig, entry: dict, experiment_dir: "Path | str"
 ) -> DictConfig:
-    """`base_cfg` plus the geometry `entry`'s run was actually trained under.
+    """`base_cfg` plus the geometry the run in `entry` was trained under.
 
-    `entry` is a `runs/state/mesh_run_configs.json` record: its `experiment`
+    `entry` is a `runs/state/mesh_run_configs.json` record. Its `experiment`
     names the yaml whose `model:` block the launch composed, and its
-    `extra_overrides` carry whatever was passed on top at launch time.
-    Overrides win over the experiment block, matching Hydra's own precedence.
+    `extra_overrides` hold launch-time overrides, which win over the experiment
+    block as in Hydra.
     """
     experiment = entry.get("experiment")
     if not experiment:
@@ -140,10 +134,10 @@ def _arm_bundles(
 ) -> tuple["DiagBundle | None", DiagBundle]:
     """The arm under test and its control.
 
-    For `random_init` the two are the same object, which is what makes that
-    invocation the noise floor: `probe_by_depth` then runs the encoder once and
-    reports a difference that is pure probe-seed spread. `load=False` skips the
-    checkpoint (the `--arm control` job never reads it) and returns None for it.
+    For `random_init` the two are the same object. `probe_by_depth` then reports
+    only probe-seed spread, which makes that run the noise floor. `load=False`
+    skips the checkpoint (the `--arm control` job never reads it) and returns
+    None in its place.
     """
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(RANDOM_INIT_SEED)
@@ -164,10 +158,12 @@ def _single_arm(
     seed_base: int,
     n_seeds: int,
 ) -> dict[int, MetricValue]:
-    """One arm's CCC at each layer, fit-for-fit what `probe_by_depth` computes
-    for that arm (same split, standardisation, and seed base) but without the
-    other arm or the forced final block -- so a LeVJEPA probe, ~16 min per fit,
-    can be split into jobs that each fit a 2h walltime."""
+    """One arm's probe CCC at each layer.
+
+    Matches what `probe_by_depth` computes for that arm (same split,
+    standardisation and seed base), minus the other arm and the forced final
+    block. This lets a slow probe (~16 min per fit) be split into jobs that each
+    fit a 2h walltime."""
     return {
         layer: replicate(
             lambda s, layer=layer: probe_ccc(

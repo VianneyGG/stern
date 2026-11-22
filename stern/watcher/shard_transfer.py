@@ -4,8 +4,8 @@
 survivor that already holds a replica, and drops it otherwise -- correct,
 since a node cannot open a shard it does not have and the P2P fetch path is
 gone. But replication is 1x for 40-68% of the corpus on every tier except
-fish, so "drop it" is the common case: factorial-tube-per_frame lost 46 of
-260 shards (17.7%) that way on 2026-08-21.
+fish, so dropping is the common case. One real run lost 46 of 260 shards
+(17.7%) that way.
 
 The shards were never gone. The excluded nodes stayed up and reachable the
 whole time -- SLURM still called them idle -- they simply could not run a
@@ -43,12 +43,10 @@ def copy_shards(
     The transfer is a target-side PULL -- `ssh dst_node "rsync src_node:... ."`
     -- not `rsync src_node:... dst_node:...`. rsync refuses a command with two
     remote endpoints ("The source and destination cannot both be remote"), so
-    the direct form fails on every call, and because this function never
-    raises it failed silently: 48 of 48 transfers returned [] against the live
-    cluster on 2026-08-22 while the watcher logged nothing. It also keeps the
-    bytes node-to-node over the cluster's internal network instead of routing
-    them through whichever host runs the watcher, matching
-    seed_mesh._execute_rsync_pull.
+    the direct form fails on every call. This function never raises, so that
+    failure was silent: every transfer returned [] with nothing logged. The
+    pull also keeps the bytes node-to-node instead of routing them through the
+    watcher's host.
 
     Shard names go to the remote rsync over stdin via `--files-from=-` rather
     than being interpolated into the command string: the nested
@@ -56,10 +54,9 @@ def copy_shards(
     filenames.
 
     All-or-nothing per call: rsync either reports success for the batch or
-    this returns `[]`. A partial-success report would be worse than useless
-    -- the caller assigns exactly what comes back, and naming a node for a
-    shard that did not arrive is the 2026-08-20 fault, which now raises
-    inside the worker rather than silently skipping.
+    this returns `[]`. A partial-success report would be worse than useless,
+    because the caller assigns exactly what comes back. A worker must never be
+    assigned a shard that did not arrive, and it raises rather than skipping.
 
     Never raises: a transfer failure must leave the pool under-filled, not
     crash the watcher tick. It does report the reason on stderr, which lands
@@ -73,10 +70,9 @@ def copy_shards(
     remote_cmd = (
         f"mkdir -p {quoted_dir} && "
         # -L dereferences: a seeded shard is often a symlink into the source
-        # node's own voxceleb2_shards (seed_mesh._symlink_source_node), and
-        # several nodes had that directory wiped by the 2026-08-17 reboot. Plain
-        # -a would faithfully copy a symlink whose target does not exist on the
-        # destination, so the shard would list as present and fail to open.
+        # node's own shard directory, and a reboot can wipe that target. Plain
+        # -a would copy the dangling link, so the shard would list as present
+        # and fail to open.
         "rsync -aL --partial --files-from=- "
         f"-e {shlex.quote('ssh -o StrictHostKeyChecking=no')} "
         f"{shlex.quote(src_node)}:{quoted_dir}/ {quoted_dir}/"

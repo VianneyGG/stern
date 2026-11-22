@@ -1,8 +1,8 @@
-"""VA range + annotation-rate harmonisation contract (REPO_SETUP.md §4).
+"""VA range and annotation-rate harmonisation.
 
-All datasets must be coerced to [-1, 1] VA range and a single annotation
-rate before any cross-corpus CCC comparison, or the comparison measures
-the harmonisation mismatch rather than domain shift.
+Every dataset is coerced to the [-1, 1] VA range and a single annotation rate
+before any cross-corpus CCC comparison. Otherwise the comparison measures the
+harmonisation mismatch instead of the domain shift.
 """
 
 from __future__ import annotations
@@ -45,7 +45,6 @@ def harmonise_rate(
         )
     source_t = np.arange(n_source) / source_hz
     target_t = np.arange(n_target) / target_hz
-    # target_t can fall slightly outside source_t's range due to n_target
-    # rounding; np.interp clamps such samples to the nearest source endpoint,
-    # which is acceptable for this use case.
+    # Rounding n_target can push the last target_t slightly past source_t's end.
+    # np.interp clamps those samples to the endpoint, which is fine here.
     return np.interp(target_t, source_t, signal)

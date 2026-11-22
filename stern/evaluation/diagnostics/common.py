@@ -1,14 +1,14 @@
 """Shared primitives for the SSL diagnostic checks.
 
-Every diagnostic plan in the series imports this module rather than re-deriving
-checkpoint loading, input sampling, or metric semantics -- the drift that left
-`export_vit_internals.py` with a hand-mirrored `ViTBlock.forward` describing a
-model the repo no longer had.
+Every diagnostic check imports this module rather than re-deriving checkpoint
+loading, input sampling, or metric semantics. A re-derived copy drifts from the
+model it describes, so the residual-stream traversal lives here once, pinned to
+the real forward by a parity test.
 
-The load-bearing idea is that a diagnostic metric is a *distribution*, not a
-number. A single reading cannot support "the model changed": that claim needs a
-replication band, which is why `MetricValue` refuses to exist as a bare float
-and `separated_from` refuses to compare things that have no band.
+The key idea: a diagnostic metric is a *distribution*, not a number. A single
+reading cannot support "the model changed"; that claim needs a replication
+band. `MetricValue` therefore refuses to exist as a bare float, and
+`separated_from` refuses to compare values that have no band.
 """
 
 from __future__ import annotations
@@ -37,11 +37,9 @@ from stern.models.videomae.mae import VideoMAEForPreTraining
 from stern.evaluation.diagnostics.export_vit_internals import load_sample_windows
 from stern.training import checkpoint as ckpt_io
 
-# How many pooled standard deviations two means must differ by before the
-# difference counts as real. 2.0 is roughly a 95% band for a normal difference;
-# it is deliberately a module constant rather than a per-call default scattered
-# across the later plans, so every check tiers its metrics on the same evidence
-# bar and changing the bar is a one-line, reviewable edit.
+# Pooled standard deviations two means must differ by to count as real. 2.0 is
+# roughly a 95% band for a normal difference. It is a module constant so every
+# check tiers its metrics against the same evidence bar.
 DEFAULT_SEPARATION_K = 2.0
 
 
@@ -50,15 +48,13 @@ class MetricValue:
     """One diagnostic metric: either sampled over seeds, or deterministic.
 
     The two kinds are kept apart on purpose. A sampled metric with `n=1` is a
-    latent bug -- it *could* have been resampled and wasn't -- and is not the
-    same thing as a metric with no sampling axis at all (`residual_branch_norm`
-    and `delta_from_init` read weights only, so replication would return the
-    identical number every time). Collapsing them would make `{"sd": null}`
-    ambiguous to every reader of `diagnostics.json`.
+    latent bug: it could have been resampled and wasn't. A deterministic metric
+    (`residual_branch_norm`, `delta_from_init`) reads weights only, so no
+    resampling would change it. Merging the two would make `{"sd": null}`
+    ambiguous in `diagnostics.json`.
 
-    Construct deterministic values via `deterministic_value`; the invariant is
-    enforced here rather than only at the orchestrator boundary, so an invalid
-    metric cannot be built in the first place.
+    Build deterministic values with `deterministic_value`. The invariants are
+    enforced here, so an invalid metric cannot be constructed.
     """
 
     mean: float
@@ -97,12 +93,9 @@ class MetricValue:
     ) -> bool:
         """True when the two means differ by more than `k` pooled sds.
 
-        Raises rather than answering when the question is ill-posed: a
-        deterministic value has no band to pool, and a zero pooled band would
-        make every non-zero difference significant. The latter is the failure
-        mode that matters -- a sampled function that receives distinct seeds but
-        ignores them reports sd=0 across the board, and silently accepting it is
-        exactly how an unreplicated metric earns Tier A.
+        Raises when the comparison is ill-posed. A zero pooled band is the case
+        that matters: a function that ignores its seed reports sd=0, and
+        accepting that would let an unreplicated metric pass as Tier A.
         """
         if self.deterministic or other.deterministic:
             raise ValueError(
@@ -124,14 +117,10 @@ class MetricValue:
 def replicate(fn: Callable[[int], float], n: int = 3, seed: int = 0) -> MetricValue:
     """Sample `fn` over `n` seeds derived from `seed`, as one `MetricValue`.
 
-    Seeds come from a local `Random` so the derivation neither depends on nor
-    disturbs global RNG state, and the same base seed always yields the same
-    sample seeds -- a diagnostic that cannot be re-run to the same numbers
-    cannot be used to argue anything.
-
-    Note the limit of what this can guarantee: distinct seeds are checked here,
-    but a function that *receives* them and ignores them still passes. That
-    residual case surfaces in `separated_from`'s zero-band check.
+    Seeds come from a local `Random`, so global RNG state is neither read nor
+    changed, and the same `seed` always gives the same sample seeds. This does
+    not guarantee `fn` uses them: a function that ignores its seed still passes
+    here, and `separated_from`'s zero-band check is what catches it.
     """
     if n < 3:
         raise ValueError(f"replicate needs n>=3 to give a metric a band, got {n}")
@@ -147,12 +136,10 @@ def replicate(fn: Callable[[int], float], n: int = 3, seed: int = 0) -> MetricVa
     )
 
 
-# The ladder version every DiagReport is stamped with. Tier A/B/C mean what the
-# ladder of that revision made them mean, so a report whose tiers cannot be
-# attributed to a revision cannot be compared with a later one. Bump this
-# whenever LADDER's membership, order, or tier thresholds change, or a scored
-# metric's definition does (2026-10-02.1: label-free metrics clip-pooled;
-# 2026-10-03.1: direction-aware tau, values over three input draws).
+# The ladder version every DiagReport is stamped with. Tier A/B/C only mean
+# something relative to the ladder that produced them, so reports from different
+# revisions are not comparable. Bump this whenever LADDER's membership, order or
+# tier thresholds change, or a scored metric's definition does.
 LADDER_REVISION = "2026-10-03.1"
 
 
@@ -548,23 +535,16 @@ def forward_with_hidden_states(
 ) -> list["torch.Tensor"]:
     """The residual stream before block 0 and after every block: `depth + 1`.
 
-    This is the ONLY place `VideoMAEEncoder.forward`'s traversal is mirrored
-    outside the model, and it is pinned bit-for-bit against the real forward by
-    a parity test -- `export_vit_internals.py`'s hand-mirrored copy of
-    `ViTBlock.forward` drifted from the model it described, and one traversal
-    with a parity test is the fix.
+    This is the only place `VideoMAEEncoder.forward`'s traversal is mirrored
+    outside the model; a parity test pins it bit-for-bit to the real forward.
 
-    The stream is returned RAW: unnormed, registers still attached. That is what
-    distinguishes it from `encoder.forward_tokens(..., return_layers=...)`,
-    which takes pre-embedded tokens plus a `keep_indices` gather (the
-    MAE-pretraining entry point, not raw pixels) and applies `self.norm` plus a
-    register-strip to every intermediate -- destroying exactly the pre-norm
+    The stream is returned raw: unnormed, registers still attached. That differs
+    from `encoder.forward_tokens(..., return_layers=...)`, which applies
+    `self.norm` and strips registers at every layer, destroying the pre-norm
     magnitudes a branch-norm ratio is computed from.
 
-    `no_grad`, deliberately not `inference_mode`: a caller holding `depth + 1`
-    activations should not also hold the graph behind them, but inference-mode
-    tensors can never re-enter autograd, which would break training an
-    attentive probe on these features.
+    Uses `no_grad`, not `inference_mode`: inference tensors can never re-enter
+    autograd, which would break training an attentive probe on these features.
     """
     if is_hf_levjepa(encoder):
         return _hf_levjepa_hidden_states(encoder, pixel_values)
@@ -665,8 +645,8 @@ class LadderResult:
     tau: float
     tier: Tier
     present_rungs: int
-    # Ordered against its declared direction as firmly as Tier B would demand
-    # in the declared one: the declaration, not the checkpoint, is suspect.
+    # The metric ranks the rungs against its declared direction with Tier B
+    # strength, so the declaration is suspect, not the checkpoints.
     inverted: bool = False
 
 
@@ -704,7 +684,7 @@ def _kendall_tau_b(
     is 0.0 -- the metric resolved no ordering at all.
     """
     n = len(values)
-    n0 = n * (n - 1) // 2
+    total_pairs = n * (n - 1) // 2
     concordant = discordant = ties = 0
     for i in range(n):
         for j in range(i + 1, n):
@@ -714,7 +694,7 @@ def _kendall_tau_b(
                 concordant += 1
             else:
                 discordant += 1
-    denominator = math.sqrt(n0 * (n0 - ties))
+    denominator = math.sqrt(total_pairs * (total_pairs - ties))
     if denominator == 0.0:
         return 0.0
     return (concordant - discordant) / denominator
@@ -728,20 +708,15 @@ def ladder_tau(
 ) -> LadderResult:
     """Score a metric's values across ladder rungs, and tier its confidence.
 
-    The tier is conjunctive, not merely rank-based: tau captures order, but Tier
-    A additionally requires every adjacent gap to clear the replication band and
-    Tier B a majority of them. A metric that ranks the ladder perfectly while
-    every gap sits inside sampling noise is Tier C -- correct order on
-    unresolvable differences is not evidence, and accepting it would let noise
-    pass as signal.
+    The tier is conjunctive: tau captures order, but Tier A also requires every
+    adjacent gap to clear the replication band, and Tier B a majority of them.
+    Correct order across unresolvable gaps is noise, so that is Tier C.
 
-    Rungs absent from `values` are simply absent; below four present rungs the
-    result is Tier C regardless, and `present_rungs` records why.
-
-    `direction` is how the metric moves as rungs improve; tau is reported in
-    it, so +1 always means "ranks the ladder correctly". A metric whose every
-    rung is deterministic is capped at Tier B: with no sampling band, any
-    difference counts as separated, so the gap half of Tier A is free.
+    Absent rungs are skipped. Below `MIN_RUNGS_FOR_TIER_AB` present rungs the
+    result is Tier C. `direction` sets the sign: tau is reported so +1 always
+    means "ranks the ladder correctly". A metric whose rungs are all
+    deterministic is capped at Tier B, since with no sampling band every
+    difference counts as separated.
     """
     if direction not in ("rising", "falling"):
         raise ValueError(f"direction must be 'rising' or 'falling', got {direction!r}")
@@ -792,33 +767,19 @@ class RungUnavailable(Exception):
     """
 
 
-# Rung 3's weights. Plan 3 surveyed the published release for a checkpoint
-# matching this repo's ViT-Base geometry (depth=12, embed_dim=768) rather than
-# assuming the first downloaded file (vit_g_hybrid_pt_1200e, ViT-giant,
-# depth=40 -- geometry-incompatible) was the only option. Two ViT-B-geometry
-# candidates exist in OpenGVLab/VideoMAE2's file listing:
-#   mae-b/pytorch_model.bin (691MB) -- adopted below.
-#   distill/vit_b_k710_dl_from_giant.pth (174MB) -- K710-supervised, not chosen.
+# Rung 3's weights: VideoMAEv2's mae-b checkpoint, one of the two ViT-Base
+# geometry files in the published release (the other, a K710-supervised distill,
+# was not chosen).
 #
-# Neither is the bare SSL-pretrain checkpoint the design doc's "public SSL"
-# framing assumed: mae-b carries a `cls_head.fc_cls` (101-way -- UCF101
-# fine-tune), confirmed by inspecting its state_dict, not by its filename.
-# Rung 3 is therefore recorded as a *supervised* public ceiling. The HF repo's
-# file listing was checked and carries no other ViT-B-geometry file.
+# It is a supervised public ceiling, not a bare SSL checkpoint: it carries
+# `cls_head.fc_cls` (101-way, a UCF101 fine-tune). It also has no `pos_embed`,
+# because the original model computes a fixed sin-cos table at forward time. The
+# loader computes that same table (`_public_videomae_sinusoid_pos_embed`) rather
+# than leaving it at random init.
 #
-# mae-b's checkpoint also has no `pos_embed` key at all: the original
-# VideoMAEv2 ViT-Base uses `use_learnable_pos_emb=False`, i.e. a fixed sin-cos
-# table computed at forward time and never saved to state_dict. This repo's
-# `VideoMAEEncoder.pos_embed` is a required learnable parameter, so the loader
-# below computes that same deterministic table
-# (`_public_videomae_sinusoid_pos_embed`, ported from `modeling_finetune.py`'s
-# `get_sinusoid_encoding_table`) rather than leaving it at random init -- a
-# faithful reproduction of what the checkpoint's own model does, not an
-# approximation.
-#
-# Stored on node090's local NVMe (not the shared home -- keeps large weights
-# off the NFS quota); a local path (this constant is NOT one -- see below) or
-# `PUBLIC_VIDEOMAEV2_LOCAL_PATH` must be supplied by the caller/host.
+# The weights live on a node's local disk, not the shared home, to keep large
+# files off the NFS quota. PUBLIC_VIDEOMAEV2_WEIGHTS is a host:path string, so
+# the caller must supply a local path (ckpt_path or PUBLIC_VIDEOMAEV2_LOCAL_PATH).
 PUBLIC_VIDEOMAEV2_WEIGHTS = (
     "node090:/Data/$USER/ladder_weights/mae-b_pytorch_model.bin"
 )
@@ -826,13 +787,10 @@ PUBLIC_VIDEOMAEV2_SOURCE = (
     "https://huggingface.co/OpenGVLab/VideoMAE2/resolve/main/mae-b/pytorch_model.bin"
 )
 
-# Rung -1 (MUTILATION) target: Plan 2's self-test control zeroes this block's
-# residual-branch weight and asserts the check under test actually moves.
-# Block 0 is the target because it is what every later diagnostic reads first
-# (branch-norm ratios, attention entropy) -- a check insensitive to a mutilation
-# this early would be insensitive to everything downstream of it too. Recorded
-# here, not in Plan 2, so the constant is defined once and every check that
-# builds rung -1 mutilates the same block the same way.
+# Rung -1 (MUTILATION) target. The self-test control zeroes this block's
+# residual-branch weight and asserts the check under test moves. Block 0 is the
+# first block every diagnostic reads (branch-norm ratios, attention entropy), so
+# a check blind to a mutilation here is blind to everything downstream too.
 MUTILATION_BLOCK = 0
 # GELUMlp has no `.fc2` attribute -- its down-projection is `net[3]`, a
 # Sequential index, which attrgetter cannot traverse (dotted paths only, no
@@ -841,10 +799,9 @@ MUTILATION_BLOCK = 0
 # not `operator.attrgetter`.
 MUTILATION_TARGET_KEY = f"blocks.{MUTILATION_BLOCK}.mlp.net.3.weight"
 
-# mae-b's block count, pinned to this repo's own ViT-Base depth (both are 12 --
-# verified in task 1.0). _KEY_MAP is built for exactly this many blocks; a
-# checkpoint with a different block count fails the geometry gate in
-# `_load_public_videomaev2_rung` before `_KEY_MAP` is ever consulted.
+# mae-b's block count, pinned to this repo's ViT-Base depth (both 12). _KEY_MAP
+# is built for exactly this many blocks; a checkpoint with a different count
+# fails the geometry gate in `_load_public_videomaev2_rung` before _KEY_MAP is read.
 _PUBLIC_VIDEOMAEV2_DEPTH = 12
 
 
@@ -882,9 +839,9 @@ def _build_public_videomaev2_key_map(depth: int) -> dict[str, str]:
     return key_map
 
 
-# Populated against the real downloaded mae-b/pytorch_model.bin checkpoint
-# (task 1.0-1.5): its `backbone.*`-prefixed keys, post q_bias/v_bias merge,
-# rename 1:1 onto `VideoMAEEncoder.state_dict()`'s keys except the MLP's
+# Matches mae-b/pytorch_model.bin's keys after the backbone. strip and the
+# q_bias/v_bias merge. Those keys rename 1:1 onto
+# `VideoMAEEncoder.state_dict()`'s keys except the MLP's
 # `fc1`/`fc2` (-> `mlp.net.0`/`mlp.net.3`, this repo's `Sequential` indices)
 # and `fc_norm` (-> `norm`, the only normalisation layer this repo's encoder
 # has at that position). Empty for any block count other than 12 -- a rung
@@ -1265,36 +1222,29 @@ def load_ladder_rung(
     return load_bundle(entry, mesh_shared, model_cfg, full_model=full_model)
 
 
-# The rung-2 submission as actually run, not a description of one: these
-# flags are operational and drift, so the next person reproduces the rung by
-# re-running this, not by re-deriving it.
+# Rung 2's submission as actually run. Re-run this to reproduce the rung; the
+# flags are operational and drift.
 #
-# The 50-clip set was carved from the built 8fps corpus rather than encoded
-# fresh -- a straight WebDataset member copy (one `.pickle` per clip) out of
-# /Data/voxceleb2_shards_8fps/shard-000000.tar on `node114`, so rung 2's frames
-# are bit-identical to what every other rung trained on. Re-encoding would
-# have made the rung differ from rung 1 in the data as well as the training,
-# which is exactly the confound the ladder exists to avoid.
+# The 50-clip set is a straight WebDataset member copy from the built 8fps corpus,
+# so rung 2's frames are bit-identical to every other rung's. Re-encoding would
+# change the data as well as the training, which is the confound the ladder
+# exists to avoid.
 #
-# The first build (ssl-diag-overfit50, 2026-09-08, node030, 4 rounds) was not
-# an overfit: a round on 50 clips is ~331 micro-batches, ~5 optimizer steps,
-# so it ended at train loss 0.95 and read as random init on every check. The
-# rebuild runs 300 rounds from rung 1's init seed (train.seed=0), so rungs 0-2
-# share one initialisation. It runs on node114, where the subset lives (node-to-
-# node rsync to node030 is refused since the key-auth change), with
-# MESH_ROOT pointed at the subset. A merge=false run pushes a 183 MB pending
-# file per round and never prunes them -- 300 rounds overran the 30 GB NFS
-# quota once -- so the wrapper keeps only the newest two.
+# An earlier 4-round build was not an overfit: 50 clips is ~5 optimizer steps per
+# round, so it read as random init everywhere. This build runs 300 rounds from
+# rung 1's init seed (train.seed=0), so rungs 0-2 share one initialisation. The
+# subset lives on one node, so the run is pinned there with MESH_ROOT pointed at
+# the subset. A merge=false run pushes a ~183 MB pending file per round and never
+# prunes them, and 300 rounds overran the NFS quota, so the wrapper keeps only the
+# newest two.
 LADDER_RUNG2_ROUTE = {
     "run_id": "ssl-diag-overfit50-v2",
     "node": "node114",
     "slurm_job_id": 1064,
     "submitted_from": "login-node:~/stern-ladder",
     "shard_subset": "node114:/Data/$USER/overfit50_shards (50 train + 10 val clips)",
-    # Per-run files, written by hand: shard_assignments_<run>.json is
-    # {"node114": ["shard-000000.tar"]}; shard_map_<run>.json is the 2026-09-08
-    # map with node030 replaced by node114. The global shard_map.json is shared
-    # by every run and must not be repointed.
+    # Per-run files, written by hand: the run's shard_assignments and shard_map.
+    # The global shard_map.json is shared by every run and must not be repointed.
     "sbatch_cmd": (
         "sbatch rung2_overfit.sbatch  # --nodelist=node114; exports "
         "MESH_SHARD_MAP=$HOME/stern_mesh/metadata/"

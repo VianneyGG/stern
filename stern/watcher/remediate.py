@@ -1,17 +1,13 @@
-"""Auto-resubmit a dead job exactly once (spec §3 Remediator).
+"""Auto-resubmit a dead job exactly once.
 
-Calls `sbatch` directly, mirroring the remote block of submit_to_cluster.sh
-(cluster/submit_to_cluster.sh), pinned to the SAME nodelist the
-dead job used via sbatch's own --nodelist flag. This runs the watcher's
-already-checked-out code on login-node in place, without the rsync/ssh round
-trip submit_to_cluster.sh performs for a developer-laptop -> cluster submission
-(that round trip is unnecessary here, and self-referential/untested when the
-watcher itself runs on login-node).
+Calls `sbatch` directly, mirroring the remote block of
+cluster/submit_to_cluster.sh, pinned to the same nodelist as the dead job via
+sbatch's --nodelist flag. The watcher runs from its checkout on the cluster
+host, so the rsync/ssh hop that submit_to_cluster.sh makes from a laptop is
+skipped.
 
-Deliberately skips submit_to_cluster.sh's remote `uv sync --quiet` step: the
-checkout/venv this watcher runs from lives on the NFS-shared home
-(~/stern), not node-local /Data, so any fish node picks up the same
-already-synced environment without re-syncing per resubmit.
+Also skips the remote `uv sync` step. The checkout and venv live on the
+NFS-shared home (~/stern), so every node sees the same environment.
 """
 
 from __future__ import annotations

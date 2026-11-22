@@ -1,16 +1,14 @@
-"""Reconstruction diagnostics, in z-space only.
+"""Reconstruction diagnostics, computed in z-space only.
 
-Productionised from the scratch scripts on login-node. Two bugs were found in that
-code before it was trusted: a degenerate positional R^2 (769 regressors against
-160 samples, R^2 = 1.000 for every checkpoint) and pixel-space temporal
-contamination. Both produced confident, wrong headline numbers, which is why the
-metrics that decide whether to change mae.py live here with tests and the
-exploratory ones do not.
+Two bugs in the earlier scratch scripts shaped this module. One was a degenerate
+positional R^2 (769 regressors for 160 samples, so R^2 = 1.000 everywhere). The
+other was pixel-space temporal contamination. Both gave confident, wrong
+headline numbers. The metrics that gate changes to mae.py are tested and live
+here.
 
-Everything is measured in z-space. Inverting the z-score with the ground-truth
-per-patch mu/sigma re-injects real structure the model never produced: measured
-that way, a noise-emitting model scored a temporal-variance ratio of 0.538 and a
-correlation of 0.691.
+Do not invert the z-score with the ground-truth per-patch mu/sigma. That
+re-injects structure the model never produced: a noise-emitting model then
+scored a temporal-variance ratio of 0.538 and a correlation of 0.691.
 """
 
 from __future__ import annotations

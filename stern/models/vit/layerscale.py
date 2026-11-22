@@ -1,3 +1,5 @@
+"""LayerScale: per-channel learnable scaling of residual branches (CaiT)."""
+
 from __future__ import annotations
 
 import torch

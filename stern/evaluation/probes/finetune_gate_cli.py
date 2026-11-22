@@ -2,9 +2,9 @@
 the HF LeVJEPA ViT-L ceiling) fine-tuned over the gate's seeds and classified
 against the seeded in-house random_init control.
 
-Reuses diag_finetune_afewva's recipe (finetune_ccc, 1 epoch, lr 1e-5, unbounded
-head, identity-disjoint split), its per-seed fingerprinted arm cache and its
-paired t-interval. Its `gate()` is not used because it gives every arm one
+Reuses finetune_gate's recipe (finetune_ccc, 1 epoch, lr 1e-5, unbounded head,
+identity-disjoint split), its per-seed fingerprinted arm cache and its paired
+t-interval. Its `gate()` is not used because it gives every arm one
 model_cfg, and the HF ceiling needs its own.
 
   --ckpt PATH    a mesh master.pt / snapshot (encoder.* keys, strict load)

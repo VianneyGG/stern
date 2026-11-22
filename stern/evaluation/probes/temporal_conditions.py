@@ -1,16 +1,16 @@
 """Does temporal order carry VA signal at all?
 
-The gate for the whole motion-fix programme. One frozen encoder, one clip set,
-one head architecture, three input conditions: normal, temporally shuffled, and
-frozen-frame. A separate head is trained per condition -- a head trained on
-dynamic features and evaluated on static ones is merely out of distribution.
+One frozen encoder, one clip set, one head architecture, three input conditions:
+normal, temporally shuffled, and frozen-frame. A separate head is trained per
+condition, because a head trained on dynamic features and scored on static ones
+is simply out of distribution.
 
-Shuffled-vs-normal is the load-bearing comparison. Absolute CCC on VEATIC is
-confounded by a large domain gap (VoxCeleb2 talking heads -> Hollywood clips)
-and by the absence of any face-cropping stage, so a low number is
-uninterpretable; the paired comparison controls both internally.
+The shuffled-vs-normal comparison is the one that matters. Absolute CCC on
+VEATIC is confounded by a large domain gap (VoxCeleb2 talking heads to
+Hollywood clips) and by the lack of a face-cropping stage, so a low number alone
+is uninterpretable. The paired comparison controls for both.
 
-Run per (checkpoint, condition) via the training entrypoint, then aggregate:
+Run once per (checkpoint, condition) through the training entrypoint, then aggregate:
 
     ~/.local/bin/uv run --no-sync python -m stern.evaluation.probes.temporal_conditions \\
         --pred-dir runs/results/probe_veatic --out runs/results/probe_gate.json
@@ -35,10 +35,10 @@ def paired_bootstrap_ccc_delta(
     n_resamples: int = 1000,
     seed: int = 0,
 ) -> tuple[float, float, float]:
-    """95% CI on CCC(pred_a) - CCC(pred_b), resampling windows in pairs.
+    """95% CI on CCC(pred_a) - CCC(pred_b), by paired bootstrap over windows.
 
-    Paired because both conditions are scored on the same windows; resampling
-    them independently would inflate the interval.
+    Windows are resampled as pairs, because both conditions are scored on the
+    same windows. Resampling them independently would widen the interval.
     """
     rng = np.random.default_rng(seed)
     n = len(target)
@@ -56,9 +56,12 @@ def paired_bootstrap_ccc_delta(
 
 
 def gate_verdict(lo: float, hi: float) -> str:
-    """open  -> temporal order carries VA signal; the motion work is justified.
-    closed  -> no measurable temporal contribution ON VEATIC. Do not generalise.
-    broken  -> shuffling improved CCC, which cannot happen legitimately."""
+    """Classify a CI on a CCC difference.
+
+    open: temporal order carries VA signal, so the motion work is justified.
+    closed: no measurable temporal contribution on VEATIC. Do not generalise.
+    broken: shuffling raised CCC, which should not happen.
+    """
     if lo > 0.0:
         return "open"
     if hi < 0.0:
@@ -79,9 +82,8 @@ def prediction_path(pred_dir: Path, checkpoint: str, condition: str) -> Path:
 def parse_prediction_path(path: Path) -> tuple[str, str]:
     """Inverse of prediction_path.
 
-    The double underscore is the separator because checkpoint names contain
-    single ones -- splitting `random_init__normal` on '_' would yield
-    ('random', 'init__normal').
+    The separator is a double underscore because checkpoint names contain single
+    ones. Splitting `random_init__normal` on '_' would give ('random', 'init__normal').
     """
     checkpoint, _, condition = path.stem.partition("__")
     if condition not in CONDITIONS:

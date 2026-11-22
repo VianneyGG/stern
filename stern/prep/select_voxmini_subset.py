@@ -23,11 +23,12 @@ from stern.data.manifest import ManifestRecord, write_manifest
 def _safe_probe(
     clip_path: Path, probe_duration_s: Callable[[Path], float]
 ) -> float | None:
-    """Wrap a prober so one corrupt/unreadable file (real occurrence in the
-    VoxCeleb2 corpus -- e.g. `av.error.InvalidDataError` on a truncated mp4)
-    doesn't crash a ~1h, 1.24M-clip run. Skipped clips are excluded from the
-    manifest entirely (an unopenable file is unusable for training either
-    way), not just counted as zero duration."""
+    """Probe one clip, returning None if it is unreadable.
+
+    Corrupt files do occur in VoxCeleb2, for example truncated mp4s. One bad
+    file must not abort a full-corpus run. Skipped clips are dropped from the
+    manifest rather than recorded with zero duration.
+    """
     try:
         return probe_duration_s(clip_path)
     except Exception as exc:
@@ -47,9 +48,8 @@ class Identity:
 
 
 def _probe_duration_av(clip_path: Path) -> float:
-    """Some VoxCeleb2 mp4s have no container-level duration (a handful out of
-    ~1.24M hit this in practice) -- fall back to the video stream's own
-    duration/time_base, then to 0.0 rather than crashing the whole run."""
+    """Duration in seconds. Some mp4s lack a container duration, so fall back to the
+    video stream's duration, then to 0.0."""
     import av
 
     with av.open(str(clip_path)) as container:
@@ -74,11 +74,8 @@ def list_clips(
     `probe_duration_s` defaults to probing the real file via `av`; injectable
     for testing without real video files.
 
-    Probing is I/O-bound (each `av.open` is mostly a disk seek + header read,
-    ~28ms measured on the real corpus) and independent per clip, so it's run
-    across a thread pool -- at VoxCeleb2's full-corpus scale (~1.24M clips)
-    the sequential version takes ~10 hours regardless of `target_hours`
-    (selection only happens after every clip is probed).
+    Probing is I/O-bound and independent per clip, so it runs on a thread pool.
+    Selection happens only after every clip is probed.
     """
     if probe_duration_s is None:
         probe_duration_s = _probe_duration_av
@@ -118,10 +115,8 @@ def load_identities(
     found under `raw_mp4_root`. Identities present on disk but absent from
     `meta_csv` are skipped (no gender to stratify by).
 
-    The official file is tab-delimited with padding whitespace around every
-    header and value (e.g. `"VoxCeleb2 ID "`, `"m "`) despite the `.csv`
-    extension -- not a clean comma-CSV -- so every field is stripped after
-    parsing.
+    The official file is tab-delimited, with padding around headers and values,
+    despite its `.csv` name. Every field is stripped after parsing.
     """
     genders: dict[str, str] = {}
     with meta_csv.open(newline="", encoding="utf-8") as f:

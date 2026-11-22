@@ -1,15 +1,12 @@
-"""Shard-major HTTP streaming for molab notebooks: shards live on login-node,
-this module fetches one at a time, prefetches the next while the current
-one trains, and evicts it before moving on. Deliberately separate from
-stern/data/wds_frames.py's random-access reader and
-ssl_windows.py's globally-shuffled SSLWindowDataset -- that path opens a
-different shard on nearly every __getitem__, which would mean
-re-downloading a multi-GB shard per training sample over login-node's
-4-10MB/s uplink. Shard-major access amortizes one download over every
-window in that shard instead. Mirrors the prefetch/evict pattern in
-stern/data/mesh_shard_dataset.py's MeshShardIterableDataset,
-minus the mesh-specific shard_map/subnet/Holder machinery this
-single-node HTTP case doesn't need.
+"""Shard-major HTTP streaming for single-node runs with no local shard copy.
+
+Shards are fetched one at a time from the shard host. The next one is
+prefetched while the current one trains, then evicted. This is separate from
+the random-access readers in wds_frames.py and SSLWindowDataset: those open a
+different shard on almost every sample, which would re-download multi-GB shards
+over a slow uplink. Here one download serves every window in its shard.
+Mirrors the prefetch/evict pattern of mesh_shard_dataset.py, without the
+mesh placement machinery.
 """
 
 from __future__ import annotations
@@ -44,19 +41,16 @@ def fetch_shard(
     max_retries: int = 3,
     retry_backoff_s: float = 1.0,
 ) -> Path:
-    """Download `shard_name` from `base_url` into `cache_dir` if not
-    already cached, verifying the transfer size against Content-Length
-    when the server provides it. Writes to a process+thread-unique tmp
-    name before an atomic rename, so this is safe to call concurrently
-    for *different* shard names (StreamingShardDataset never calls this
-    for the same shard from two workers at once, since worker shard
-    assignment is disjoint).
+    """Download `shard_name` from `base_url` into `cache_dir`, unless cached.
 
-    Retries transient failures (connection resets, truncated transfers)
-    with linear backoff -- a free `trycloudflare.com` quick tunnel drops
-    connections under sustained large-file transfer load (observed: ~15%
-    of shards failing with 530s / IncompleteRead on a single-attempt
-    fetch), which was silently starving training of most of its data."""
+    The size is checked against Content-Length when the server sends one. The
+    download goes to a per-process, per-thread tmp name and is then renamed
+    atomically. Concurrent calls are safe for different shard names. Workers
+    never share a shard.
+
+    Retries transient failures with linear backoff. Quick tunnels drop
+    connections under sustained large transfers, and a single attempt
+    fails often enough to starve training, so do not drop the retries."""
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     dest = cache_dir / shard_name
@@ -98,10 +92,10 @@ def fetch_shard(
 
 
 class StreamingShardDataset(IterableDataset):
-    """Streams SSL windows from a login-node-hosted shard corpus over HTTP,
-    shard-major, evicting each shard from `cache_dir` once its windows are
-    exhausted. Never holds more than ~2 shards resident (current +
-    prefetching next)."""
+    """Streams SSL windows from an HTTP-hosted shard corpus, shard-major.
+
+    Each shard is evicted from `cache_dir` once its windows are used up. At
+    most two shards are resident: the current one and the prefetched next."""
 
     def __init__(
         self,
@@ -147,7 +141,7 @@ class StreamingShardDataset(IterableDataset):
                     shard_name, base_url=self._base_url, cache_dir=self._cache_dir
                 )
                 result_queue.put((path, None))
-            except Exception as exc:  # noqa: BLE001 -- surfaced to the consumer, not fatal
+            except Exception as exc:  # noqa: BLE001 -- passed to the consumer, not fatal
                 result_queue.put((None, exc))
 
         thread = threading.Thread(target=_run, daemon=True)

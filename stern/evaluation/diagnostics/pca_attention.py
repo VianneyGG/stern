@@ -1,22 +1,17 @@
 """PCA and attention-map visualisation over the recipe2x2 checkpoints.
 
-Follow-up to `diagnose_conditioning.py`'s spectrum-stats finding (activation
-effective rank collapses from block 1 in the "paper" recipe). This script
-makes that finding visible: per-block PCA of token activations (does the
-token cloud collapse toward a line/point as depth increases?) and per-block
-attention maps (do heads stay differentiated or go uniform/degenerate?).
+Visualises the activation-rank collapse that `conditioning.py` measures. Per
+block it shows PCA of token activations (does the token cloud collapse toward a
+line or point with depth?) and attention maps (do heads stay differentiated, or
+go uniform?).
 
-Caveat (same as diagnose_conditioning.py): fixed-seed random input, not real
-video data -- isolates architecture/weight-space collapse, not data-dependent
-collapse.
+Caveat: the input is fixed-seed random noise, not video, so this shows
+weight-space collapse, not data-dependent collapse.
 
-Caveat (mirror drift risk, same class as export_vit_internals -- see
-docs/superpowers/plans -- and the "export_vit_internals mirror drift" note):
-`forward_with_attn` below hand-mirrors `ViTBlock.forward`
-(stern/models/vit/block.py) so it can request `need_weights=True`
-from attention, which `ViTBlock.forward` never does. If block.py's forward
-changes, this mirror will silently drift. Not parity-tested; treat plots as
-approximate if block.py changes after this script was written.
+Caveat (mirror drift): `forward_with_attn` hand-mirrors `ViTBlock.forward`
+(stern/models/vit/block.py) so it can request `need_weights=True`, which the real
+forward never does. It has no parity test. If `ViTBlock.forward` changes, the
+plots become approximate.
 
 Usage:
     PYTHONPATH=. uv run --no-sync python stern/evaluation/diagnostics/pca_attention.py
@@ -48,9 +43,8 @@ VAR_THRESHOLD = 0.90
 
 
 def forward_with_attn(encoder, x: torch.Tensor, keep_indices: torch.Tensor):
-    """Mirrors ViTBlock.forward + VideoMAEEncoder.forward_tokens, but asks
-    attention for weights (need_weights=True), which the real forward path
-    never does. See module docstring's mirror-drift caveat."""
+    """Mirror of ViTBlock.forward and VideoMAEEncoder.forward_tokens that also
+    returns attention weights. See the module docstring's mirror-drift caveat."""
     idx = keep_indices.unsqueeze(-1).expand(-1, -1, x.shape[-1])
     x = torch.gather(x, 1, idx)
     x = encoder.registers.prepend(x)

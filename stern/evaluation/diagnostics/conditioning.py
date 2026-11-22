@@ -1,31 +1,23 @@
-"""One-shot conditioning / rank diagnostic over the recipe2x2 checkpoints.
+"""One-shot conditioning and rank diagnostic over the recipe2x2 checkpoints.
 
-Motivation: the "new recipe" (paper-faithful, stride-1, time_avg) fixed
-positional collapse, but a downstream probe found layers 8-12 go dead anyway
-("depth collapse", invisible in val_loss). Before running the 4-pool E2b
-ablation to test candidate fixes, this script asks a cheaper question first:
-does a direct rank/conditioning read on the checkpoints already on disk show
-*where* collapse sets in, without waiting on new training runs?
+Answers where in depth rank collapse sets in, using only the checkpoints on
+disk: no new training runs. Sits upstream of the E2b pooling ablation.
 
-For each of the four `recipe2x2-{legacy,paper}-{per_frame,time_avg}` master
-checkpoints, per encoder block (1..depth) this reports:
-  - weight singular value spectrum for qkv/proj/fc1/fc2 (condition number,
+For each `recipe2x2-{legacy,paper}-{per_frame,time_avg}` master checkpoint,
+per encoder block this reports:
+  - weight singular value spectrum for qkv/proj (condition number,
     spectral-entropy effective rank)
   - activation effective rank: SVD of the block's token output (register-
-    stripped, post block-norm) on one fixed-seed random input batch,
-    reshaped to (B*N, D)
-  - gradient singular value spectrum for qkv.weight from one MAE-loss
-    backward pass at this checkpoint -- a single snapshot, not a trajectory
-    across training (no intermediate-round checkpoints were pulled for
-    recipe2x2, only the final master.pt per cell)
+    stripped, post block-norm) on one fixed-seed random batch, reshaped to
+    (B*N, D)
+  - gradient spectrum for qkv.weight from one MAE-loss backward pass. This is
+    a single snapshot, not a trajectory: only the final master.pt is kept per
+    cell.
 
-Caveat: input is fixed-seed random noise, not real video data -- no
-manifest/shard path was wired for this script. This isolates
-architecture/weight-space rank collapse; a real-data pass could show
-additional data-dependent collapse not visible here.
+Caveat: the input is fixed-seed random noise, not video, so this isolates
+weight-space rank collapse. Data-dependent collapse needs a real-data pass.
 
-Run on a single GPU node (orchids tier is sufficient -- read-only inference
-plus one backward pass, no training). Usage:
+Needs one GPU node (inference plus one backward pass, no training). Usage:
     PYTHONPATH=. uv run --no-sync python stern/evaluation/diagnostics/conditioning.py
 """
 

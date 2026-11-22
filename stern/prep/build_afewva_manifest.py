@@ -1,33 +1,29 @@
 #!/usr/bin/env python
-"""Build the STERN manifest + per-clip VA label CSVs from an extracted AFEW-VA tree.
+"""Build the manifest and per-clip VA label CSVs from an extracted AFEW-VA tree.
 
-AFEW-VA (ibug, EULA-gated) ships 600 clip folders, each with zero-padded frame
-images and one JSON annotation file mapping every frame to integer valence /
-arousal in [-10, 10] plus 68 landmarks:
+AFEW-VA (ibug, EULA-gated) has one folder per clip. Each folder holds frame
+images and one JSON file with per-frame integer valence and arousal in
+[-10, 10]:
 
     {"actor": "Actor Name", "video_id": "001",
      "frames": {"00000": {"valence": 2, "arousal": -3, "landmarks": [[x, y] * 68]},
                 ...}}
 
-This writes, under `--out-root` (defaults to the AFEW-VA root):
-  labels/<clip>.csv   two columns `valence,arousal`, one row per frame, pre-divided
-                       by 10.0 into [-1,1] (see PROBE_VA_RANGE note below)
-  manifest.csv        one ManifestRecord per clip (role=probe)
+Under `--out-root` this writes:
+  labels/<clip>.csv   `valence,arousal` per frame, divided by 10 into [-1, 1]
+  manifest.csv        one ManifestRecord per clip, role=probe
 
-`diag_probe.py` pins `PROBE_VA_RANGE = (-1.0, 1.0)` with no per-dataset override,
-so labels are written already in [-1,1] here rather than relying on `harmonise_va`
-to rescale from AFEW-VA's native [-10,10] -- `conf/dataset/afewva.yaml` must set
-`va_range: [-1.0, 1.0]` to match (making that harmonise_va call a no-op).
+Labels are already in [-1, 1], so the probe's `va_range` must be [-1, 1]
+(configs/dataset/afewva.yaml). Otherwise harmonise_va would rescale them again.
 
-`identity_id` is the clip's `actor` field when present (enables an actor-disjoint
-fit/scored split), falling back to the clip id otherwise.
+`identity_id` is the clip's `actor` when present, which allows an actor-disjoint
+split. Otherwise it falls back to the clip id.
 
-A clip whose frame count and annotation count disagree is skipped and reported --
-never aligned to the shorter, since `VAWindowDataset` mean-pools labels per window
-and a silent misalignment corrupts CCC for every window in that clip.
+A clip whose frame and annotation counts differ is skipped and reported, never
+aligned to the shorter one. A misaligned label corrupts CCC for every window
+in the clip.
 
-Run as (repo root, `stern.data.manifest` needs the root on PYTHONPATH -- pytest sets
-this via pyproject.toml's `pythonpath`, a bare script invocation does not):
+Run from the repo root. `stern.data.manifest` must be on PYTHONPATH:
     PYTHONPATH=. uv run python stern/prep/build_afewva_manifest.py \\
         --afewva-root $AFEWVA_ROOT
 """
@@ -50,11 +46,9 @@ def parse_clip_annotations(
 ) -> tuple[str | None, list[tuple[float, float]]]:
     """Return `(actor, [(valence, arousal), ...])` in frame order from one clip's JSON.
 
-    Valence/arousal are scaled from AFEW-VA's native [-10, 10] into [-1, 1] (see
-    module docstring). Sorts frame keys numerically when every key is an integer,
-    matching `frame_decoder.list_frame_files`' numeric-sort guard: a plain
-    lexicographic `sorted(frames)` would order unpadded keys as "0","1","10",
-    "11","2",..., silently misaligning every label from frame index 2 onward.
+    Values are scaled from [-10, 10] to [-1, 1]. Frame keys sort numerically when
+    they are all integers, as `list_frame_files` does. A plain string sort would
+    put "10" before "2" and misalign every label after the first ten frames.
     """
     data = json.loads(Path(json_path).read_text())
     frames = data.get("frames")
@@ -79,6 +73,7 @@ def parse_clip_annotations(
 
 
 def build(afewva_root: Path, out_root: Path, *, annotation_hz: float = 30.0) -> Path:
+    """Write label CSVs and `manifest.csv` under `out_root`; return the manifest path."""
     afewva_root = Path(afewva_root)
     out_root = Path(out_root)
     labels_dir = out_root / "labels"

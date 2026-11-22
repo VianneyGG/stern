@@ -1,9 +1,9 @@
-"""Pure rendering: diagnostics.json + plots/ -> one self-contained report.html.
+"""Render diagnostics.json and its plots/ into one self-contained report.html.
 
-No torch, no `_diag_common`, no metric computation: every verdict, bracket and
-tier is precomputed by run_diagnostics.py, so the layout can be iterated on
-against a fixture diagnostics.json (the same split plot_vit_internals.py keeps).
-This module is also the single source of the constants both sides agree on.
+Pure rendering: no torch, no metric computation. Every verdict, bracket and tier
+is precomputed upstream, so the layout can be iterated on against a fixture
+diagnostics.json, as plot_vit_internals does. This module is the single source
+of the constants both sides agree on.
 """
 
 from __future__ import annotations
@@ -67,18 +67,16 @@ PANEL_OF: dict[str, str] = {
 
 
 # (check, metric-name regex, direction): how a metric moves as the rung
-# improves. Per metric, not per check -- one check emits metrics that disagree
-# (labelfree's rankme rises, alpha_req is best near 1). First match
-# wins. A metric no rule matches has no declared direction: tau is read
-# rising, and it is never flagged inverted nor painted red.
-# attention_entropy_by_block is deliberately undeclared: on the 2026-10-03
-# ladder it fell from random init (uniform) to the ceiling, but entropy is not
-# monotone in quality -- full collapse to one token is the low extreme too --
-# so declaring "falling" from that ladder would be circular.
-# branch_norm_ratio's ratios are undeclared for the same reason: declared
-# "falling" (a branch overwriting the stream is the collapse signature), they
-# rose from random init to the ceiling at nearly every block on that ladder --
-# branches start small at init and grow in healthy training too.
+# improves. Per metric, not per check, since one check can emit metrics that
+# disagree (labelfree's rankme rises, alpha_req is best near 1). First match
+# wins. A metric with no matching rule has no declared direction: tau is read
+# as rising, and it is never flagged inverted or painted red.
+# attention_entropy_by_block is deliberately undeclared. Entropy is not
+# monotone in quality, since full collapse to one token is the low extreme too.
+# Declaring "falling" from the observed ladder would be circular.
+# branch_norm_ratio is undeclared for the same reason. Branches start small at
+# init and grow in healthy training, so their ratios rise even when training is
+# fine.
 DIRECTION_RULES: tuple[tuple[str, str, str], ...] = (
     ("residual_branch_norm", r"", "rising"),
     ("delta_from_init", r"", "rising"),
@@ -291,8 +289,8 @@ def _metric_table(reports: list[dict], ladder_tiers: dict) -> str:
 
 
 def _real_vs_random(reports: list[dict]) -> str:
-    """Does the metric respond to data at all -- a separate question from the
-    ladder verdict, so a separate table, never folded into it."""
+    """Does the metric respond to data at all. This is a separate question from
+    the ladder verdict, so it gets its own table."""
     randoms = {
         (e["check"], e["run_id"], e["round"], e["rung"]): e
         for e in reports

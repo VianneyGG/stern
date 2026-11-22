@@ -1,9 +1,8 @@
-"""Raw-frame decoding for the VideoMAE pipeline (no face detection).
+"""Raw-frame decoding for the VideoMAE pipeline.
 
-Per docs/superpowers/specs/2026-07-01-training-pipeline-design.md §4.2: this
-intentionally skips face cropping (a shared face-crop stage was archived in
-SCAFFOLD_ARCHIVE.md, out of scope until a RetinaFace integration is benchmarked)
-and just uniformly samples whole frames from the raw clip.
+There is no face detection or cropping stage. Whole frames are sampled
+uniformly from each clip, which is either a video file or a directory of
+extracted frame images.
 """
 
 from __future__ import annotations
@@ -16,9 +15,9 @@ from PIL import Image
 
 
 def decode_frames(video_path: Path, num_frames: int = 16) -> list[np.ndarray]:
-    """Uniformly sample `num_frames` frames from `video_path`, resized to 224x224.
+    """Uniformly sample `num_frames` frames from a video, resized to 224x224.
 
-    Returns a list of `num_frames` uint8 arrays of shape (224, 224, 3).
+    Returns `num_frames` uint8 arrays of shape (224, 224, 3).
     """
     with av.open(str(video_path)) as container:
         stream = container.streams.video[0]
@@ -37,19 +36,18 @@ def _resize(frame: np.ndarray, size: int) -> np.ndarray:
     return np.array(Image.fromarray(frame).resize((size, size), Image.BILINEAR))
 
 
-# --- Frame-directory decoding (AFEW-VA ships extracted PNG frames, not MP4s) ---
+# --- Frame-directory decoding (AFEW-VA and VEATIC ship extracted frames, not MP4s) ---
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 
 
 def list_frame_files(clip_dir: Path) -> list[Path]:
-    """Frame-ordered image files in `clip_dir`.
+    """Frame image files in `clip_dir`, in temporal order.
 
-    Sorts numerically by filename stem when every stem is an integer (VEATIC's
-    `video_frame.py` writes unpadded `0.jpg, 1.jpg, ..., 10.jpg`, where a plain
-    lexicographic sort would put "10.jpg" before "2.jpg"). Falls back to a
-    lexicographic sort for non-integer stems (e.g. AFEW-VA's zero-padded names,
-    where both orderings agree anyway).
+    Sorts by integer stem when every stem is an integer. VEATIC writes unpadded
+    names (`0.jpg, ..., 10.jpg`), and a lexicographic sort would put "10"
+    before "2". Otherwise sorts by name, which already matches zero-padded
+    names such as AFEW-VA's.
     """
     files = [p for p in Path(clip_dir).iterdir() if p.suffix.lower() in _IMAGE_EXTS]
     if not files:
@@ -74,13 +72,10 @@ def read_frames_at(
 def load_clip_frames(
     clip_path: Path, num_frames: int = 16, size: int = 224
 ) -> list[np.ndarray]:
-    """Uniformly sample `num_frames` frames from `clip_path`, whichever layout
-    it is: a video file (`decode_frames`) or a directory of extracted frame
-    images (`list_frame_files` + `read_frames_at`, AFEW-VA/VEATIC's layout).
+    """Uniformly sample `num_frames` frames from a clip, whatever its layout.
 
-    Dispatches on `clip_path.is_dir()` so `data/loaders.py`'s `load_frames`
-    methods work for both dataset shapes without callers needing to know
-    which one a given dataset uses.
+    A directory means extracted frame images, a file means a video. The
+    dispatch lives here so callers in loaders.py need not know which a dataset uses.
     """
     clip_path = Path(clip_path)
     if clip_path.is_dir():

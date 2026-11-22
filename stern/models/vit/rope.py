@@ -1,3 +1,5 @@
+"""Factorised 3D rotary position embedding (RoPE) for (t, h, w) token grids."""
+
 from __future__ import annotations
 
 import torch

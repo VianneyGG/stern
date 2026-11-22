@@ -1,6 +1,8 @@
-"""Static checks needing no cluster access: is per-node pacing configured,
-is torch.compile on, and is fp16 error-feedback quantization wired on both
-NFS directions (master broadcast, worker pseudo-gradient push)?
+"""Static checks that need no cluster access.
+
+Covers three things: whether per-node pacing is configured, whether
+torch.compile is on, and whether fp16 error-feedback quantization is wired on
+both NFS directions (master broadcast, worker pseudo-gradient push).
 """
 
 from __future__ import annotations

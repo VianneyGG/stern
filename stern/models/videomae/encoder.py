@@ -12,10 +12,10 @@ VideoMAE's encoder:
     -> mean over tokens
   -> (B, embed_dim)
 
-Caveat (plan self-critique #1): a ~86M-param ViT trained from scratch on ~30k
-AFEW-VA frames will overfit badly -- from-scratch video ViTs expect
-Kinetics-scale data. This is an explicit design choice by the user, not an
-oversight; expect a low CCC ceiling until more data (or pretraining) is added.
+Caveat: a ~86M-param ViT trained from scratch on ~30k AFEW-VA frames overfits
+badly, since from-scratch video ViTs expect Kinetics-scale data. Training from
+scratch is a deliberate choice, so expect a low CCC ceiling until more data or
+pretraining is added.
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ class VideoMAEEncoder(nn.Module):
         self.token_grid = (n_tubelets, grid, grid)
         num_tokens = n_tubelets * grid * grid
         self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, self.embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)  #
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
         dropout = float(model_cfg.get("dropout", 0.0))
         drop_path_rate = float(model_cfg.get("drop_path_rate", 0.0))
@@ -108,13 +108,9 @@ class VideoMAEEncoder(nn.Module):
             for i in range(depth)
         )
         self.norm = nn.LayerNorm(self.embed_dim)
-        # Pre-rewrite, attention's in_proj/out_proj weights came from
-        # nn.MultiheadAttention's own default init (xavier_uniform_ on the raw
-        # in_proj_weight Parameter, which self.apply() never reached since it
-        # wasn't wrapped in an nn.Linear). SelfAttention's qkv/proj ARE plain
-        # nn.Linear, so they now get the configured init below. This keeps the
-        # default as trunc_normal(std=0.02) while enabling the paper's
-        # Cutting-the-Skip diagonal-dominant init as an explicit ablation axis.
+        # SelfAttention's qkv/proj are plain nn.Linear, so self.apply() reaches
+        # them. The default stays trunc_normal(std=0.02); Cutting-the-Skip is an
+        # opt-in ablation via weight_init.
         self.apply(self._init_weights)
         self._init_attention_weights()
 

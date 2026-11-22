@@ -58,8 +58,8 @@ def update_rate_ema(
 ) -> float:
     """`alpha * observed + (1 - alpha) * prev`, or `observed` on the first call.
 
-    Throughput here is not stationary -- the fish nodes are shared with other
-    students' jobs and NFS contention moves per-round rates around -- so the
+    Throughput here is not stationary. Nodes are shared with other users' jobs
+    and NFS contention moves per-round rates around, so the
     budget tracks a smoothed rate rather than the last round's, which would
     make step counts oscillate with transient contention.
     """

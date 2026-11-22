@@ -1,9 +1,8 @@
 """Checkpoint save/load with NFS-safe atomic writes and all-time-best guard.
 
-The cluster's shared filesystem (login-node NFS, T1 findings) makes naive
-per-epoch `torch.save` risky on two axes: partial writes if the job is
-killed mid-write, and stalls on rank 0 during a large load. This module
-addresses both:
+The cluster's shared NFS filesystem makes naive per-epoch `torch.save` risky
+on two axes: partial writes if the job is killed mid-write, and stalls on
+rank 0 during a large load. This module addresses both:
 
 - Atomic writes: everything goes through `save()`'s tmp→rename pattern so
   a crash mid-write leaves the previous good file intact.
@@ -13,10 +12,9 @@ addresses both:
   loading the full checkpoint payload every epoch (a 1+ GB NFS read blocks
   rank 0 and can trip the NCCL watchdog).
 
-Load-side mismatch guards (`model_name`, `optimizer_name`) copy the WHN
-pattern: fail closed rather than silently loading state into a differently-
-shaped model. A run that resumes with an incompatible optimizer starts the
-optimizer fresh but keeps the model weights.
+Load-side guards on `model_name` and `optimizer_name` fail closed rather than
+load state into a differently shaped model. A run that resumes with an
+incompatible optimizer starts the optimizer fresh but keeps the model weights.
 """
 
 from __future__ import annotations
@@ -37,12 +35,11 @@ logger = logging.getLogger(__name__)
 
 
 def save(path: Path | str, payload: Mapping[str, Any]) -> None:
-    """Atomic torch.save: write to a `.tmp` sibling then rename.
+    """Atomic torch.save: write to a `.tmp` sibling, then rename over `path`.
 
-    Rename is atomic on POSIX filesystems (including our NFS mount when
-    src and dst are on the same mount, which they are since both are
-    inside the run's checkpoint dir). A SIGKILL between torch.save and
-    rename leaves the previous good file intact, worst case.
+    The rename is atomic only because the tmp file and `path` share a mount,
+    which holds since both sit in the run's checkpoint dir. A kill between
+    the save and the rename leaves the previous file intact.
     """
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -57,13 +54,10 @@ def try_save(
     attempts: int = 3,
     backoff_s: float = 30.0,
 ) -> bool:
-    """Best-effort `save()`: retries on failure, returns False instead of
-    raising once `attempts` is exhausted.
+    """Best-effort `save()`: retry, then return False instead of raising.
 
-    The observed production failure (NFS write errors during finalization)
-    clusters into cluster-wide events lasting minutes, not per-node blips --
-    so a caller that needs to keep training rather than die should get a
-    bool back, not an exception.
+    NFS write errors come in cluster-wide bursts lasting minutes, so the
+    backoff is per-attempt and the caller gets a bool to keep training on.
     """
     for attempt in range(1, attempts + 1):
         try:
@@ -146,12 +140,10 @@ def load(
     state_dict = _strip_orig_mod_prefix(state_dict)
     load_result = raw_model.load_state_dict(state_dict, strict=False)
     if load_result.missing_keys or load_result.unexpected_keys:
-        # strict=False intentionally tolerates key differences (e.g. LoRA vs.
-        # non-LoRA runs sharing most keys) -- but a silent tolerance is
-        # indistinguishable from a real architecture-drift bug (e.g. a block
-        # internals rewrite renaming attention/MLP parameters) without this
-        # log line. Mirrors the equivalent guard in
-        # training/diloco/mesh_round.py's master-checkpoint load.
+        # strict=False tolerates key differences (e.g. LoRA vs. non-LoRA runs),
+        # but without this log line a real architecture drift (renamed block
+        # parameters, say) would load silently. The master-checkpoint load in
+        # stern/training/mesh_round.py has the same guard.
         logger.warning(
             "checkpoint.load: state_dict key mismatch loading %s -- "
             "missing=%s unexpected=%s",
@@ -263,22 +255,18 @@ _LEGACY_MLP = re.compile(r"\.mlp\.(\d+)\.")
 
 
 def remap_legacy_attention_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
-    """Rename pre-ViT-refactor parameter keys onto the current module layout.
+    """Rename pre-ViT-refactor parameter keys to the current module layout.
 
-    The refactor replaced nn.MultiheadAttention with ViTAttention and wrapped
-    the MLP's nn.Sequential in a `net` attribute. Every checkpoint written
-    before it -- including pool-cars-best-120r, the run the motion probes score
-    -- shares only 77 of 205 keys with the current model and would otherwise
-    load as 128 unexpected + 129 missing keys.
+    The refactor replaced nn.MultiheadAttention with ViTAttention and moved the
+    MLP's nn.Sequential under a `net` attribute. Older checkpoints share only
+    part of the key set with the current model and would otherwise load with
+    many missing and unexpected keys.
 
-    This is a pure rename. ViTAttention's (qkv, proj) parameters mirror
-    nn.MultiheadAttention's (in_proj, out_proj) shapes and ordering exactly, so
-    the tensors transfer 1:1 with no reshaping -- the numerical guarantee is
-    test_vit_attention.py's parity test, which copies weights across by these
-    same names.
+    This is a pure rename. ViTAttention's (qkv, proj) tensors have the same
+    shapes and ordering as nn.MultiheadAttention's (in_proj, out_proj), so no
+    reshaping is needed.
 
-    Idempotent, so callers may apply it unconditionally rather than sniffing
-    the checkpoint's vintage.
+    Idempotent, so callers can apply it unconditionally.
     """
     remapped = {}
     for key, value in state_dict.items():
@@ -394,11 +382,9 @@ def load_encoder_state(
 def _remap_payload(payload: dict) -> dict:
     """Apply the legacy key rename to a loaded checkpoint's model weights.
 
-    Both payload shapes in circulation are handled: a dict carrying a
-    "model_state_dict" entry, and a bare state dict -- train.py and
-    dump_probe_predictions.py both fall back to the payload itself via
-    .get("model_state_dict", ckpt). Sibling entries (optimizer state, round,
-    epoch) are left untouched.
+    Handles both payload shapes in circulation: a dict with a
+    "model_state_dict" entry, and a bare state dict. Sibling entries
+    (optimizer state, round, epoch) are left untouched.
     """
     if not isinstance(payload, dict):
         return payload

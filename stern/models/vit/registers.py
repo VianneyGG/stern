@@ -1,3 +1,5 @@
+"""Register tokens: extra attention-only tokens, prepended before the blocks and stripped after."""
+
 from __future__ import annotations
 
 import torch

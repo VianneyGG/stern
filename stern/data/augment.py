@@ -1,9 +1,8 @@
 """Group-consistent spatial augmentation for MAE pretraining windows.
 
-VideoMAE's GroupMultiScaleCrop samples one crop scale + position and one flip
-decision per clip, then applies it identically to every frame. Independent
-per-frame augmentation would inject motion the model didn't actually see,
-corrupting the exact signal masked-reconstruction is meant to learn.
+One crop and one flip are drawn per clip and applied to every frame, as in
+VideoMAE's GroupMultiScaleCrop. Per-frame augmentation would add motion the
+model never sees, which corrupts the signal masked reconstruction learns.
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ class GroupAugmentParams:
 def sample_group_augment(
     image_size: int, rng: random.Random, scales: tuple[float, ...] = _SCALES
 ) -> GroupAugmentParams:
+    """Draw one crop box and flip decision for a whole clip."""
     scale = rng.choice(scales)
     crop_size = max(1, round(image_size * scale))
     max_offset = image_size - crop_size
@@ -40,6 +40,7 @@ def sample_group_augment(
 def apply_group_augment(
     frames: list[np.ndarray], params: GroupAugmentParams, image_size: int
 ) -> list[np.ndarray]:
+    """Crop, resize and optionally flip every frame with the same `params`."""
     out = []
     for frame in frames:
         img = (

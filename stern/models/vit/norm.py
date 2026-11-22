@@ -1,3 +1,5 @@
+"""Normalisation layers for ViT blocks, selected by `norm_type`."""
+
 from __future__ import annotations
 
 import torch

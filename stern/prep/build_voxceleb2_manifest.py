@@ -1,22 +1,17 @@
 #!/usr/bin/env python
-"""Build a STERN manifest covering the ENTIRE VoxCeleb2 corpus under --raw-root,
-with no subset/downsampling.
+"""Build a manifest covering the entire VoxCeleb2 corpus under --raw-root.
 
-Unlike select_voxmini_subset.py (which always culls via
-select_stratified_subset and raises ValueError if --target-hours exceeds the
-real corpus size), this writes every probed clip -- for the decentralized
-mesh plan's "full-corpus manifest" prerequisite
-(docs/superpowers/plans/2026-07-16-decentralized-mesh-training.md).
+Unlike select_voxmini_subset.py, nothing is subsampled. Every probed clip is
+written, which is what the full-corpus mesh run needs.
 
-Reuses select_voxmini_subset.py's list_clips() (walk + threaded duration
-probe, ~28ms/clip via av.open(), parallelized across --probe-workers)
-verbatim -- no second decode/probe path. No vox2_meta.csv join needed: the
-manifest schema doesn't carry gender, only identity_id/clip_path/duration_s.
+It reuses select_voxmini_subset.list_clips() for the walk and the threaded
+duration probe. The manifest schema has no gender field, so no vox2_meta.csv
+join is needed.
 
-Usage:
+Usage (run from the repo root):
     PYTHONPATH=. uv run python stern/prep/build_voxceleb2_manifest.py \\
-        --raw-root /Data/$USER/voxceleb2_raw/dev/dev/mp4 \\
-        --manifest-out /Data/$USER/voxceleb2_raw/dev_manifest.csv
+        --raw-root $DATA_ROOT/voxceleb2_raw/dev/dev/mp4 \\
+        --manifest-out $DATA_ROOT/voxceleb2_raw/dev_manifest.csv
 """
 
 from __future__ import annotations

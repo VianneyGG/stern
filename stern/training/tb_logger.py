@@ -1,11 +1,9 @@
-"""TensorBoard writer + WHN-schema result JSON, as plain functions.
+"""TensorBoard writer and result-JSON output for training runs, as plain functions.
 
 No wrapper class: `make_writer` returns a `SummaryWriter` or `None` (call
-sites guard with `if writer:`), and `write_result_json` is a standalone
-function. Schema parity with the What_Happens_Next repo's result JSONs is
-deliberate: both projects share the same cluster, so cross-project isoFLOP /
-cost-per-sample comparisons stay meaningful even though the JSONs now live
-under this repo's own `runs/results/`, not a shared `.claude/results/` path.
+sites guard with `if writer:`). Result JSONs match the schema of the sibling
+What_Happens_Next project, so cross-project comparisons on the shared cluster
+still line up. The files live under this repo's `runs/results/`.
 """
 
 from __future__ import annotations
@@ -25,11 +23,10 @@ from stern.training.ddp import _get
 
 
 def result_json_filename(experiment_name: str, run_tag: str | None) -> str:
-    """Stable filename for one experiment+run_tag's result JSON.
+    """Stable filename for one experiment and run_tag's result JSON.
 
-    Shared by `write_result_json`'s overwrite path and the watcher's stall
-    detector (stern/watcher/results.py) -- both must agree on this
-    exact name or the watcher will never find a running job's live file.
+    The watcher's stall detector (stern/watcher/results.py) looks up a live
+    run's file by this name, so both sides must use this function.
     """
     suffix = f"-{run_tag}" if run_tag else ""
     return f"{experiment_name}{suffix}.json"
@@ -52,17 +49,15 @@ def write_result_json(
     rank: int = 0,
     overwrite: bool = False,
 ) -> Path | None:
-    """Write one result JSON per run. Call only on rank 0.
+    """Write one result JSON for a run. Call only on rank 0.
 
-    Schema-compatible with WHN's per-run JSONs so `runs/results/` stays
-    cross-project comparable. Merges: caller-provided `metrics`, resolved
-    cfg snapshot, and environment/reproducibility fields.
+    The payload holds the caller's `metrics`, the resolved config, and
+    environment and reproducibility fields.
 
-    `overwrite=True` writes to a stable, timestamp-free filename keyed on
-    experiment+run_tag, so a long run can emit its *current* state every epoch
-    and the aggregator sees exactly one up-to-date row per cell mid-run (the
-    default timestamped form only lands once, at loop exit — useless for a
-    walltime-bounded run that never reaches its epoch horizon).
+    `overwrite=True` writes a stable, timestamp-free filename keyed on
+    experiment and run_tag. A walltime-bounded run can then re-emit its
+    current state every epoch and the aggregator sees one row per cell. The
+    timestamped form only lands at loop exit, which such a run may never reach.
     """
     if rank != 0:
         return None
@@ -117,35 +112,21 @@ def write_mesh_round_scalars(
     *,
     final: bool = False,
 ) -> int:
-    """Replay not-yet-flushed mesh rounds from every node's JSONL onto `writer`.
+    """Replay mesh rounds not yet flushed to `writer`, read from each node's JSONL.
 
-    Nodes are discovered by globbing `mesh_shared/metrics/<run_id>/*.jsonl`
-    (no fixed roster) -- run_outer_step.py's merge only ever sees the
-    contributors of the round it just merged, but a node that missed
-    quorum still has its own JSONL and should still show up here.
+    Nodes are discovered by globbing `mesh_shared/metrics/<run_id>/*.jsonl`.
+    A node that missed quorum still has a JSONL and still shows up here.
+    Records use a 1-based `round`; scalars go at step `round - 1`.
 
-    Each node's `_append_round_metrics` (training/diloco/mesh_round.py)
-    record uses a 1-based `round`; scalars are written at 0-based step
-    `round - 1` to match run_outer_step.py's own `--round`.
+    The newest round seen is held back until the next call, unless
+    `final=True`. A node appends its round-R record only after the merge for
+    round R, so a straggler's record can land after a fast node's. Holding
+    the newest round back gives stragglers one more merge cycle. A round
+    that is flushed is never revisited. This is monitoring only; the JSONL
+    on NFS remains the source of truth.
 
-    The *newest* round observed across all nodes is held back one call,
-    never flushed immediately, unless `final=True`: a worker only appends
-    its JSONL record for round R after the merge for round R has already
-    run (it's blocked in a post-push barrier the merge itself releases),
-    so a fast node's round-R record can land before a straggler's. Holding
-    the newest round back gives every node one more merge cycle (~one
-    round) to catch up before that round's scalars (including the pool
-    mean) are finalized. Once flushed a round is never revisited, so a
-    node that never reports for a round simply isn't counted in that
-    round's pool mean -- this is monitoring, not the source of truth (the
-    JSONL itself, on NFS, is unaffected and still has every record).
-    `final=True` is for a run that just reached DONE: there is no future
-    merge cycle left to wait for, so every remaining round (including the
-    one that would otherwise still be held back) is flushed as-is.
-
-    Returns the highest round number flushed this call, or `last_round`
-    unchanged if nothing new was flushed. The caller persists this as the
-    next call's `last_round`.
+    Returns the highest round flushed, or `last_round` if nothing new was
+    flushed. The caller stores the result as the next `last_round`.
     """
     metrics_dir = mesh_shared / "metrics" / run_id
     per_round: dict[int, dict[str, dict[str, Any]]] = {}
@@ -224,16 +205,12 @@ def write_mesh_round_scalars(
 def flush_final_tb_rounds(tb_dir: Path, mesh_shared: Path, run_id: str) -> None:
     """Best-effort: flush every round still held back once a run reaches DONE.
 
-    write_mesh_round_scalars's straggler holdback (see its docstring) always
-    leaves a run's last round or two unflushed while it's still live -- there
-    is no next merge cycle coming once the run is DONE, so this is the one
-    call site that passes final=True. Mirrors run_outer_step.py's
-    _write_tb_scalars bookkeeping (same tb_last_round.txt convention) but
-    carries no merge-specific scalars, since no merge runs at DONE.
+    Once a run is DONE no merge cycle follows, so this is the only caller that
+    passes `final=True`. It keeps the `tb_last_round.txt` bookkeeping that
+    run_outer_step.py uses, but writes no merge-specific scalars.
 
-    Never raises -- called from the watcher's DONE transition
-    (stern/watcher/mesh_tick.py), where a TB write failure must
-    never block a run from finishing.
+    Never raises. It runs from the watcher's DONE transition
+    (stern/watcher/mesh_tick.py), and a TB write failure must not block the run.
     """
     last_round_path = tb_dir.parent / "tb_last_round.txt"
     try:

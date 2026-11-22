@@ -1,24 +1,20 @@
 #!/usr/bin/env python
-"""Build the STERN manifest + per-clip VA label CSVs from an extracted VEATIC tree.
+"""Build the manifest and per-clip VA label CSVs from an extracted VEATIC tree.
 
-VEATIC (github.com/AlbusPeter/VEATIC) stores ratings as two separate,
-**headerless, 2-column** CSVs per video -- confirmed from the repo's own
-`dataset.py` (`np.loadtxt(path, delimiter=',')[:,1]`), not the README's
-simplified tree:
+VEATIC (github.com/AlbusPeter/VEATIC) stores ratings as two headerless,
+2-column CSVs per video. The README's tree is simplified, so this follows the
+repo's own loader instead:
 
     rating_averaged/${video_id}_valence.csv   # col 0 = frame index, col 1 = valence
     rating_averaged/${video_id}_arousal.csv   # col 0 = frame index, col 1 = arousal
-    frame/${video_id}/${frame_index}.jpg      # unpadded, 0-indexed (video_frame.py)
+    frame/${video_id}/${frame_index}.jpg      # unpadded, 0-indexed
 
-This zips the two rating files (row-for-row -- valence/arousal share the same
-per-frame indexing) into one `valence,arousal` label CSV under `--out-root`,
-matching the `stern/data/labels.py` contract, and writes `manifest.csv`
-(role=probe). `conf/dataset/veatic.yaml` declares `va_range=[-1,1]`; this was
-an educated guess, since confirmed against the real dataset (observed range
-[-0.9146, 0.8893] across all 124 clips).
+The two rating files are zipped row by row into one `valence,arousal` CSV under
+`--out-root`, which matches the stern/data/labels.py contract. The manifest
+rows are role=probe. Labels stay in the native [-1, 1] range, and
+configs/dataset/veatic.yaml must declare the same `va_range`.
 
-Run as (repo root, `stern.data.manifest` needs the root on PYTHONPATH -- pytest sets
-this via pyproject.toml's `pythonpath`, a bare script invocation does not):
+Run from the repo root. `stern.data.manifest` must be on PYTHONPATH:
     PYTHONPATH=. uv run python stern/prep/build_veatic_manifest.py \\
         --veatic-root $VEATIC_ROOT
 """
@@ -36,17 +32,12 @@ from stern.data.frame_decoder import _IMAGE_EXTS
 
 
 def load_video_ratings(ratings_dir: Path, video_id: str) -> list[tuple[float, float]]:
-    """Read `{video_id}_valence.csv` + `{video_id}_arousal.csv` (headerless,
-    2-column: col 0 = frame index, col 1 = value) and zip them into
-    `[(valence, arousal), ...]`.
+    """Read one video's valence and arousal rating files into `[(valence, arousal), ...]`.
 
-    Validates rather than silently tolerating: both files must have the same
-    row count (a length mismatch means one file is corrupt/truncated, not
-    something to silently truncate further), and each file's frame-index
-    column must be the contiguous sequence 0..N-1 (this code assumes dense
-    1:1 frame alignment; an undetected gap would misalign every later label).
-    `np.atleast_2d` guards a single-row CSV, which `np.loadtxt` would
-    otherwise return as a 1D array and crash the `[:, 1]` column slice.
+    Both files must have the same row count, and each frame-index column must be
+    the contiguous sequence 0..N-1. Otherwise a gap would silently misalign every
+    later label. `np.atleast_2d` keeps a single-row file 2-D, so the column slice
+    still works.
     """
     valence_path = ratings_dir / f"{video_id}_valence.csv"
     arousal_path = ratings_dir / f"{video_id}_arousal.csv"
@@ -73,6 +64,7 @@ def load_video_ratings(ratings_dir: Path, video_id: str) -> list[tuple[float, fl
 
 
 def build(veatic_root: Path, out_root: Path, *, annotation_hz: float = 30.0) -> Path:
+    """Write label CSVs and `manifest.csv` under `out_root`; return the manifest path."""
     veatic_root = Path(veatic_root)
     out_root = Path(out_root)
     frame_root = veatic_root / "frame"
@@ -80,7 +72,7 @@ def build(veatic_root: Path, out_root: Path, *, annotation_hz: float = 30.0) -> 
     if not frame_root.is_dir() or not ratings_dir.is_dir():
         raise ValueError(
             f"{veatic_root} must contain 'frame/' and 'rating_averaged/' "
-            "(run scripts/fetch_veatic.py first)"
+            "(run python -m stern.prep.fetch_veatic first)"
         )
 
     labels_dir = out_root / "labels"

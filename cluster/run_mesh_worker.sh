@@ -52,7 +52,7 @@ if [[ ! -f "${MESH_SHARD_MAP}" ]]; then
   exit 1
 fi
 if [[ ! -d "${MESH_ROOT}" ]]; then
-  echo "ERROR: MESH_ROOT=${MESH_ROOT} not found on $(hostname) -- run seed_mesh.py before submitting workers" >&2
+  echo "ERROR: MESH_ROOT=${MESH_ROOT} not found on $(hostname) -- run python -m stern.mesh.seed_nodes before submitting workers" >&2
   exit 1
 fi
 
@@ -65,7 +65,7 @@ for _i in $(seq 1 10); do
   sleep 3
 done
 if [[ ! -f "${_VAL_MANIFEST}" ]]; then
-  echo "ERROR: ${_VAL_MANIFEST} not found on $(hostname) after 30s -- run seed_mesh.py before submitting workers" >&2
+  echo "ERROR: ${_VAL_MANIFEST} not found on $(hostname) after 30s -- run python -m stern.mesh.seed_nodes before submitting workers" >&2
   exit 1
 fi
 

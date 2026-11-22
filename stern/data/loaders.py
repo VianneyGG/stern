@@ -1,12 +1,8 @@
-"""Per-role dataset loaders. ssl / probe / eval NEVER share a loader by
-default. Burning Aff-Wild2's labels on label-free SSL would waste its main
-value -- keeping loaders separate makes that mistake structurally hard to
-make by accident.
+"""Per-role dataset loaders. SSL, probe and eval data never share a loader.
 
-Per docs/superpowers/specs/2026-07-01-training-pipeline-design.md, this
-pipeline has no face-cropping stage (a shared crop/face_pipeline stage was
-archived in SCAFFOLD_ARCHIVE.md, out of scope) -- .load_frames() decodes raw
-whole-frame samples via stern/data/frame_decoder.py instead.
+Keeping them apart stops labelled data from leaking into label-free SSL by
+accident. There is no face-cropping stage: `load_frames` decodes whole frames
+through stern/data/frame_decoder.py.
 """
 
 from __future__ import annotations
@@ -22,11 +18,7 @@ from stern.data.frame_decoder import load_clip_frames
 
 
 class DatasetNotAcquiredError(RuntimeError):
-    """Raised when dataset_cfg.present is False -- data hasn't been acquired yet.
-
-    Distinct from NotImplementedError on .load_frames(): this means "run the
-    acquisition script first," that means "crop pipeline doesn't exist yet."
-    """
+    """Raised when dataset_cfg.present is False: the acquisition script has not run."""
 
 
 @dataclass
@@ -112,13 +104,10 @@ def identity_disjoint_split(
 ) -> tuple[set[str], set[str]]:
     """Partition `records` into (fit_ids, scored_ids) by `identity_id`.
 
-    Derived deterministically from the manifest's identity_ids alone (sorted
-    order) -- never from a seed, so the split is identical across every seed,
-    every layer, and both arms, which is what makes the checkpoint-minus-
-    control difference a paired difference. `train.py:_split_loaders` splits
-    windows (not clips) and seeds from the caller's `seed`; neither property
-    holds here on purpose. Shared by diag_probe and train.py's
-    `train.split=identity`.
+    The split uses only the sorted identity ids, never a seed. Every seed and
+    both arms therefore score the same identities, which keeps a
+    checkpoint-minus-control difference paired. A seeded window-level split
+    does not have this property, on purpose.
     """
     identity_ids = sorted({record.identity_id for record in records})
     n_scored = max(1, round(len(identity_ids) * split_fraction))

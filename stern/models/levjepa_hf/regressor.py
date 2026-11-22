@@ -1,15 +1,14 @@
-"""Released LeVJEPA ViT-L (HuggingFace, `trust_remote_code`) + a linear VA head.
+"""Released LeVJEPA ViT-L (HuggingFace, `trust_remote_code`) with a linear VA head.
 
-Ladder rung 4's supervised encoder: the public `galilai-group/LeVJEPA-VideoMix-
-Large` checkpoint fine-tuned end-to-end on AFEW-VA. It is loaded through
-`transformers` rather than into this repo's ViT because its geometry (24 blocks,
-1024-d, tubelet 1, RoPE, block-causal attention) has no counterpart in
-`models/ViT/` -- see the ssl-diag-03 design.md's rung-4 decision.
+The public `galilai-group/LeVJEPA-VideoMix-Large` checkpoint, fine-tuned end-to-end
+on AFEW-VA. It loads through `transformers` rather than into `stern.models.vit`,
+because its geometry (24 blocks, 1024-d, tubelet 1, RoPE, block-causal attention)
+has no counterpart there.
 
-The head is a plain linear readout of the mean-pooled patch tokens with no
-`tanh`: `LinearVAHead`'s `tanh` saturated within one epoch on the from-scratch
-rung-4 run and zeroed every gradient after it. Outputs are clamped to `[-1, 1]`
-only in eval mode, where no gradient flows.
+The head is a plain linear readout of the mean-pooled patch tokens, with no tanh.
+A tanh head saturated within one epoch in an earlier run and zeroed every gradient
+after that. Outputs are clamped to `[-1, 1]` only in eval mode, where no gradient
+flows.
 """
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+"""Weight initialisation for the ViT, including the Cutting-the-Skip attention init."""
+
 from __future__ import annotations
 
 import math
@@ -117,6 +119,7 @@ def cutting_skip_attention_init(
 
 
 def init_module(module: nn.Module, method: str = "trunc_normal", std: float = 0.02):
+    """Initialise one Linear, LayerNorm or Conv3d in place, using `method`."""
     if isinstance(module, nn.Linear):
         if method == "trunc_normal":
             nn.init.trunc_normal_(module.weight, std=std)

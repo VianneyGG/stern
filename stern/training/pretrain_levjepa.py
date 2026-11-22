@@ -1,7 +1,7 @@
 """Hydra entrypoint: LeVJEPA collapse-free self-supervised video pretraining.
 
-Single-node only (no DDP wrapping) per the design's rollout order -- mesh
-wiring is a separate, later step in training/diloco/mesh_round.py.
+Single-node only, with no DDP wrapping. The DiLoCo mesh path lives in
+stern/training/mesh_round.py.
 """
 
 from __future__ import annotations
@@ -236,8 +236,8 @@ def run_levjepa_pretrain_stage(
     local_rank: int,
     device: torch.device,
 ) -> dict:
-    """LeVJEPA pretraining loop. Mirrors `pretrain.run_pretrain_stage`'s
-    signature and return-dict shape."""
+    """Run the LeVJEPA pretraining loop. Same signature and return shape as
+    `pretrain.run_pretrain_stage`."""
     run_tag = cfg.get("run_tag", None)
     ckpt_name = f"{cfg.experiment.name}/{run_tag}" if run_tag else cfg.experiment.name
     checkpoint_root = Path(cfg.train.checkpoint_root) / ckpt_name
@@ -336,15 +336,10 @@ def run_levjepa_pretrain_stage(
             writer.add_scalar("train/z_locals_norm", z_locals_norm, epoch)
             writer.flush()
 
-        # Step before the checkpoint save (not after, unlike pretrain.py's
-        # ordering): the saved scheduler snapshot must be the one the next
-        # (resumed) epoch should use. Stepping after save leaves the
-        # checkpoint holding the LR this epoch already consumed, so a
-        # resumed run would silently redo one step of warmup/decay instead
-        # of continuing where training left off. This reordering doesn't
-        # change the LR trajectory used for actual training in an
-        # uninterrupted run -- that's driven by the live optimizer object,
-        # not by when we snapshot it for checkpointing.
+        # Step the scheduler before saving, unlike pretrain.py. The checkpoint
+        # must hold the scheduler state the resumed epoch should use. Saving
+        # first would make a resume redo one step of warmup or decay. The live
+        # optimizer drives the uninterrupted LR schedule, so training is unaffected.
         scheduler.step()
 
         if rank == 0:
