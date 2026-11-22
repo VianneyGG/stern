@@ -62,6 +62,11 @@ GATE_HEAD_BOUNDED = False
 # cheaper than the old gate despite the extra seeds.
 GATE_MIN_EPOCHS = 1
 GATE_SEEDS = 10
+# train.seed is applied only by train.run_training, which the gate bypasses, so
+# before 2026-11-01 a "seed" was really the RNG state left by the previous run
+# in the process: parallel seed-subset jobs repeated each other's seeds.
+# Recorded in gate_params so caches from before the fix are never extended.
+GATE_RNG_SEEDED = True
 
 # Arm label -> cache directory name. The checkpoint's key adds its run id.
 _CONTROL_KEY = "random_init"
@@ -69,61 +74,124 @@ _CEILING_KEY = "ceiling_public_videomaev2"
 
 
 def finetune_ccc(
-    encoder, model_cfg, *, manifest_root: Path, min_epochs: int, seed: int
+    encoder,
+    model_cfg,
+    *,
+    manifest_root: Path,
+    min_epochs: int,
+    seed: int,
+    head_lr_mult: float = 1.0,
+    persist_dir: Path | None = None,
 ) -> dict:
     """One end-to-end fine-tune of `encoder` on AFEW-VA, run for exactly
-    `min_epochs` with resume off, scored on the final epoch over the
-    identity-disjoint held-out split.
+    `min_epochs`, scored on the final epoch over the identity-disjoint
+    held-out split.
 
-    `epochs` is the count `run_train_stage`'s loop ran -- never `min_epochs`
-    echoed back, so a shortened run is visible to the gate.
+    `epochs` is the count `run_train_stage`'s loop ran (plus the epochs a
+    resume skipped) -- never `min_epochs` echoed back, so a shortened run is
+    visible to the gate.
+
+    `head_lr_mult != 1` switches to AdamW (weight decay 0, so Adam's update)
+    because only `_build_optimizer`'s AdamW path gives the head its own LR.
+
+    `persist_dir` makes a seed survive a walltime kill: it trains in
+    `<persist_dir>/<encoder fingerprint>/seed<N>/` with resume on, so the next
+    job continues from the last finished epoch. A finished seed's result is
+    kept in `final.json` and its checkpoints are deleted (several GB for the
+    ViT-L). Without it, behaviour is the historical gate's: a temp dir, no
+    resume.
     """
-    manifest_root = Path(manifest_root)
-    with tempfile.TemporaryDirectory() as work:
-        work = Path(work)
-        encoder_path = work / "encoder_init.pt"
-        torch.save(
-            {
-                "model_state_dict": {
-                    f"encoder.{k}": v for k, v in encoder.state_dict().items()
-                }
-            },
-            encoder_path,
-        )
-        with initialize_config_dir(config_dir=str(CONF_DIR), version_base=None):
-            cfg = compose(
-                config_name="config",
-                overrides=[
-                    "experiment=videomae_va_finetune_afewva",
-                    f"train.epochs={min_epochs}",
-                    f"train.seed={seed}",
-                    "++train.split=identity",
-                    f"++train.split_fraction={SPLIT_FRACTION}",
-                    "train.freeze_backbone=false",
-                    "train.resume=false",
-                    "train.save_latest=false",
-                    f"train.learning_rate={GATE_LR}",
-                    f"train.pretrain_encoder_path={encoder_path}",
-                    f"train.checkpoint_root={work / 'ckpt'}",
-                    f"train.results_root={work / 'results'}",
-                    "dataset.present=true",
-                    f"dataset.path={manifest_root}",
-                    f"dataset.manifest_path={manifest_root / 'manifest.csv'}",
-                ],
+    if persist_dir is None:
+        with tempfile.TemporaryDirectory() as work:
+            return _finetune_in(
+                Path(work), encoder, model_cfg, manifest_root=manifest_root,
+                min_epochs=min_epochs, seed=seed, head_lr_mult=head_lr_mult,
+                resume=False,
             )
-        with open_dict(cfg):
-            cfg.model = OmegaConf.create(OmegaConf.to_container(model_cfg))
-            cfg.model.head_bounded = GATE_HEAD_BOUNDED
-        result = train_mod.run_train_stage(
-            cfg, rank=0, world_size=1, local_rank=0, device=_resolve_device()
+    work = Path(persist_dir) / encoder_fingerprint(encoder)[:16] / f"seed{seed}"
+    done = work / "final.json"
+    if done.exists():
+        return json.loads(done.read_text())
+    work.mkdir(parents=True, exist_ok=True)
+    result = _finetune_in(
+        work, encoder, model_cfg, manifest_root=manifest_root,
+        min_epochs=min_epochs, seed=seed, head_lr_mult=head_lr_mult, resume=True,
+    )
+    _write_atomic(done, result)
+    for name in ("latest.pt", "best.pt"):
+        (work / "ckpt" / name).unlink(missing_ok=True)
+    return result
+
+
+def _finetune_in(
+    work: Path,
+    encoder,
+    model_cfg,
+    *,
+    manifest_root: Path,
+    min_epochs: int,
+    seed: int,
+    head_lr_mult: float,
+    resume: bool,
+) -> dict:
+    head_overrides = (
+        []
+        if head_lr_mult == 1.0
+        else [
+            "++train.optimizer=adamw",
+            "++train.weight_decay=0.0",
+            f"++train.head_lr_mult={head_lr_mult}",
+        ]
+    )
+    manifest_root = Path(manifest_root)
+    encoder_path = work / "encoder_init.pt"
+    torch.save(
+        {"model_state_dict": {f"encoder.{k}": v for k, v in encoder.state_dict().items()}},
+        encoder_path,
+    )
+    flag = "true" if resume else "false"
+    with initialize_config_dir(config_dir=str(CONF_DIR), version_base=None):
+        cfg = compose(
+            config_name="config",
+            overrides=[
+                "experiment=videomae_va_finetune_afewva",
+                f"train.epochs={min_epochs}",
+                f"train.seed={seed}",
+                "++train.split=identity",
+                f"++train.split_fraction={SPLIT_FRACTION}",
+                "train.freeze_backbone=false",
+                f"train.resume={flag}",
+                f"train.save_latest={flag}",
+                f"train.learning_rate={GATE_LR}",
+                f"train.pretrain_encoder_path={encoder_path}",
+                f"train.checkpoint_root={work / 'ckpt'}",
+                f"train.results_root={work / 'results'}",
+                "dataset.present=true",
+                f"dataset.path={manifest_root}",
+                f"dataset.manifest_path={manifest_root / 'manifest.csv'}",
+                *head_overrides,
+            ],
         )
+    with open_dict(cfg):
+        cfg.model = OmegaConf.create(OmegaConf.to_container(model_cfg))
+        cfg.model.head_bounded = GATE_HEAD_BOUNDED
+    torch.manual_seed(seed)
+    result = train_mod.run_train_stage(
+        cfg, rank=0, world_size=1, local_rank=0, device=_resolve_device()
+    )
 
     final = result["final"]
+    if not final:
+        raise RuntimeError(
+            f"gate: {work} resumed with every epoch already done but no final "
+            "metrics (killed between the last epoch and final.json); delete its "
+            "ckpt/latest.pt to rerun the last epoch"
+        )
     return {
         "ccc_valence": float(final["val_ccc_v"]),
         "ccc_arousal": float(final["val_ccc_a"]),
         "mean_ccc": float(final["mean_ccc"]),
-        "epochs": int(result["epochs_run"]),
+        "epochs": int(result.get("start_epoch", 0)) + int(result["epochs_run"]),
     }
 
 
@@ -184,16 +252,29 @@ def _write_atomic(path: Path, payload: dict) -> None:
 
 
 def _run_arm(
-    key: str, encoder, *, cache_dir: Path, n_seeds: int, finetune, **kwargs
+    key: str,
+    encoder,
+    *,
+    cache_dir: Path,
+    n_seeds: int,
+    finetune,
+    seed_subset: list[int] | None = None,
+    **kwargs,
 ) -> list[dict]:
     """One arm's per-seed results, from the cache where the weights match and
     from `finetune` otherwise. Each result is written as soon as it returns,
-    so a walltime kill loses at most the fine-tune in flight."""
+    so a walltime kill loses at most the fine-tune in flight.
+
+    `seed_subset` runs only those seeds (parallel jobs filling one cache); a
+    later call without it reads them all back."""
+    seeds = range(n_seeds) if seed_subset is None else seed_subset
+    if any(not 0 <= s < n_seeds for s in seeds):
+        raise ValueError(f"gate: seed_subset {list(seeds)} outside range({n_seeds})")
     fingerprint = encoder_fingerprint(encoder)
     arm_dir = cache_dir / key
     arm_dir.mkdir(parents=True, exist_ok=True)
     results = []
-    for seed in range(n_seeds):
+    for seed in seeds:
         path = arm_dir / f"seed{seed}.json"
         cached = json.loads(path.read_text()) if path.exists() else None
         if cached is None or cached["fingerprint"] != fingerprint:
@@ -253,6 +334,7 @@ def gate(
             "split_fraction": SPLIT_FRACTION,
             "lr": GATE_LR,
             "head_bounded": GATE_HEAD_BOUNDED,
+            "rng_seeded": GATE_RNG_SEEDED,
         },
     )
     arms = [

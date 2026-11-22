@@ -96,6 +96,73 @@ def test_finetune_ccc_composes_the_gate_recipe(tmp_path, monkeypatch):
         assert torch.equal(loaded["model_state_dict"][f"encoder.{k}"], v)
 
 
+class _BackboneAndHead(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = torch.nn.Linear(4, 4)
+        self.head = torch.nn.Linear(4, 2)
+
+
+def _lrs_from_composed_train_cfg(cfg) -> dict[str, float]:
+    """The LRs the real optimizer builder assigns under the composed recipe."""
+    model = _BackboneAndHead()
+    opt, _ = train_mod._build_optimizer(model, cfg.train)
+    lr_of = {id(p): g["lr"] for g in opt.param_groups for p in g["params"]}
+    return {
+        "backbone": lr_of[id(model.backbone.weight)],
+        "head": lr_of[id(model.head.weight)],
+    }
+
+
+def test_finetune_ccc_head_lr_mult_reaches_the_optimizer(tmp_path, monkeypatch):
+    seen = _spy_train_stage(monkeypatch, _RETURNED)
+    gate_mod.finetune_ccc(
+        _encoder(), _tiny_model_cfg(), manifest_root=tmp_path, min_epochs=2, seed=0,
+        head_lr_mult=100.0,
+    )
+    ((cfg, _, _),) = seen
+    lrs = _lrs_from_composed_train_cfg(cfg)
+    assert lrs["backbone"] == pytest.approx(gate_mod.GATE_LR)
+    assert lrs["head"] == pytest.approx(100.0 * gate_mod.GATE_LR)
+    assert float(cfg.train.weight_decay) == 0.0
+
+
+def test_finetune_ccc_default_keeps_one_lr_for_every_param(tmp_path, monkeypatch):
+    seen = _spy_train_stage(monkeypatch, _RETURNED)
+    gate_mod.finetune_ccc(
+        _encoder(), _tiny_model_cfg(), manifest_root=tmp_path, min_epochs=2, seed=0
+    )
+    ((cfg, _, _),) = seen
+    lrs = _lrs_from_composed_train_cfg(cfg)
+    assert lrs["backbone"] == lrs["head"] == pytest.approx(gate_mod.GATE_LR)
+
+
+def test_run_arm_seed_subsets_fill_one_cache_that_a_full_call_reads_back(tmp_path):
+    calls: list[int] = []
+
+    def fake(encoder, *, seed, min_epochs, **_):
+        calls.append(seed)
+        return {"mean_ccc": float(seed), "epochs": min_epochs}
+
+    kw = dict(cache_dir=tmp_path, n_seeds=5, finetune=fake, min_epochs=1)
+    enc = _encoder()
+    part = gate_mod._run_arm("arm", enc, seed_subset=[1, 3], **kw)
+    assert calls == [1, 3]
+    assert [r["mean_ccc"] for r in part] == [1.0, 3.0]
+
+    full = gate_mod._run_arm("arm", enc, **kw)
+    assert calls == [1, 3, 0, 2, 4]  # cached seeds are not recomputed
+    assert [r["mean_ccc"] for r in full] == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+def test_run_arm_rejects_a_seed_outside_the_gate(tmp_path):
+    with pytest.raises(ValueError, match="outside"):
+        gate_mod._run_arm(
+            "arm", _encoder(), cache_dir=tmp_path, n_seeds=3, finetune=None,
+            min_epochs=1, seed_subset=[3],
+        )
+
+
 def test_finetune_ccc_reports_the_loops_epoch_count_not_its_argument(
     tmp_path, monkeypatch
 ):
@@ -166,6 +233,84 @@ def test_finetune_ccc_end_to_end_on_a_tiny_encoder(tmp_path):
     assert np.isfinite(result["ccc_valence"]) and np.isfinite(result["ccc_arousal"])
 
 
+def test_finetune_ccc_seeds_the_rng_from_its_seed_not_the_callers_state(
+    tmp_path, monkeypatch
+):
+    """train.seed is only applied by run_training, which the gate bypasses:
+    the training RNG must depend on `seed` alone, or parallel seed-subset jobs
+    replay each other's runs."""
+    draws: list = []
+
+    def _spy(cfg, **_):
+        draws.append(torch.rand(4))
+        return _RETURNED
+
+    monkeypatch.setattr(train_mod, "run_train_stage", _spy)
+    for burn, seed in [(0, 3), (99, 3), (0, 4)]:
+        encoder = _encoder()  # reseeds the global RNG, as gate_cli's does
+        torch.rand(burn)  # the state an earlier run in the job leaves behind
+        gate_mod.finetune_ccc(
+            encoder, _tiny_model_cfg(), manifest_root=tmp_path, min_epochs=1, seed=seed
+        )
+
+    assert torch.equal(draws[0], draws[1])
+    assert not torch.equal(draws[0], draws[2])
+
+
+class _Killed(Exception):
+    pass
+
+
+def test_finetune_ccc_persist_dir_resumes_after_a_kill_and_keeps_the_result(
+    tmp_path, monkeypatch
+):
+    """A job killed during epoch 3 of 3 must resume at epoch 3 in the next job
+    (not restart), score the full run, and leave no multi-GB checkpoints."""
+    from video_encoding.scripts.build_afewva_manifest import build
+    from video_encoding.tests.test_train_stage import _write_clip
+
+    data = tmp_path / "data"
+    rng = np.random.default_rng(0)
+    for i in range(10):
+        _write_clip(data / f"{i:03d}", 24, rng, actor=f"actor{i // 2}")
+    build(data, data)
+    model_cfg = _tiny_model_cfg(embed_dim=24)
+    torch.manual_seed(0)
+    encoder = VideoMAEEncoder(model_cfg)
+    persist = tmp_path / "persist"
+    kw = dict(manifest_root=data, min_epochs=3, seed=0, persist_dir=persist)
+
+    real_train_epoch = train_mod._train_epoch
+    epochs_started: list[int] = []
+
+    def kill_on_third(*a, **k):
+        epochs_started.append(1)
+        if len(epochs_started) == 3:
+            raise _Killed
+        return real_train_epoch(*a, **k)
+
+    monkeypatch.setattr(train_mod, "_train_epoch", kill_on_third)
+    with pytest.raises(_Killed):
+        gate_mod.finetune_ccc(encoder, model_cfg, **kw)
+
+    epochs_started.clear()
+    monkeypatch.setattr(train_mod, "_train_epoch", lambda *a, **k: (
+        epochs_started.append(1), real_train_epoch(*a, **k))[1])
+    result = gate_mod.finetune_ccc(encoder, model_cfg, **kw)
+
+    assert len(epochs_started) == 1  # resumed at epoch 3, did not restart
+    assert result["epochs"] == 3
+    assert np.isfinite(result["mean_ccc"])
+    (seed_dir,) = persist.glob("*/seed0")
+    assert json.loads((seed_dir / "final.json").read_text()) == result
+    assert not (seed_dir / "ckpt" / "latest.pt").exists()
+    assert not (seed_dir / "ckpt" / "best.pt").exists()
+
+    # A finished seed is read back, never retrained.
+    monkeypatch.setattr(train_mod, "_train_epoch", lambda *a, **k: pytest.fail("retrained"))
+    assert gate_mod.finetune_ccc(encoder, model_cfg, **kw) == result
+
+
 # --- classify ------------------------------------------------------------------
 
 
@@ -228,7 +373,10 @@ class _FakeFinetune:
         self.calls: list[tuple[str, int]] = []
         self.kwargs: list[dict] = []
 
-    def __call__(self, encoder, model_cfg, *, manifest_root, min_epochs, seed):
+    def __call__(
+        self, encoder, model_cfg, *, manifest_root, min_epochs, seed, head_lr_mult=1.0,
+        persist_dir=None,
+    ):
         arm = self.arm_of[id(encoder)]
         self.calls.append((arm, seed))
         self.kwargs.append(

@@ -257,7 +257,13 @@ def run_train_stage(
         write_result_json(
             result, cfg, results_root=cfg.train.results_root, overwrite=True
         )
-    return {"stage": "train", **result, "final": final, "epochs_run": epochs_run}
+    return {
+        "stage": "train",
+        **result,
+        "final": final,
+        "epochs_run": epochs_run,
+        "start_epoch": start_epoch,
+    }
 
 
 def _build_optimizer(model, train_cfg) -> tuple[torch.optim.Optimizer, str]:

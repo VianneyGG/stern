@@ -95,6 +95,14 @@ class VideoMAEVARegressor(nn.Module):
             num_heads=12,
             bounded=bool(model_cfg.get("head_bounded", True)),
         )
+        # Optional per-channel standardisation of the tokens the head reads. In
+        # LeVJEPA lean ~99% of every token's squared norm is one shared vector,
+        # which flattens the head's attention scores.
+        self.token_norm = (
+            nn.BatchNorm1d(self._embed_dim)
+            if bool(model_cfg.get("head_token_norm", False))
+            else None
+        )
 
     def freeze_backbone(self) -> None:
         """Freeze the pretrained encoder while leaving the cross-attention VA head trainable."""
@@ -135,4 +143,6 @@ class VideoMAEVARegressor(nn.Module):
                 f"backbone feature dim {tokens.shape[-1]} != configured "
                 f"model.embed_dim {self._embed_dim}"
             )
+        if self.token_norm is not None:
+            tokens = self.token_norm(tokens.transpose(1, 2)).transpose(1, 2)
         return self.head(tokens)
