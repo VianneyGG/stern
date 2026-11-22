@@ -68,7 +68,7 @@ Two unrelated architectures, selected via `override /model: <name>`:
   (`LeVJEPAEncoder` + SIGReg/invariance losses, `stern/models/
   levjepa/`), not a delta on `videomae_base`. Selected, as its
   `levjepa_lean` variant, by `configs/experiment/levjepa_mesh_ssl.yaml`; its own `encoder:
-  levjepa` field is what `training/diloco/mesh_round.py`'s
+  levjepa` field is what `stern/training/mesh_round.py`'s
   `_build_pretrain_model` dispatches on for mesh runs.
 
 | Field | Default | Purpose |

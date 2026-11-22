@@ -17,8 +17,8 @@
   <div id="answer">
     <h4>What worked</h4>
     <ul>
-      <li><b>The cause was found and removed.</b> DiLoCo's default outer step multiplies each update by up to 7. At 7× the residual-stream norm reaches 370 to 460 and a motion readout falls below its random-initialisation level. At 1× the norm stays near 90 and the readout stays at that level.</li>
-      <li><b>Encoders trained with the corrected setting are useful downstream.</b> On a frozen probe for valence and arousal, the from-scratch ViT-B reads 0.189 against 0.066 for a random initialisation; two public pretrained models read 0.200 and 0.209 on the same probe. A smaller from-scratch encoder, fine-tuned, beats a random initialisation by +0.031 (95% interval +0.005 to +0.057).</li>
+      <li><b>The cause was found and removed.</b> DiLoCo's default outer step multiplies each update by up to 7. At 7× the residual-stream norm reaches 370 to 460 and a motion readout falls below its random-initialisation level. At 1× the norm stays near 90 and the readout stays near its random-initialisation level. That readout splits by token; a stricter one, split by clip, puts every DiLoCo setting below random initialisation (appendix B).</li>
+      <li><b>Encoders trained with the corrected setting carry signal downstream.</b> On a frozen probe for valence and arousal, the from-scratch ViT-B reads 0.189 against 0.066 for a random initialisation; two public pretrained models read 0.200 and 0.209 on the same probe. A smaller from-scratch encoder, fine-tuned, beats a random initialisation by +0.031 (95% interval +0.005 to +0.057) at round 48; by round 78 the difference is no longer resolved.</li>
       <li><b>Continued pretraining improves a released model.</b> Fine-tuned CCC goes from 0.287 to 0.331 over 30 seeds; 29 of the 30 improve.</li>
       <li><b>The training system.</b> Decentralized training on a pool of 113 single-GPU workstations, with a watcher that keeps runs alive and keeps them off the machines during class hours.</li>
     </ul>
@@ -28,7 +28,7 @@
       <li>Fine-tuned, the from-scratch encoder is far from the released model: +0.03 over a random initialisation against about +0.26.</li>
     </ul>
   </div>
-  <p class="byline">Solo project, summer 2026 internship. Every number on this page is read from the result tables in <code>docs/data/</code>; the notebook <code>notebooks/stern_overview.ipynb</code> rebuilds them into the figures. One figure plays as you scroll through it; the others are still.</p>
+  <p class="byline">Solo project, summer 2026 internship. The figures on this page are drawn from the result tables in <code>docs/data/</code>; the notebook <code>notebooks/stern_overview.ipynb</code> rebuilds them into the figures. One figure plays as you scroll through it; the others are still.</p>
 </header>
 
 <h2 id="diloco"><span class="n">1 · DiLoCo</span>Training on machines that talk once per round</h2>
@@ -78,7 +78,7 @@ w ← w − outer_lr · (g + momentum · b)</div>
 <div class="callout good"><h4>Reading</h4><p>Plain AdamW at 7× is affected more than DiLoCo at 7×. So the outer momentum is not what does it: the size of the update is. The validation loss cannot show it: across all these settings it stays between 0.513 and 0.548.</p></div>
 
 <h2 id="fix"><span class="n">4 · The correction</span>Training at 1×, and what the encoders are worth</h2>
-<p>Every later run keeps the effective multiplier at 1×. Two downstream checks were run on encoders trained that way. Both use AFEW-VA (600 clips, 240 actors) and the concordance correlation coefficient (CCC) on held-out actors: 1 is perfect agreement with the human annotation of valence and arousal, 0 is none.</p>
+<p>Two downstream checks were run on encoders trained at an effective multiplier of 1×. Both use AFEW-VA (600 clips, 240 actors) and the concordance correlation coefficient (CCC) on held-out actors: 1 is perfect agreement with the human annotation of valence and arousal, 0 is none.</p>
 <h3 id="probe">Frozen features</h3>
 <p class="why"><b>Why this figure.</b> It asks whether the encoder's features carry valence and arousal without any fine-tuning: the encoder is frozen and a small attentive probe is trained on its layer-6 tokens.</p>
 <figure><canvas data-scene="ladder" style="--ar:16/5;--arn:10/11"></canvas>
@@ -87,7 +87,7 @@ w ← w − outer_lr · (g + momentum · b)</div>
 <h3 id="gate">Fine-tuned, against a random initialisation</h3>
 <p class="why"><b>Why this figure.</b> Fine-tuning is the stricter test, because a random initialisation also learns when fine-tuned. The encoder and a random initialisation are fine-tuned with the same 10 seeds, and the paired difference is reported with a 95% interval.</p>
 <figure><canvas data-scene="gate" style="--ar:16/5.4;--arn:10/9"></canvas>
-<figcaption><b>Fine-tuned CCC minus random init, by training round.</b> A smaller encoder (depth 7, about 34M parameters, LeVJEPA objective) on 14 machines, DiLoCo at 0.1 / 0.9, which is 1×. <span class="legend"><span><i style="background:var(--s-blue)"></i>after the seeding fix, with 95% interval</span><span><i style="background:var(--s-grey)"></i>before the fix, no interval shown</span></span></figcaption></figure>
+<figcaption><b>Fine-tuned CCC minus random init, by training round.</b> A smaller encoder (depth 7, LeVJEPA objective) on 14 machines, DiLoCo at 0.1 / 0.9, which is 1×. <span class="legend"><span><i style="background:var(--s-blue)"></i>after the seeding fix, with 95% interval</span><span><i style="background:var(--s-grey)"></i>before the fix, no interval shown</span></span></figcaption></figure>
 <p>At round 48 the encoder reaches a CCC of 0.089 against 0.058 for a random initialisation: +0.031, interval +0.005 to +0.057. At round 78 the difference is +0.011 and the interval includes zero. Earlier snapshots are shown without intervals because of a seeding bug fixed on 2026-11-01 (<a href="#system-detail">appendix D</a>). For scale, the released ViT-L scores about +0.26 on this test. It is one training run.</p>
 
 <h2 id="open"><span class="n">5 · Still open</span>The deep blocks</h2>
@@ -115,7 +115,7 @@ w ← w − outer_lr · (g + momentum · b)</div>
 <h2 id="limits"><span class="n">8 · Limits</span>What these results do not cover</h2>
 <ul class="plain">
 <li>Sections 2 and 3 and appendices A and B rest on 20-round, single-machine encoders, mostly one seed per setting. The dose-response was pre-registered as a rank test (Spearman at most −0.8, p &lt; 0.05). Four doses survive for the stricter readout, too few for that threshold: the test gives ρ = −0.80, p = 0.17.</li>
-<li>The frozen probe of section 4 is three seeds on one layer. The ViT-B encoders have not been through the paired fine-tuning test.</li>
+<li>The frozen probe of section 4 is three seeds on one layer. The ViT-B encoders have been through only an earlier 3-seed version of the paired fine-tuning test, which was inconclusive: −0.056 against −0.030 for random initialisation, 95% interval −0.277 to +0.225.</li>
 <li>The fine-tuning result of section 4 is one training run, and the difference is no longer resolved at round 78.</li>
 <li>All downstream numbers are on AFEW-VA.</li>
 </ul>
@@ -137,7 +137,7 @@ w ← w − outer_lr · (g + momentum · b)</div>
 <p>With the pooled batch the rank reaches 10.4 and speaker identity 0.21, on both seeds, against 2.7 and 0.168 at a random initialisation. The rank fix alone did not improve valence and arousal: fine-tuned, these encoders scored about 0.03 below a random initialisation (measured before the seeding fix).</p>
 <h3 id="throughput">D · The system in more detail</h3>
 <figure><canvas data-scene="throughput" style="--ar:16/5.4;--arn:10/9"></canvas>
-<figcaption><b>Why not synchronous training.</b> Total throughput when machines exchange gradients at every step. At batch 4, one machine alone processes 24.0 samples per second and eight together 11.1.</figcaption></figure>
+<figcaption><b>Why not synchronous training.</b> Total throughput when machines exchange gradients at every step. At batch 4, one machine alone processes 24.0 samples per second and eight together 11.1. Exchanging only every eight steps (gradient accumulation) reaches 60.8 samples per second, 2.5 times one machine, at an effective batch of 256: the cost is the exchange, which DiLoCo cuts further.</figcaption></figure>
 <div id="system-detail"></div>
 <ul class="plain">
 <li><b>One round.</b> Assign shards (each held by exactly one machine), run local steps, wait for a quorum or a grace deadline, merge (drop stale and non-finite updates, weighted average, Nesterov outer step), sync the new master. The quorum shrinks for missing machines, never below 60% of the pool.</li>

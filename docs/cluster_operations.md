@@ -17,7 +17,8 @@ checkout on the shared home directory.
 
 ## Launching a mesh pool
 
-Run on the login node. Roster: `stern/mesh/tiers.tsv` (113 nodes).
+Run on the login node. Roster: `cluster/tiers.tsv` (113 nodes; not
+committed, copy `cluster/tiers.example.tsv` and fill in the host names).
 
 ```bash
 cd $REPO
@@ -67,7 +68,7 @@ enforced in code. Do not work around it.
 python3 stern/watcher/class_hours.py   # exit 0 allowed, 1 refused, reason on stderr
 ```
 
-To gate hand-typed submissions, link the shim as `sbatch`, `srun` and `salloc` in
+To gate hand-typed submissions, link the shim (`cluster/slurm_class_hours_shim.sh`) as `sbatch`, `srun` and `salloc` in
 `$HOME/.local/bin`, which must precede `/usr/bin` on PATH. The shim passes `srun`
 and `salloc` through inside an allocation. Job scripts call `class_hours.py` themselves.
 
@@ -96,7 +97,7 @@ rsync -a <results-host>:$DATA_ROOT/stern_mesh_results/<run_id>/master.pt ./<run_
 ```
 
 Never run `rsync --delete` against the repo: it wiped `runs/state` and
-`slurm/logs` once. `.rsync-exclude` protects both.
+`cluster/slurm/logs` once. `.rsync-exclude` protects both.
 
 ## Exporting ViT-internals plots
 
@@ -133,7 +134,7 @@ recreates state for any config that lacks it.
 
 - **Stale sync flag.** Flags were keyed by run id and round only, so a reused id
   let workers see an old flag and skip the merged checkpoint. Fixed:
-  `_clean_stale_run_artifacts` (`watcher/mesh_tick.py`) clears them, with a
+  `_clean_stale_run_artifacts` (`stern/watcher/mesh_tick.py`) clears them, with a
   digit-only glob so `pool-fish` cannot delete `pool-fish-5r`'s.
 - **Merge crash loop.** A merge killed at 300 s, after its writes finished, left
   every retry seeing deltas from an already-applied round. Fixed on 2026-08-28: a

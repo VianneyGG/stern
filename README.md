@@ -8,8 +8,8 @@ Solo project, summer 2026 internship. The same story as a page, with a figure th
 
 ## What worked
 
-- **The cause was found and removed.** DiLoCo's default outer step multiplies each update by up to 7. At 7x the residual-stream norm reaches 370 to 460 and a motion readout falls below its random-initialisation level. At 1x the norm stays near 90 and the readout stays at that level.
-- **Encoders trained with the corrected setting are useful downstream.** On a frozen probe for valence and arousal, the from-scratch ViT-B reads 0.189 against 0.066 for a random initialisation; two public pretrained models read 0.200 and 0.209 on the same probe. A smaller from-scratch encoder, fine-tuned, beats a random initialisation by +0.031 (95% interval +0.005 to +0.057).
+- **The cause was found and removed.** DiLoCo's default outer step multiplies each update by up to 7. At 7x the residual-stream norm reaches 370 to 460 and a motion readout falls below its random-initialisation level. At 1x the norm stays near 90 and the readout stays near its random-initialisation level. That readout splits by token; a stricter one, split by clip, puts every DiLoCo setting below random initialisation (appendix B).
+- **Encoders trained with the corrected setting carry signal downstream.** On a frozen probe for valence and arousal, the from-scratch ViT-B reads 0.189 against 0.066 for a random initialisation; two public pretrained models read 0.200 and 0.209 on the same probe. A smaller from-scratch encoder, fine-tuned, beats a random initialisation by +0.031 (95% interval +0.005 to +0.057) at round 48; by round 78 the difference is no longer resolved.
 - **Continued pretraining improves a released model.** Fine-tuned CCC goes from 0.287 to 0.331 over 30 seeds; 29 of the 30 improve.
 - **The training system.** Decentralized training on a pool of 113 single-GPU workstations, with a watcher that keeps runs alive and keeps them off the machines during class hours.
 
@@ -92,7 +92,7 @@ Plain AdamW at seven times the learning rate is affected more than DiLoCo at 7x,
 
 ## 4. The correction, and what it bought
 
-Every later run keeps the effective multiplier at 1x. Two downstream checks were run on encoders trained that way. Both use AFEW-VA (600 clips, 240 actors) and the concordance correlation coefficient (CCC) on held-out actors: 1 is perfect agreement with the human annotation, 0 is none.
+Two downstream checks were run on encoders trained at an effective multiplier of 1x. Both use AFEW-VA (600 clips, 240 actors) and the concordance correlation coefficient (CCC) on held-out actors: 1 is perfect agreement with the human annotation, 0 is none.
 
 ### Frozen features
 
@@ -101,7 +101,7 @@ The encoder is frozen and a small attentive probe is trained on its layer-6 toke
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/probe_ladder_dark.svg">
-    <img src="assets/probe_ladder.svg" alt="Frozen-probe CCC on AFEW-VA at layer 6. From-scratch ViT-B on 9 machines at 1x: 0.189 against 0.066 for its random-init control. An earlier superseded short run: 0.095 against 0.090. Public ViT-B with supervised weights: 0.200 against 0.097. Released LeVJEPA ViT-L: 0.209 against 0.070." width="760">
+    <img src="assets/probe_ladder.svg" alt="Frozen-probe CCC on AFEW-VA at layer 6. From-scratch ViT-B on 9 machines at 1x: 0.189 against 0.066 for its random-init control. An earlier superseded short run: 0.095 against 0.090. Public ViT-B fine-tuned on UCF101: 0.200 against 0.097. Released LeVJEPA ViT-L: 0.209 against 0.070." width="760">
   </picture>
 </p>
 
@@ -109,12 +109,12 @@ The from-scratch ViT-B, trained for 60 rounds on 9 machines at 1x, reads 0.189 a
 
 ### Fine-tuned, against a random initialisation
 
-A paired test, called the gate: fine-tune the encoder and a random initialisation with the same 10 seeds, and report the paired difference in CCC with a 95% interval. The run is on 14 machines, with DiLoCo at outer learning rate 0.1 and momentum 0.9, an effective multiplier of 1x. The model is a smaller encoder (depth 7, about 34M parameters) trained with the LeVJEPA objective.
+A paired test, called the gate: fine-tune the encoder and a random initialisation with the same 10 seeds, and report the paired difference in CCC with a 95% interval. The run is on 14 machines, with DiLoCo at outer learning rate 0.1 and momentum 0.9, an effective multiplier of 1x. The model is a smaller encoder (depth 7) trained with the LeVJEPA objective.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/gate_curve_dark.svg">
-    <img src="assets/gate_curve.svg" alt="Fine-tuned CCC minus random init against training round. After the seeding fix: +0.031 with interval +0.005 to +0.057 at round 48, +0.011 with interval −0.026 to +0.048 at round 78. Earlier snapshots, without intervals, rise from 0 to about +0.04 between rounds 18 and 48." width="760">
+    <img src="assets/gate_curve.svg" alt="Fine-tuned CCC minus random init against training round. After the seeding fix: +0.031 with interval +0.005 to +0.057 at round 48, +0.011 with interval −0.026 to +0.048 at round 78. Earlier snapshots, without intervals, rise from 0 at round 1 to about +0.04 at round 18 and stay there until round 48." width="760">
   </picture>
 </p>
 
@@ -148,7 +148,7 @@ The pool is 113 single-GPU workstations in five hardware tiers, joined by 1 GbE 
 ## 8. Limits
 
 - Sections 2 and 3 and appendices A and B rest on 20-round, single-machine encoders, mostly one seed per setting. The dose-response was pre-registered as a rank test (Spearman at most −0.8, p < 0.05). Four doses survive for the stricter readout, too few for that threshold: the test gives ρ = −0.80, p = 0.17.
-- The frozen probe of section 4 is three seeds on one layer. The ViT-B encoders have not been through the gate.
+- The frozen probe of section 4 is three seeds on one layer. The ViT-B encoders have been through only an earlier 3-seed version of the gate, which was inconclusive: −0.056 against −0.030 for random initialisation, 95% interval −0.277 to +0.225.
 - The gate result of section 4 is one training run, and the difference is no longer resolved at round 78.
 - All downstream numbers are on AFEW-VA.
 
@@ -258,7 +258,7 @@ Synchronous multi-node training, measured before choosing DiLoCo:
   </picture>
 </p>
 
-At batch 4, eight machines exchanging gradients every step process 11.1 samples/s; one machine alone processes 24.0. So each worker is one GPU process with no `torch.distributed`: it trains locally on the shards it holds and pushes a checkpoint once per round.
+At batch 4, eight machines exchanging gradients every step process 11.1 samples/s; one machine alone processes 24.0. Exchanging only every eight steps (gradient accumulation) reaches 60.8 samples/s, 2.5 times one machine, at an effective batch of 256: the cost is the exchange, which DiLoCo cuts further. So each worker is one GPU process with no `torch.distributed`: it trains locally on the shards it holds and pushes a checkpoint once per round.
 
 ```mermaid
 flowchart LR

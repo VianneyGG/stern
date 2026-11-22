@@ -135,7 +135,7 @@ function drawCause(ctx, u, W, H, th) {
 /* ---------- 4. the correction ---------- */
 const whisk = (ctx, P, v, sd, y, color, w = 2) => seg2(ctx, P.X(v - sd), y, P.X(v + sd), y, color, w);
 function drawLadder(ctx, u, W, H, th) {
-  const narrow = isNarrow(W), lw = narrow ? 14 : 250, NAME = { 1: ["From scratch: ViT-B, 9 machines at 1×", "this project"], 2: ["From scratch: an earlier short run", "this project, superseded"], 3: ["Public ViT-B, supervised weights", "reference"], 4: ["Released LeVJEPA ViT-L", "reference"] };
+  const narrow = isNarrow(W), lw = narrow ? 14 : 250, NAME = { 1: ["From scratch: ViT-B, 9 machines at 1×", "this project"], 2: ["From scratch: an earlier short run", "this project, superseded"], 3: ["Public ViT-B, UCF101 fine-tune", "reference"], 4: ["Released LeVJEPA ViT-L", "reference"] };
   const c = { x: lw, y: 30, w: W - lw - 60, h: H - 30 - 46 }, P = new Plot(ctx, { ...c, xr: [0, .27], yr: [0, 1] }), rows = D.ladder, rh = c.h / rows.length;
   P.grid({ xt: [0, .05, .1, .15, .2, .25], xf: v => v.toFixed(2), xlabel: "frozen-probe CCC on AFEW-VA (dot: mean of 3 seeds, bar: ± 1 SD)" });
   [0, .05, .1, .15, .2, .25].forEach(v => seg2(ctx, P.X(v), c.y, P.X(v), c.y + c.h, th.grid));

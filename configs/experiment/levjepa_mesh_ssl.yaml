@@ -5,7 +5,7 @@ defaults:
 
 experiment:
   name: levjepa_mesh_ssl
-  description: "Decentralized mesh SIGReg SSL pretraining for LeVJEPA -- consumes MESH_* env vars, bypasses cfg.dataset entirely (see training/diloco/mesh_round.py)."
+  description: "Decentralized mesh SIGReg SSL pretraining for LeVJEPA -- consumes MESH_* env vars, bypasses cfg.dataset entirely (see stern/training/mesh_round.py)."
   stage: pretrain
 
 mesh:

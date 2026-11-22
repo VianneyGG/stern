@@ -11,7 +11,7 @@ mtime-relative-to-round-start filter passes it through no matter which
 round it actually belongs to. Only the round the worker was actually
 training for -- carried in the filename -- resolves that ambiguity.
 
-Both `training/diloco/mesh_round.py` (the writer, via `pending_filename`)
+Both `stern/training/mesh_round.py` (the writer, via `pending_filename`)
 and every reader import this instead of building/parsing the pattern by
 hand, so the format can't drift between them.
 """
