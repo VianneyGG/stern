@@ -7,13 +7,17 @@ import pytest
 from stern.training.mesh_round import chunk_stop_round
 
 
-def test_no_chunking_runs_the_whole_run_in_one_job():
-    # The default for every run registered before the 2h cap existed.
-    assert chunk_stop_round(rounds=40, start_round=0, chunk_rounds=None) == 40
-
-
-def test_a_mid_run_relaunch_without_chunking_still_finishes_the_run():
-    assert chunk_stop_round(rounds=40, start_round=17, chunk_rounds=None) == 40
+@pytest.mark.parametrize(
+    "start_round",
+    [
+        # The default for every run registered before the 2h cap existed.
+        pytest.param(0, id="fresh_run"),
+        pytest.param(17, id="mid_run_relaunch"),
+    ],
+)
+def test_no_chunking_runs_the_rest_of_the_run_in_one_job(start_round):
+    stop = chunk_stop_round(rounds=40, start_round=start_round, chunk_rounds=None)
+    assert stop == 40
 
 
 def test_first_chunk_stops_at_the_chunk_length():

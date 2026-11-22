@@ -256,6 +256,11 @@ def test_main_sweeps_orphaned_pending_checkpoints_each_tick(tmp_path, monkeypatc
     monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
 
     state_dir.mkdir(parents=True)
+    # Full check not due until 2100: the tick takes the fast path, so the
+    # per-tick sweep/NaN code is what runs and what the test observes.
+    (state_dir / "watcher_state.json").write_text(
+        json.dumps({"next_full_check_at": 4102444800.0})
+    )
     (state_dir / "mesh_run_configs.json").write_text(
         json.dumps(
             [
@@ -286,12 +291,13 @@ def test_main_sweeps_orphaned_pending_checkpoints_each_tick(tmp_path, monkeypatc
         patch(
             "stern.watcher.watch_training.run_full_check",
             return_value=TickResult(num_flags=0, actions=[], action_taken=False),
-        ),
+        ) as mock_full_check,
     ):
         rc = watch_mod.main()
 
     assert rc == 0
     mock_sweep.assert_called_once()
+    mock_full_check.assert_not_called()
     assert mock_sweep.call_args.args[0] == mesh_shared / "checkpoints" / "pending"
     assert mock_sweep.call_args.args[1] == {"RUN1"}
     log_text = (state_dir / "watcher.log").read_text()
@@ -321,6 +327,11 @@ def test_main_detects_and_remediates_nan_nodes_each_tick(tmp_path, monkeypatch):
     monkeypatch.setenv("NAN_REMEDIATION_DRY_RUN", "false")
 
     state_dir.mkdir(parents=True)
+    # Full check not due until 2100: the tick takes the fast path, so the
+    # per-tick sweep/NaN code is what runs and what the test observes.
+    (state_dir / "watcher_state.json").write_text(
+        json.dumps({"next_full_check_at": 4102444800.0})
+    )
     (state_dir / "mesh_run_configs.json").write_text(
         json.dumps(
             [
@@ -362,11 +373,12 @@ def test_main_detects_and_remediates_nan_nodes_each_tick(tmp_path, monkeypatch):
         patch(
             "stern.watcher.watch_training.run_full_check",
             return_value=TickResult(num_flags=0, actions=[], action_taken=False),
-        ),
+        ) as mock_full_check,
     ):
         rc = watch_mod.main()
 
     assert rc == 0
+    mock_full_check.assert_not_called()
     mock_detect.assert_called_once()
     assert mock_detect.call_args.args[0] == "RUN1"
     mock_remediate.assert_called_once()

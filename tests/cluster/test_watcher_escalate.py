@@ -72,7 +72,7 @@ def test_record_escalation_increments_budget_and_sets_last_escalation_at():
     assert state.jobs["36901"].status == "escalated"
 
 
-def test_record_escalation_rolls_over_on_new_day():
+def test_record_escalation_starts_a_new_count_on_a_new_day():
     state = WatcherState(escalation_day="2026-07-14", escalation_count_today=5)
     with patch("stern.watcher.escalate._today_utc", return_value="2026-07-15"):
         record_escalation(state, "36901", now=0.0)

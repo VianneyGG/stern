@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from stern.evaluation.throughput_audit.watcher_log import (
     detect_watcher_gaps,
     parse_merge_event,
@@ -7,36 +9,43 @@ from stern.evaluation.throughput_audit.watcher_log import (
 )
 
 
-def test_parse_merge_event_full_checkin():
-    line = (
-        "2026-08-05T14:30:00+00:00 mesh: sw2-birds-lr070m080: "
-        "AWAITING_CHECKPOINTS -> MERGING (16 nodes)"
-    )
-    event = parse_merge_event(line)
-    assert event == {
-        "timestamp": datetime(2026, 8, 5, 14, 30, 0, tzinfo=timezone.utc),
-        "run_id": "sw2-birds-lr070m080",
-        "kind": "full",
-    }
-
-
-def test_parse_merge_event_quorum():
-    line = (
-        "2026-08-05T14:31:00+00:00 mesh: sw3-birds-quorum12: "
-        "AWAITING_CHECKPOINTS -> MERGING (quorum 12/16 reached, 12 nodes)"
-    )
-    event = parse_merge_event(line)
-    assert event["kind"] == "quorum"
-    assert event["run_id"] == "sw3-birds-quorum12"
-
-
-def test_parse_merge_event_timeout():
-    line = (
-        "2026-08-05T14:32:00+00:00 mesh: sw2-fish-lr090m090: "
-        "AWAITING_CHECKPOINTS -> MERGING (timeout, missing ['node009', 'node011'])"
-    )
-    event = parse_merge_event(line)
-    assert event["kind"] == "timeout"
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        pytest.param(
+            "2026-08-05T14:30:00+00:00 mesh: sw2-birds-lr070m080: "
+            "AWAITING_CHECKPOINTS -> MERGING (16 nodes)",
+            {
+                "timestamp": datetime(2026, 8, 5, 14, 30, 0, tzinfo=timezone.utc),
+                "run_id": "sw2-birds-lr070m080",
+                "kind": "full",
+            },
+            id="full-checkin",
+        ),
+        pytest.param(
+            "2026-08-05T14:31:00+00:00 mesh: sw3-birds-quorum12: "
+            "AWAITING_CHECKPOINTS -> MERGING (quorum 12/16 reached, 12 nodes)",
+            {
+                "timestamp": datetime(2026, 8, 5, 14, 31, 0, tzinfo=timezone.utc),
+                "run_id": "sw3-birds-quorum12",
+                "kind": "quorum",
+            },
+            id="quorum",
+        ),
+        pytest.param(
+            "2026-08-05T14:32:00+00:00 mesh: sw2-fish-lr090m090: "
+            "AWAITING_CHECKPOINTS -> MERGING (timeout, missing ['node009', 'node011'])",
+            {
+                "timestamp": datetime(2026, 8, 5, 14, 32, 0, tzinfo=timezone.utc),
+                "run_id": "sw2-fish-lr090m090",
+                "kind": "timeout",
+            },
+            id="timeout",
+        ),
+    ],
+)
+def test_parse_merge_event_extracts_time_run_and_kind(line, expected):
+    assert parse_merge_event(line) == expected
 
 
 def test_parse_merge_event_ignores_unrelated_lines():

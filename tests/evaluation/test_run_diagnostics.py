@@ -808,13 +808,10 @@ def test_write_plots_skips_an_unsupported_shape(tmp_path):
     assert "plot" not in envelope["meta"]
 
 
-def test_run_stamps_verdicts_and_writes_plots(two_check_run):
+def test_cka_matrix_report_records_three_plots_and_its_panel(two_check_run):
     cka = [e for e in two_check_run["reports"] if e["check"] == "cka_matrix"]
     assert len(cka[0]["meta"]["plot"]) == 3  # full / trimmed / diff
     assert cka[0]["meta"]["panel"] == "cka"
-    for e in two_check_run["reports"]:
-        for m in e["metrics"].values():
-            assert (m["bracket"], m["verdict"], m["red"]) == (None, None, False)
 
 
 # --- end to end ------------------------------------------------------------

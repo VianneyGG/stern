@@ -1092,7 +1092,10 @@ _HF_SNAPSHOT = Path(
 )
 _needs_hf = pytest.mark.skipif(
     not (_HF_SNAPSHOT / "modeling_levjepa.py").exists(),
-    reason=f"no LeVJEPA HF snapshot at {_HF_SNAPSHOT}",
+    reason=(
+        f"missing {_HF_SNAPSHOT / 'modeling_levjepa.py'} "
+        "(set LEVJEPA_HF_PATH to the released snapshot dir)"
+    ),
 )
 
 

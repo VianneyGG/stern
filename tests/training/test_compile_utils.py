@@ -6,6 +6,7 @@ cost for a single nn.Linear on this environment), no GPU needed.
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
@@ -38,15 +39,16 @@ def _tiny_model_cfg() -> DictConfig:
     )
 
 
-def test_maybe_compile_noop_when_disabled():
+@pytest.mark.parametrize(
+    "train_cfg",
+    [
+        pytest.param({"compile": False}, id="disabled"),
+        pytest.param({}, id="unset"),
+    ],
+)
+def test_maybe_compile_noop_when_disabled_or_unset(train_cfg):
     model = nn.Linear(4, 4)
-    cfg = DictConfig({"train": {"compile": False}})
-    assert maybe_compile(model, cfg) is model
-
-
-def test_maybe_compile_noop_when_unset():
-    model = nn.Linear(4, 4)
-    cfg = DictConfig({"train": {}})
+    cfg = DictConfig({"train": train_cfg})
     assert maybe_compile(model, cfg) is model
 
 

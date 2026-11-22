@@ -391,13 +391,16 @@ def test_deep_supervision_accepts_the_last_block():
     assert aux.deep_preds[0].shape == pred.shape
 
 
-def test_deep_supervision_rejects_an_out_of_range_layer():
+@pytest.mark.parametrize(
+    "layer",
+    [
+        pytest.param(9, id="far-above-depth"),
+        pytest.param(5, id="depth-plus-one"),
+        # Layers are 1-based to match the prompt's [4, 8, 12]; 0 would silently
+        # mean 'the last block' under Python indexing.
+        pytest.param(0, id="zero-is-not-1-based"),
+    ],
+)
+def test_deep_supervision_rejects_a_layer_outside_one_to_depth(layer):
     with pytest.raises(ValueError, match="deep_supervision_layers"):
-        VideoMAEForPreTraining(_cfg(depth=4, deep_supervision_layers=[9]))
-
-
-def test_deep_supervision_rejects_a_non_positive_layer():
-    """Layers are 1-based to match the prompt's [4, 8, 12]; 0 would silently
-    mean 'the last block' under Python indexing."""
-    with pytest.raises(ValueError, match="deep_supervision_layers"):
-        VideoMAEForPreTraining(_cfg(depth=4, deep_supervision_layers=[0]))
+        VideoMAEForPreTraining(_cfg(depth=4, deep_supervision_layers=[layer]))

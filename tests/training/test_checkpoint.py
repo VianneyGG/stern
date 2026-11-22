@@ -364,23 +364,29 @@ class TestRemapLegacyAttentionKeys:
         assert out["encoder.blocks.0.attn.qkv.weight"].flatten()[0] == 7.0
         assert out["encoder.blocks.0.attn.qkv.bias"].flatten()[0] == 9.0
 
-    def test_renames_the_output_projection(self):
-        out = remap_legacy_attention_keys(
-            {"decoder_blocks.0.attn.out_proj.weight": torch.zeros(1)}
-        )
-        assert list(out) == ["decoder_blocks.0.attn.proj.weight"]
-
-    def test_renames_the_sequential_mlp_into_its_net_submodule(self):
-        out = remap_legacy_attention_keys(
-            {
-                "decoder_blocks.0.mlp.0.weight": torch.zeros(1),
-                "decoder_blocks.0.mlp.3.bias": torch.zeros(1),
-            }
-        )
-        assert set(out) == {
-            "decoder_blocks.0.mlp.net.0.weight",
-            "decoder_blocks.0.mlp.net.3.bias",
-        }
+    @pytest.mark.parametrize(
+        ("legacy_keys", "expected_keys"),
+        [
+            pytest.param(
+                ["decoder_blocks.0.attn.out_proj.weight"],
+                {"decoder_blocks.0.attn.proj.weight"},
+                id="output_projection",
+            ),
+            pytest.param(
+                ["decoder_blocks.0.mlp.0.weight", "decoder_blocks.0.mlp.3.bias"],
+                {
+                    "decoder_blocks.0.mlp.net.0.weight",
+                    "decoder_blocks.0.mlp.net.3.bias",
+                },
+                id="sequential_mlp_into_net",
+            ),
+        ],
+    )
+    def test_renames_legacy_key_to_current_module_layout(
+        self, legacy_keys, expected_keys
+    ):
+        out = remap_legacy_attention_keys({k: torch.zeros(1) for k in legacy_keys})
+        assert set(out) == expected_keys
 
     def test_leaves_unrelated_keys_untouched(self):
         keys = {

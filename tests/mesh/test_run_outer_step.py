@@ -170,9 +170,12 @@ def test_merge_with_lr1_momentum0_reproduces_weighted_average(tmp_path):
     master_path = tmp_path / "master.pt"
     momentum_path = tmp_path / "momentum.pt"
 
+    # Master w=1.0. Workers w=0.0 (n=100) and w=3.0 (n=300) -> alphas 0.25 / 0.75.
+    # Weighted mean = 0.25*0.0 + 0.75*3.0 = 2.25. A no-op merge leaves 1.0; an
+    # unweighted mean gives 1.5. Both must fail.
     _write_master(master_path, 1.0)
     _write_worker(pending_dir / "run1_0_a.pt", 0.0, n_samples=100)
-    _write_worker(pending_dir / "run1_0_b.pt", 2.0, n_samples=100)
+    _write_worker(pending_dir / "run1_0_b.pt", 3.0, n_samples=300)
 
     merge_round(
         pending_dir,
@@ -185,7 +188,7 @@ def test_merge_with_lr1_momentum0_reproduces_weighted_average(tmp_path):
     )
 
     merged = torch.load(master_path, weights_only=False)["model_state_dict"]
-    assert merged["w"][0, 0].item() == pytest.approx(1.0)
+    assert merged["w"][0, 0].item() == pytest.approx(2.25)
 
 
 def test_merge_round_reads_delta_state_dict_directly_when_present(tmp_path):
@@ -334,40 +337,40 @@ def test_momentum_buffer_is_written_and_reloaded(tmp_path, capsys):
         0, 0
     ].item()
 
-    assert m2 != pytest.approx(m1)
+    # Hand-derived (lr=0.7, momentum=0.9, one worker at 1.1, master 1.0):
+    # round 1: delta = 1.0-1.1 = -0.1; buf = -0.1; step = -0.1+0.9*(-0.1) = -0.19;
+    #          master = 1.0 - 0.7*(-0.19) = 1.133.
+    # round 2: master 1.133, delta = 0.033; buf = 0.9*(-0.1)+0.033 = -0.057;
+    #          step = 0.033+0.9*(-0.057) = -0.0183; master = 1.133+0.7*0.0183 = 1.14581.
+    # A round-2 buffer that was not reloaded gives 1.133 - 0.7*(0.033+0.9*0.033) = 1.08911.
+    assert m1 == pytest.approx(1.133, abs=1e-5)
+    assert m2 == pytest.approx(1.14581, abs=1e-5)
 
 
-def test_checkpoint_with_neither_state_dict_key_is_rejected_loudly(tmp_path):
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"n_samples": 100}, id="neither_key"),
+        pytest.param(
+            {
+                "model_state_dict": _sd(0.5),
+                "delta_state_dict": _sd(0.5),
+                "n_samples": 100,
+            },
+            id="both_keys",
+        ),
+    ],
+)
+def test_checkpoint_without_exactly_one_state_dict_key_is_rejected_loudly(
+    tmp_path, payload
+):
     pending_dir = tmp_path / "pending"
     pending_dir.mkdir()
     master_path = tmp_path / "master.pt"
     momentum_path = tmp_path / "momentum.pt"
 
     _write_master(master_path, 1.0)
-    torch.save({"n_samples": 100}, pending_dir / "run1_0_a.pt")
-
-    with pytest.raises(ValueError, match="exactly one of"):
-        merge_round(
-            pending_dir,
-            master_path,
-            momentum_path,
-            run_id="run1",
-            lr=0.7,
-            momentum=0.9,
-        )
-
-
-def test_checkpoint_with_both_state_dict_keys_is_rejected_loudly(tmp_path):
-    pending_dir = tmp_path / "pending"
-    pending_dir.mkdir()
-    master_path = tmp_path / "master.pt"
-    momentum_path = tmp_path / "momentum.pt"
-
-    _write_master(master_path, 1.0)
-    torch.save(
-        {"model_state_dict": _sd(0.5), "delta_state_dict": _sd(0.5), "n_samples": 100},
-        pending_dir / "run1_0_a.pt",
-    )
+    torch.save(payload, pending_dir / "run1_0_a.pt")
 
     with pytest.raises(ValueError, match="exactly one of"):
         merge_round(
@@ -953,7 +956,15 @@ def test_metrics_out_omitted_creates_no_file(tmp_path):
     assert not results_dir.exists()
 
 
-def test_metrics_out_records_timeout_forced_flag(tmp_path):
+@pytest.mark.parametrize(
+    ("flag", "record_key", "expected"),
+    [
+        pytest.param(["--timeout-forced"], "timeout_forced", True, id="timeout_flag_set"),
+        pytest.param(["--quorum-relaxed"], "quorum_relaxed", True, id="quorum_flag_set"),
+        pytest.param([], "quorum_relaxed", False, id="quorum_flag_omitted_defaults_false"),
+    ],
+)
+def test_metrics_out_record_reflects_merge_flags(tmp_path, flag, record_key, expected):
     pending_dir = tmp_path / "pending"
     pending_dir.mkdir()
     master_path = tmp_path / "master.pt"
@@ -975,77 +986,14 @@ def test_metrics_out_records_timeout_forced_flag(tmp_path):
                 "--allow-missing-momentum",
                 "--metrics-out",
                 str(metrics_out),
-                "--timeout-forced",
+                *flag,
             ],
         )
     )
 
     assert rc == 0
     record = json.loads(metrics_out.read_text().splitlines()[0])
-    assert record["timeout_forced"] is True
-
-
-def test_metrics_out_records_quorum_relaxed_flag(tmp_path):
-    pending_dir = tmp_path / "pending"
-    pending_dir.mkdir()
-    master_path = tmp_path / "master.pt"
-    momentum_path = tmp_path / "momentum.pt"
-    metrics_out = tmp_path / "run1_rounds.jsonl"
-
-    _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_1_a.pt", 0.5, n_samples=100)
-
-    rc = main(
-        _cli_argv(
-            pending_dir,
-            master_path,
-            momentum_path,
-            "run1",
-            extra=[
-                "--round",
-                "1",
-                "--allow-missing-momentum",
-                "--metrics-out",
-                str(metrics_out),
-                "--quorum-relaxed",
-            ],
-        )
-    )
-
-    assert rc == 0
-    record = json.loads(metrics_out.read_text().splitlines()[0])
-    assert record["quorum_relaxed"] is True
-
-
-def test_metrics_out_defaults_quorum_relaxed_to_false(tmp_path):
-    pending_dir = tmp_path / "pending"
-    pending_dir.mkdir()
-    master_path = tmp_path / "master.pt"
-    momentum_path = tmp_path / "momentum.pt"
-    metrics_out = tmp_path / "run1_rounds.jsonl"
-
-    _write_master(master_path, 1.0)
-    _write_worker(pending_dir / "run1_1_a.pt", 0.5, n_samples=100)
-
-    rc = main(
-        _cli_argv(
-            pending_dir,
-            master_path,
-            momentum_path,
-            "run1",
-            extra=[
-                "--round",
-                "1",
-                "--allow-missing-momentum",
-                "--metrics-out",
-                str(metrics_out),
-            ],
-        )
-    )
-
-    assert rc == 0
-    record = json.loads(metrics_out.read_text().splitlines()[0])
-    assert record["quorum_relaxed"] is False
+    assert record[record_key] is expected
 
 
 def test_append_merge_metrics_includes_observability_fields(tmp_path):
@@ -1059,18 +1007,20 @@ def test_append_merge_metrics_includes_observability_fields(tmp_path):
         quorum_relaxed=True,
         effective_quorum_k=2,
         misses_charged=1,
-        misses_excused_job_absent=1,
+        misses_excused_job_absent=2,
         misses_correlated=0,
-        exclusions_suspended_no_replacement=1,
+        exclusions_suspended_no_replacement=4,
         requeues_seen=3,
     )
     record = json.loads(metrics_path.read_text().splitlines()[0])
+    assert record["timeout_forced"] is False  # schema key present, value as passed
     assert record["quorum_relaxed"] is True
     assert record["effective_quorum_k"] == 2
+    # Distinct values so a swapped field name fails.
     assert record["misses_charged"] == 1
-    assert record["misses_excused_job_absent"] == 1
+    assert record["misses_excused_job_absent"] == 2
     assert record["misses_correlated"] == 0
-    assert record["exclusions_suspended_no_replacement"] == 1
+    assert record["exclusions_suspended_no_replacement"] == 4
     assert record["requeues_seen"] == 3
 
 

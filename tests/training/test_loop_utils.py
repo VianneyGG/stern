@@ -1,5 +1,6 @@
 """Unit tests for training/loop_utils.py's WeightEMA."""
 
+import pytest
 import torch
 from torch import nn
 
@@ -30,15 +31,17 @@ def test_ema_converges_toward_a_fixed_target_under_repeated_updates():
     assert torch.allclose(ema.state_dict()["weight"], target, atol=1e-4)
 
 
-def test_ema_update_does_not_mutate_the_live_model():
-    model = nn.Linear(4, 4, bias=False)
-    live_before = model.weight.detach().clone()
-    ema = WeightEMA(model, decay=0.5)
-
+def test_ema_update_is_one_step_formula_and_leaves_live_weights_alone():
+    # Hand-picked: shadow starts at 2.0, live weight is set to 6.0, decay 0.9.
+    # ema = 0.9 * 2.0 + 0.1 * 6.0 = 1.8 + 0.6 = 2.4 (swapping d and 1-d gives 5.6).
+    model = nn.Linear(1, 1, bias=False)
     with torch.no_grad():
-        model.weight.add_(1.0)
+        model.weight.fill_(2.0)
+    ema = WeightEMA(model, decay=0.9)
+    with torch.no_grad():
+        model.weight.fill_(6.0)
+
     ema.update(model)
 
-    assert not torch.equal(model.weight.detach(), live_before)
-    # ema shadow moved only halfway (decay=0.5) toward the new live weights.
-    assert not torch.allclose(ema.state_dict()["weight"], model.weight.detach())
+    assert ema.state_dict()["weight"].item() == pytest.approx(2.4)
+    assert model.weight.item() == 6.0

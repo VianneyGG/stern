@@ -193,9 +193,12 @@ def test_run_train_stage_resumes_from_latest_checkpoint(tmp_path, monkeypatch):
     assert first_ckpt["epoch"] == 1  # 0-indexed: epochs 0,1 ran
 
     cfg.train.epochs = 4
-    train_mod.run_train_stage(
+    result = train_mod.run_train_stage(
         cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
     )
+    # Epochs 0,1 are on disk, so the second call starts at epoch 2 and runs 2 more.
+    assert result["start_epoch"] == 2
+    assert result["epochs_run"] == 2
     second_ckpt = torch.load(latest_path, weights_only=False)
     assert second_ckpt["epoch"] == 3  # resumed at epoch 2, ran through epoch 3
 
@@ -331,25 +334,60 @@ def test_resume_continues_the_lr_schedule_instead_of_restarting_warmup(
     _write_clip(tmp_path / "002", 24, rng)
     manifest_path = build(tmp_path, tmp_path)
     monkeypatch.setattr(train_mod, "VideoMAEVARegressor", _FakeRegressor)
+    # Same epochs target (3) throughout. The first run is preempted at the
+    # start of epoch 2, after epochs 0 and 1 are saved.
     cfg = _cfg(tmp_path, manifest_path)
-    cfg.train.update({"optimizer": "adamw", "warmup_epochs": 1, "epochs": 2})
-    train_mod.run_train_stage(
-        cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
-    )
-    latest = tmp_path / "ckpt" / "test_va_finetune" / "latest.pt"
-    steps_after_2 = torch.load(latest, weights_only=False)["scheduler_state_dict"][
-        "last_epoch"
-    ]
-    assert steps_after_2 > 0
+    cfg.train.update({"optimizer": "adamw", "warmup_epochs": 1, "epochs": 3})
+    real_train_epoch = train_mod._train_epoch
+    started = 0
 
-    cfg.train.epochs = 3
+    def _preempting_train_epoch(*args, **kwargs):
+        nonlocal started
+        started += 1
+        if started == 3:
+            raise RuntimeError("simulated preemption")
+        return real_train_epoch(*args, **kwargs)
+
+    monkeypatch.setattr(train_mod, "_train_epoch", _preempting_train_epoch)
+    with pytest.raises(RuntimeError, match="simulated preemption"):
+        train_mod.run_train_stage(
+            cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
+        )
+    latest = tmp_path / "ckpt" / "test_va_finetune" / "latest.pt"
+    assert torch.load(latest, weights_only=False)["epoch"] == 1
+
+    # The LR each optimizer step uses, across the resumed epoch.
+    step_lrs: list[float] = []
+
+    def _recording_train_epoch(model, loader, optimizer, *args, **kwargs):
+        real_step = optimizer.step
+
+        def _recording_step(*a, **k):
+            step_lrs.append(optimizer.param_groups[0]["lr"])
+            return real_step(*a, **k)
+
+        optimizer.step = _recording_step
+        return real_train_epoch(model, loader, optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(train_mod, "_train_epoch", _recording_train_epoch)
     train_mod.run_train_stage(
         cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
     )
-    steps_after_3 = torch.load(latest, weights_only=False)["scheduler_state_dict"][
-        "last_epoch"
-    ]
-    assert steps_after_3 == steps_after_2 * 3 // 2
+    # Hand-derived. 2 clips x 11 windows = 22; val = round(2.2) = 2; train = 20;
+    # drop_last at batch 4 gives s = 5 steps per epoch. The lambda uses warmup = s
+    # and total = 3s, so an optimizer step at global index i = 2s + k (k = 0..4)
+    # has progress = (i - s) / (3s - s) = (5 + k) / 10 and LR =
+    # 1e-2 * 0.5 * (1 + cos(pi * progress)):
+    #   k=0: progress 0.5 -> 1e-2 * 0.5 * 1.0000        = 5e-3
+    #   k=1: progress 0.6 -> 1e-2 * 0.5 * 0.690983      = 3.454915e-3
+    #   k=2: progress 0.7 -> 1e-2 * 0.5 * 0.412215      = 2.061074e-3
+    #   k=3: progress 0.8 -> 1e-2 * 0.5 * 0.190983      = 9.54915e-4
+    #   k=4: progress 0.9 -> 1e-2 * 0.5 * 0.048943      = 2.447174e-4
+    # A restarted warmup would begin near 1e-2 / 5 = 2e-3 and rise again.
+    assert len(step_lrs) == 5
+    assert step_lrs == pytest.approx(
+        [5e-3, 3.454915e-3, 2.061074e-3, 9.54915e-4, 2.447174e-4], rel=1e-5
+    )
 
 
 def test_levjepa_hf_encoder_routes_to_the_hf_regressor(tmp_path, monkeypatch):
@@ -469,14 +507,12 @@ def test_default_split_is_the_seeded_window_level_random_split(tmp_path, monkeyp
     )
 
     ((_, val_ds),) = seen
-    n_total = len(val_ds.dataset)
-    n_val = max(1, int(round(n_total * 0.1)))
-    expected = torch.utils.data.random_split(
-        range(n_total),
-        [n_total - n_val, n_val],
-        generator=torch.Generator().manual_seed(3),
-    )[1].indices
-    assert list(val_ds.indices) == list(expected)
+    # 10 clips x 11 windows: 24 frames, span 4, step 2 -> starts 0..20.
+    # Validation = round(110 * 0.1) = 11 windows, indices pinned from
+    # random_split(range(110), [99, 11]) with generator seed 3. The literal is
+    # generated, not hand-derivable: the hand check is 11 distinct indices in 0..109.
+    assert len(val_ds.dataset) == 110
+    assert list(val_ds.indices) == [106, 103, 77, 13, 30, 50, 97, 107, 5, 20, 52]
 
 
 def test_final_is_the_last_epoch_and_best_keys_are_unchanged(tmp_path, monkeypatch):

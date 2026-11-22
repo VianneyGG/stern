@@ -91,7 +91,10 @@ def test_sample_clip_keys_raises_when_shard_too_small(tmp_path):
         sample_clip_keys(shard_path, n_windows=3, seed=42)
 
 
-def test_sample_clip_keys_excludes_clips_shorter_than_num_frames(tmp_path):
+@pytest.mark.parametrize("seed", range(10))
+def test_sample_clip_keys_excludes_clips_shorter_than_num_frames(tmp_path, seed):
+    # 3 clips, 2 drawn: with the length filter removed, "short" is drawn for
+    # about two thirds of seeds, so looping seeds makes the filter observable.
     shard_path = _write_shard(tmp_path, {"short": 2, "long0": 10, "long1": 10})
     shard_index = {
         "short": {"num_frames": 2},
@@ -99,9 +102,8 @@ def test_sample_clip_keys_excludes_clips_shorter_than_num_frames(tmp_path):
         "long1": {"num_frames": 10},
     }
     picked = sample_clip_keys(
-        shard_path, n_windows=2, seed=0, shard_index=shard_index, num_frames=4
+        shard_path, n_windows=2, seed=seed, shard_index=shard_index, num_frames=4
     )
-    assert "short" not in picked
     assert set(picked) == {"long0", "long1"}
 
 
@@ -123,10 +125,11 @@ def test_load_sample_windows_raises_when_no_clip_is_long_enough(tmp_path):
         load_sample_windows(shard_path, n_windows=1, num_frames=4, image_size=8, seed=0)
 
 
-def test_load_sample_windows_skips_clips_shorter_than_the_window(tmp_path):
+@pytest.mark.parametrize("seed", range(10))
+def test_load_sample_windows_skips_clips_shorter_than_the_window(tmp_path, seed):
     shard_path = _write_shard(tmp_path, {"short": 2, "long0": 12, "long1": 12})
     windows = load_sample_windows(
-        shard_path, n_windows=2, num_frames=4, image_size=8, seed=3
+        shard_path, n_windows=2, num_frames=4, image_size=8, seed=seed
     )
     assert {clip_key for clip_key, _ in windows} == {"long0", "long1"}
 

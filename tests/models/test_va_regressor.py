@@ -31,11 +31,15 @@ def _cfg(embed_dim: int):
 
 
 def test_forward_returns_bounded_va_pairs():
+    torch.manual_seed(0)
     model = VideoMAEVARegressor(_cfg(12), backbone=_StubBackbone(12))
     out = model(torch.randn(5, 3, 4, 8, 8))
 
     assert out.shape == (5, 2)
     assert torch.all(out >= -1.0) and torch.all(out <= 1.0)
+    # Measured 0.15 at seed 0. A tanh pinned at +-1 would still pass the bound
+    # check above, so also require the outputs to sit strictly inside it.
+    assert out.abs().max().item() < 0.99
 
 
 def test_forward_raises_on_embed_dim_mismatch():

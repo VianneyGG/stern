@@ -34,27 +34,26 @@ class _TinyModel(nn.Module):
         return torch.tanh(self.lin(pixel_values.mean(dim=[2, 3, 4])))
 
 
-def test_accum_steps_reduces_optimizer_step_count():
+@pytest.mark.parametrize(
+    ("accum_steps", "expected_steps"),
+    [
+        # 4 batches: boundaries fall at batches 2 and 4.
+        pytest.param(2, 2, id="accum_2_steps_on_boundaries"),
+        # Every batch is a boundary.
+        pytest.param(1, 4, id="accum_1_steps_every_batch"),
+    ],
+)
+def test_accum_steps_sets_optimizer_step_count(accum_steps, expected_steps):
     model = _TinyModel()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
     loader = _loader(n_batches=4)
 
     with mock.patch.object(optimizer, "step", wraps=optimizer.step) as step_spy:
-        _train_epoch(model, loader, optimizer, torch.device("cpu"), accum_steps=2)
+        _train_epoch(
+            model, loader, optimizer, torch.device("cpu"), accum_steps=accum_steps
+        )
 
-    # 4 batches at accum_steps=2 -> optimizer.step() fires on boundaries only (2, 4).
-    assert step_spy.call_count == 2
-
-
-def test_accum_steps_one_steps_every_batch():
-    model = _TinyModel()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
-    loader = _loader(n_batches=4)
-
-    with mock.patch.object(optimizer, "step", wraps=optimizer.step) as step_spy:
-        _train_epoch(model, loader, optimizer, torch.device("cpu"), accum_steps=1)
-
-    assert step_spy.call_count == 4
+    assert step_spy.call_count == expected_steps
 
 
 def _grad_norm(model: nn.Module) -> float:
@@ -98,15 +97,37 @@ def test_grad_clip_zero_disables_clipping():
 
 
 def test_grad_clip_positive_clips_each_optimizer_step():
+    """With grad_clip=1e-3 every step's gradient ends at norm exactly 1e-3.
+
+    clip_grad_norm_ returns the pre-clip norm, so the test first checks that
+    the raw norm exceeds 1e-3 (clipping really engages). It then reads the
+    gradient norm at optimizer.step(), the gradient the optimizer consumes,
+    and expects 1e-3. A clip that is a no-op, or any later scaling, fails it.
+    """
     model = _TinyModel()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
     loader = _loader(n_batches=3)
+    real_clip = torch.nn.utils.clip_grad_norm_
+    real_step = optimizer.step
+    pre_norms: list[float] = []
+    stepped_norms: list[float] = []
 
+    def _recording_clip(parameters, max_norm, *args, **kwargs):
+        pre_norms.append(float(real_clip(parameters, max_norm, *args, **kwargs)))
+        return pre_norms[-1]
+
+    def _recording_step(*args, **kwargs):
+        stepped_norms.append(_grad_norm(model))
+        return real_step(*args, **kwargs)
+
+    optimizer.step = _recording_step
     with mock.patch(
-        "torch.nn.utils.clip_grad_norm_", wraps=torch.nn.utils.clip_grad_norm_
+        "torch.nn.utils.clip_grad_norm_", side_effect=_recording_clip
     ) as clip_spy:
-        _train_epoch(model, loader, optimizer, torch.device("cpu"), grad_clip=0.5)
+        _train_epoch(model, loader, optimizer, torch.device("cpu"), grad_clip=1e-3)
 
     assert clip_spy.call_count == 3
     for call in clip_spy.call_args_list:
-        assert call.args[1] == 0.5 or call.kwargs.get("max_norm") == 0.5
+        assert call.args[1] == 1e-3 or call.kwargs.get("max_norm") == 1e-3
+    assert all(n > 1e-3 for n in pre_norms)
+    assert stepped_norms == pytest.approx([1e-3] * 3, rel=1e-4)

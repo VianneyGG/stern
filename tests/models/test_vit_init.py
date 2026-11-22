@@ -139,11 +139,12 @@ def test_skipping_the_residual_is_what_cutting_skip_is_actually_for():
     trunc_drift = trunc_rms[-1] / trunc_rms[0]
     cutting_drift = cutting_rms[-1] / cutting_rms[0]
 
-    # trunc_normal has no stabilising structure without a skip path: each
-    # block resets the stream to a fresh, uncorrelated projection of its
-    # input, so scale should drift far more than the (near-identity) cutting
-    # skip's small per-block state update.
-    assert abs(cutting_drift - 1.0) < abs(trunc_drift - 1.0)
+    # Measured at seed 0, depth 8, no skip: trunc_normal last/first RMS = 1.61,
+    # cutting_skip = 1.17. Margins: trunc must leave [0.6, 1.4] (headroom
+    # 0.21 below the measured value); cutting_skip must stay in [0.85, 1.3]
+    # (headroom ~0.12 above and ~0.32 below).
+    assert abs(trunc_drift - 1.0) > 0.4
+    assert 0.85 <= cutting_drift <= 1.3
 
 
 def test_keeping_the_skip_makes_cutting_skip_attention_redundant():

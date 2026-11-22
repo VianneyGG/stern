@@ -63,11 +63,14 @@ def test_preprocess_window_shape_and_normalisation():
 def test_regressor_on_real_encoder_returns_bounded_va():
     # embed_dim=48: divisible by both the encoder's num_heads=4 and the VA
     # head's fixed num_heads=12.
+    torch.manual_seed(0)
     model = VideoMAEVARegressor(_tiny_cfg(embed_dim=48))
     out = model(torch.randn(3, 3, 4, 16, 16))
 
     assert out.shape == (3, 2)
     assert torch.all(out >= -1.0) and torch.all(out <= 1.0)
+    # Measured 0.14 at seed 0. Bounds alone pass for a saturated tanh too.
+    assert out.abs().max().item() < 0.99
 
 
 def test_drop_path_zeroes_and_scales_samples():

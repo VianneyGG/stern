@@ -104,6 +104,23 @@ def _mesh_dataset(root, clip_key: str, n_frames: int, overlap: float = 0.0):
     )
 
 
+def _set_mesh_env(
+    monkeypatch, mesh_shared, mesh_root, checkpoint_root, *, run_id="run1"
+):
+    """Point the MESH_* env at the standard mesh_shared layout for one round."""
+    monkeypatch.setenv("MESH_RUN_ID", run_id)
+    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
+    monkeypatch.setenv(
+        "MESH_ASSIGNMENTS",
+        str(mesh_shared / "metadata" / f"shard_assignments_{run_id}.json"),
+    )
+    monkeypatch.setenv(
+        "MESH_SHARD_MAP", str(mesh_shared / "metadata" / "shard_map.json")
+    )
+    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
+    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+
+
 def test_train_one_round_respects_steps_per_round(tmp_path):
     torch.manual_seed(0)
     device = torch.device("cpu")
@@ -213,15 +230,16 @@ def test_evaluate_val_loss_uses_no_grad(tmp_path):
     masker = RandomTubeMasking(mask_ratio=0.5)
     val_dataset = _mesh_dataset(tmp_path / "val_mesh", "val_clip0", n_frames=8)
 
-    for p in model.parameters():
-        assert p.grad is None
+    grad_enabled_in_forward = []
+    model.register_forward_hook(
+        lambda _m, _i, _o: grad_enabled_in_forward.append(torch.is_grad_enabled())
+    )
 
     evaluate_val_loss(model, val_dataset, device, masker, "off", max_windows=10)
 
-    # No backward() ran under torch.no_grad(): every parameter's .grad is
-    # still exactly what it was before the call (None -- never populated).
-    for p in model.parameters():
-        assert p.grad is None
+    # Every forward ran under torch.no_grad(), so no autograd graph is built.
+    assert grad_enabled_in_forward
+    assert not any(grad_enabled_in_forward)
 
 
 def test_push_checkpoint_and_wait_returns_immediately_when_merge_false(
@@ -283,33 +301,6 @@ def test_push_checkpoint_and_wait_succeeds_when_flag_appears(tmp_path, monkeypat
     )
 
 
-def test_push_checkpoint_and_wait_casts_shared_payload_to_fp16(tmp_path):
-    payload = {
-        "model_state_dict": {"w": torch.ones(2, 2), "b": torch.ones(2)},
-        "n_samples": 1,
-    }
-
-    push_checkpoint_and_wait(
-        payload,
-        mesh_shared=tmp_path,
-        run_id="r1",
-        node="nodeA",
-        round_num=0,
-        merge=False,
-    )
-
-    shared = torch.load(
-        tmp_path / "checkpoints" / "pending" / "r1_0_nodeA.pt",
-        map_location="cpu",
-        weights_only=False,
-    )
-    assert shared["model_state_dict"]["w"].dtype == torch.float16
-    assert shared["model_state_dict"]["b"].dtype == torch.float16
-    # Caller's own dict must be untouched: local checkpoint saves (which
-    # happen before this call in run_mesh_pretrain_stage) must stay fp32.
-    assert payload["model_state_dict"]["w"].dtype == torch.float32
-
-
 def test_push_checkpoint_and_wait_pushes_delta_not_weights_when_master_sd_given(
     tmp_path,
 ):
@@ -348,6 +339,9 @@ def test_push_checkpoint_and_wait_pushes_delta_not_weights_when_master_sd_given(
     delta = shared["delta_state_dict"]
     assert delta["w"].dtype == torch.float16
     assert torch.allclose(delta["w"].float(), torch.full((2, 2), 0.25), atol=1e-3)
+    # Every key is diffed and cast, not only the first: b is 1.0 - 0.75 = 0.25.
+    assert delta["b"].dtype == torch.float16
+    assert torch.allclose(delta["b"].float(), torch.full((2,), 0.25), atol=1e-3)
     # Caller's own dict must be untouched -- same guarantee as the
     # full-weight path above.
     assert payload["model_state_dict"]["w"].dtype == torch.float32
@@ -376,6 +370,9 @@ def test_push_checkpoint_and_wait_keeps_full_weights_when_master_sd_is_none(tmp_
     assert "delta_state_dict" not in shared
     assert "master_version" not in shared
     assert shared["model_state_dict"]["w"].dtype == torch.float16
+    # Caller's own dict must be untouched: local checkpoint saves (which
+    # happen before this call in run_mesh_pretrain_stage) must stay fp32.
+    assert payload["model_state_dict"]["w"].dtype == torch.float32
 
 
 def test_fp16_state_dict_leaves_non_float_buffers_untouched():
@@ -410,12 +407,7 @@ def test_run_mesh_pretrain_stage_cold_start_has_no_master_checkpoint(
 
     checkpoint_root = tmp_path / "stern_checkpoints"
 
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, checkpoint_root)
 
     # master.pt intentionally never created -- this is the cold-start case.
     assert not (mesh_shared / "checkpoints" / "run1" / "master.pt").exists()
@@ -474,12 +466,7 @@ def test_run_mesh_pretrain_stage_with_ema_decay_writes_val_loss_ema(
 
     checkpoint_root = tmp_path / "stern_checkpoints"
 
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, checkpoint_root)
 
     cfg = DictConfig(
         {
@@ -536,12 +523,7 @@ def test_round_loop_stops_at_boundary_when_stop_file_present(tmp_path, monkeypat
     stop_file = tmp_path / "stop"
     stop_file.touch()
 
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, checkpoint_root)
     monkeypatch.setenv("MESH_STOP_FILE", str(stop_file))
 
     cfg = DictConfig(
@@ -591,12 +573,7 @@ def test_shared_pending_payload_drops_optimizer_state_local_keeps_it(
 
     checkpoint_root = tmp_path / "stern_checkpoints"
 
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, checkpoint_root)
 
     cfg = DictConfig(
         {
@@ -678,12 +655,7 @@ def test_run_mesh_pretrain_stage_warm_starts_round_zero_from_existing_master(
 
     checkpoint_root = tmp_path / "stern_checkpoints"
 
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, checkpoint_root)
 
     cfg = DictConfig(
         {
@@ -783,12 +755,7 @@ def test_round_loop_pushes_delta_against_the_master_snapshot_it_loaded(
     )
 
     checkpoint_root = tmp_path / "stern_checkpoints"
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, checkpoint_root)
 
     cfg = DictConfig(
         {
@@ -846,12 +813,7 @@ def test_round_loop_omits_master_sd_on_a_cold_start(tmp_path, monkeypatch):
     shard_map_path.write_text(json.dumps({}))
 
     checkpoint_root = tmp_path / "stern_checkpoints"
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, checkpoint_root)
 
     cfg = DictConfig(
         {
@@ -926,12 +888,7 @@ def test_late_joiner_loads_master_before_first_local_round(tmp_path, monkeypatch
     monkeypatch.setattr(mesh_round.torch, "load", spy_load)
 
     checkpoint_root = tmp_path / "stern_checkpoints"
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, checkpoint_root)
 
     cfg = DictConfig(
         {
@@ -963,7 +920,7 @@ def test_late_joiner_loads_master_before_first_local_round(tmp_path, monkeypatch
 
 
 def test_run_mesh_pretrain_stage_strips_fqdn_before_shard_lookup(tmp_path, monkeypatch):
-    """shard_assignments_*.json (written by seed_mesh.py/assignment.py) is
+    """shard_assignments_*.json (written by seed_nodes.py/assignment.py) is
     keyed by short hostnames ('node008'), matching NODE_SUBNETS and the
     per-node checkpoint naming convention. socket.gethostname() returns
     whatever the node's NSS/DNS config reports, which can be the FQDN
@@ -981,7 +938,7 @@ def test_run_mesh_pretrain_stage_strips_fqdn_before_shard_lookup(tmp_path, monke
     mesh_shared = tmp_path / "mesh_shared"
     assignments_path = mesh_shared / "metadata" / "shard_assignments_run1.json"
     assignments_path.parent.mkdir(parents=True)
-    # Keyed by the short hostname, as seed_mesh.py actually writes it.
+    # Keyed by the short hostname, as seed_nodes.py actually writes it.
     assignments_path.write_text(json.dumps({"node008": [shard_name]}))
 
     shard_map_path = mesh_shared / "metadata" / "shard_map.json"
@@ -989,12 +946,7 @@ def test_run_mesh_pretrain_stage_strips_fqdn_before_shard_lookup(tmp_path, monke
 
     checkpoint_root = tmp_path / "stern_checkpoints"
 
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, checkpoint_root)
 
     cfg = DictConfig(
         {
@@ -1041,7 +993,7 @@ def test_resolve_subnet_uses_real_per_host_mapping_not_a_single_constant():
     """Review finding 1: a single yaml-wide subnet constant would report
     every node as the same subnet regardless of which physical host it runs
     on. node001 (fish tier) and node024 (birds tier) are real hostnames
-    from seed_mesh.py's NODE_SUBNETS roster with genuinely different real
+    from seed_nodes.py's NODE_SUBNETS roster with genuinely different real
     subnets -- this must resolve them differently, not to one hardcoded
     value."""
     cfg = DictConfig({"mesh": {"subnet": "/999"}})
@@ -1174,12 +1126,7 @@ def test_run_mesh_pretrain_stage_writes_one_round_metrics_line(tmp_path, monkeyp
     shard_map_path = mesh_shared / "metadata" / "shard_map.json"
     shard_map_path.write_text(json.dumps({}))
 
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(tmp_path / "stern_checkpoints"))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, tmp_path / "stern_checkpoints")
 
     cfg = DictConfig(
         {
@@ -1245,12 +1192,7 @@ def test_run_mesh_pretrain_stage_continues_past_a_failed_push(tmp_path, monkeypa
     shard_map_path = mesh_shared / "metadata" / "shard_map.json"
     shard_map_path.write_text(json.dumps({}))
 
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(tmp_path / "stern_checkpoints"))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, tmp_path / "stern_checkpoints")
 
     # Round 1's (0-indexed round_num=1) sync flag pre-exists so its barrier
     # clears immediately -- this test is not about barrier waiting, only
@@ -1322,12 +1264,7 @@ def test_run_mesh_pretrain_stage_skips_push_on_zero_sample_round(tmp_path, monke
     shard_map_path = mesh_shared / "metadata" / "shard_map.json"
     shard_map_path.write_text(json.dumps({}))
 
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(tmp_path / "stern_checkpoints"))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, tmp_path / "stern_checkpoints")
 
     monkeypatch.setattr(
         mesh_round,
@@ -1460,12 +1397,7 @@ def _run_with_step_capture(tmp_path, monkeypatch, *, mesh_cfg, rates, seed=None)
     shard_map_path.write_text(json.dumps({}))
 
     checkpoint_root = tmp_path / "stern_checkpoints"
-    monkeypatch.setenv("MESH_RUN_ID", "run1")
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, checkpoint_root)
 
     cfg = DictConfig(
         {
@@ -1594,12 +1526,7 @@ def test_run_mesh_pretrain_stage_reproducible_across_ambient_rng_state(
         shard_map_path.write_text(json.dumps({}))
         checkpoint_root = root / "stern_checkpoints"
 
-        monkeypatch.setenv("MESH_RUN_ID", "run1")
-        monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-        monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-        monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-        monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-        monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(checkpoint_root))
+        _set_mesh_env(monkeypatch, mesh_shared, mesh_root, checkpoint_root)
 
         cfg = DictConfig(
             {
@@ -1643,12 +1570,7 @@ def _mesh_env(tmp_path, monkeypatch, run_id="maskrun"):
     assignments_path.write_text(json.dumps({hostname: [shard_name]}))
     shard_map_path = mesh_shared / "metadata" / "shard_map.json"
     shard_map_path.write_text(json.dumps({}))
-    monkeypatch.setenv("MESH_RUN_ID", run_id)
-    monkeypatch.setenv("MESH_SHARED", str(mesh_shared))
-    monkeypatch.setenv("MESH_ASSIGNMENTS", str(assignments_path))
-    monkeypatch.setenv("MESH_SHARD_MAP", str(shard_map_path))
-    monkeypatch.setenv("MESH_ROOT", str(mesh_root))
-    monkeypatch.setenv("STERN_CHECKPOINT_ROOT", str(tmp_path / "ckpt"))
+    _set_mesh_env(monkeypatch, mesh_shared, mesh_root, tmp_path / "ckpt", run_id=run_id)
 
 
 def _mask_cfg(**model_kwargs):
@@ -1759,27 +1681,21 @@ def _flag(mesh_shared: Path, run_id: str, round_num: int) -> Path:
     return p
 
 
-def test_round_already_merged_false_when_no_flag(tmp_path):
-    assert round_already_merged(tmp_path, "RUN1", 3) is False
-
-
-def test_round_already_merged_true_for_this_round(tmp_path):
-    _flag(tmp_path, "RUN1", 3)
-    assert round_already_merged(tmp_path, "RUN1", 3) is True
-
-
-def test_round_already_merged_ignores_other_rounds(tmp_path):
-    """A prior round's flag is always present mid-run -- only the flag for
-    the round being trained means the merge went ahead without us."""
-    _flag(tmp_path, "RUN1", 0)
-    _flag(tmp_path, "RUN1", 1)
-    _flag(tmp_path, "RUN1", 2)
-    assert round_already_merged(tmp_path, "RUN1", 3) is False
-
-
-def test_round_already_merged_ignores_other_runs(tmp_path):
-    _flag(tmp_path, "RUN2", 3)
-    assert round_already_merged(tmp_path, "RUN1", 3) is False
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        pytest.param([], False, id="no_flag"),
+        pytest.param([("RUN1", 3)], True, id="flag_for_this_round"),
+        # A prior round's flag is always present mid-run -- only the flag for
+        # the round being trained means the merge went ahead without us.
+        pytest.param([("RUN1", 0), ("RUN1", 1), ("RUN1", 2)], False, id="other_rounds_only"),
+        pytest.param([("RUN2", 3)], False, id="other_run_same_round"),
+    ],
+)
+def test_round_already_merged_true_only_for_this_run_and_round(tmp_path, flags, expected):
+    for run_id, round_num in flags:
+        _flag(tmp_path, run_id, round_num)
+    assert round_already_merged(tmp_path, "RUN1", 3) is expected
 
 
 def test_micro_batch_size_configurable(tmp_path):

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from stern.watcher.detectors import (
     detect_dead,
     detect_drained_nodes,
@@ -321,25 +323,14 @@ def test_detect_nan_still_flags_a_nan_written_during_the_current_round(tmp_path)
     assert flags[0].subject == "nan:run1:nodeA"
 
 
-def test_detect_drained_nodes_flags_drained_state():
+@pytest.mark.parametrize("state", ["drained", "down", "draining"])
+def test_detect_drained_nodes_flags_unhealthy_states(state):
     flags = detect_drained_nodes(
-        {"node001": "drained", "node002": "idle"}, roster=["node001", "node002"]
+        {"node001": state, "node002": "idle"}, roster=["node001", "node002"]
     )
     assert len(flags) == 1
     assert flags[0].subject == "drain:node001"
     assert flags[0].kind == "node_drained"
-
-
-def test_detect_drained_nodes_flags_down_state():
-    flags = detect_drained_nodes({"node001": "down"}, roster=["node001"])
-    assert len(flags) == 1
-    assert flags[0].subject == "drain:node001"
-
-
-def test_detect_drained_nodes_flags_draining_state():
-    flags = detect_drained_nodes({"node001": "draining"}, roster=["node001"])
-    assert len(flags) == 1
-    assert flags[0].subject == "drain:node001"
 
 
 def test_detect_drained_nodes_ignores_idle_and_mixed_states():

@@ -163,11 +163,15 @@ class TestH1Verdict:
     def test_a_large_budget_supports_it(self):
         assert h1_verdict(0.35) == "holds"
 
-    def test_the_middle_is_reported_as_weak_not_forced_either_way(self):
-        assert h1_verdict(0.05) == "weak"
-
-    def test_the_boundaries_are_where_the_docstring_says(self):
-        assert h1_verdict(0.02) == "weak"
-        assert h1_verdict(0.0199) == "refuted"
-        assert h1_verdict(0.10) == "holds"
-        assert h1_verdict(0.0999) == "weak"
+    @pytest.mark.parametrize(
+        "budget, verdict",
+        [
+            pytest.param(0.05, "weak", id="middle_is_not_forced"),
+            pytest.param(0.02, "weak", id="lower_boundary_is_weak"),
+            pytest.param(0.0199, "refuted", id="just_below_lower_boundary"),
+            pytest.param(0.10, "holds", id="upper_boundary_holds"),
+            pytest.param(0.0999, "weak", id="just_below_upper_boundary"),
+        ],
+    )
+    def test_the_middle_and_boundaries_are_where_the_docstring_says(self, budget, verdict):
+        assert h1_verdict(budget) == verdict

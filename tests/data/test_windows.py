@@ -124,11 +124,11 @@ class TestFrameStride:
 
     def test_the_step_advances_by_the_span_not_the_frame_count(self):
         """Otherwise strided windows would overlap despite overlap=0."""
-        span = (4 - 1) * 3 + 1  # 10
+        # span = (4 - 1) * 3 + 1 = 10
         assert window_starts(30, 4, 0.0, 3) == [0, 10, 20]
 
     def test_overlap_still_applies_to_the_span(self):
-        span = (4 - 1) * 3 + 1  # 10, half-overlap step 5
+        # span = (4 - 1) * 3 + 1 = 10, so the half-overlap step is 5
         assert window_starts(30, 4, 0.5, 3) == [0, 5, 10, 15, 20]
 
     def test_a_non_positive_stride_raises(self):

@@ -5,7 +5,6 @@ import torch
 from torch import nn
 
 from stern.models.vit.block import BlockConfig, ViTBlock
-from stern.models.vit.layerscale import LayerScale
 
 
 class _LegacyBlockForParityTest(nn.Module):
@@ -79,42 +78,38 @@ def test_block_defaults_use_identity_layer_scale():
     assert isinstance(block.layer_scale2, nn.Identity)
 
 
-@pytest.mark.parametrize("norm_type", ["layernorm", "rmsnorm", "centerednorm"])
-def test_block_runs_with_each_norm_type(norm_type):
-    block = ViTBlock(BlockConfig(embed_dim=16, num_heads=4, norm_type=norm_type))
+@pytest.mark.parametrize(
+    "cfg_kwargs",
+    [
+        pytest.param({"norm_type": "layernorm"}, id="norm_type-layernorm"),
+        pytest.param({"norm_type": "rmsnorm"}, id="norm_type-rmsnorm"),
+        pytest.param({"norm_type": "centerednorm"}, id="norm_type-centerednorm"),
+        pytest.param({"mlp_type": "gelu"}, id="mlp_type-gelu"),
+        pytest.param({"mlp_type": "swiglu"}, id="mlp_type-swiglu"),
+        pytest.param({"qk_norm": True}, id="qk_norm"),
+        pytest.param({"layer_scale_init": 1e-5}, id="layer_scale"),
+    ],
+)
+def test_block_runs_with_each_axis_setting(cfg_kwargs):
+    block = ViTBlock(BlockConfig(embed_dim=16, num_heads=4, **cfg_kwargs))
     out = block(torch.randn(2, 5, 16))
     assert out.shape == (2, 5, 16)
 
 
-@pytest.mark.parametrize("mlp_type", ["gelu", "swiglu"])
-def test_block_runs_with_each_mlp_type(mlp_type):
-    block = ViTBlock(BlockConfig(embed_dim=16, num_heads=4, mlp_type=mlp_type))
-    out = block(torch.randn(2, 5, 16))
-    assert out.shape == (2, 5, 16)
-
-
-def test_block_runs_with_qk_norm():
-    block = ViTBlock(BlockConfig(embed_dim=16, num_heads=4, qk_norm=True))
-    out = block(torch.randn(2, 5, 16))
-    assert out.shape == (2, 5, 16)
-
-
-def test_block_runs_with_layer_scale():
-    block = ViTBlock(BlockConfig(embed_dim=16, num_heads=4, layer_scale_init=1e-5))
-    assert isinstance(block.layer_scale1, LayerScale)
-    out = block(torch.randn(2, 5, 16))
-    assert out.shape == (2, 5, 16)
-
-
-@pytest.mark.parametrize("norm_type", ["rmsnorm", "centerednorm"])
-def test_non_default_norm_type_changes_block_output(norm_type):
-    """The shape-only smoke test above would still pass if norm_type were
-    silently ignored (e.g. always falling through to LayerNorm) -- this
-    proves the axis actually changes what the block computes. Norm-layer
-    params (weight/bias) are deterministic at init (no RNG draws) for every
-    variant here, so seeding before each construction gives attn/mlp
-    identical weights across both blocks -- any output difference is
-    attributable to the norm layer alone."""
+@pytest.mark.parametrize(
+    "variant_kwargs",
+    [
+        pytest.param({"norm_type": "rmsnorm"}, id="norm_type-rmsnorm"),
+        pytest.param({"norm_type": "centerednorm"}, id="norm_type-centerednorm"),
+        pytest.param({"mlp_type": "swiglu"}, id="mlp_type-swiglu"),
+        pytest.param({"qk_norm": True}, id="qk_norm"),
+        pytest.param({"layer_scale_init": 1e-5}, id="layer_scale"),
+    ],
+)
+def test_each_axis_changes_block_output(variant_kwargs):
+    """The shape-only smoke test would still pass if an axis were silently
+    ignored; this proves each axis changes what the block computes. Both blocks
+    are seeded identically, so any output difference comes from the axis alone."""
     embed_dim, num_heads, mlp_ratio = 16, 4, 2.0
     x = torch.randn(2, 5, embed_dim)
 
@@ -128,7 +123,7 @@ def test_non_default_norm_type_changes_block_output(norm_type):
             embed_dim=embed_dim,
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
-            norm_type=norm_type,
+            **variant_kwargs,
         )
     )
 
@@ -139,84 +134,6 @@ def test_non_default_norm_type_changes_block_output(norm_type):
         variant_out = variant_block(x)
 
     assert not torch.allclose(default_out, variant_out)
-
-
-def test_swiglu_mlp_type_changes_block_output():
-    embed_dim, num_heads, mlp_ratio = 16, 4, 2.0
-    x = torch.randn(2, 5, embed_dim)
-
-    torch.manual_seed(0)
-    gelu_block = ViTBlock(
-        BlockConfig(embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
-    )
-    torch.manual_seed(0)
-    swiglu_block = ViTBlock(
-        BlockConfig(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-            mlp_type="swiglu",
-        )
-    )
-
-    gelu_block.eval()
-    swiglu_block.eval()
-    with torch.no_grad():
-        gelu_out = gelu_block(x)
-        swiglu_out = swiglu_block(x)
-
-    assert not torch.allclose(gelu_out, swiglu_out)
-
-
-def test_qk_norm_changes_block_output():
-    embed_dim, num_heads, mlp_ratio = 16, 4, 2.0
-    x = torch.randn(2, 5, embed_dim)
-
-    torch.manual_seed(0)
-    plain_block = ViTBlock(
-        BlockConfig(embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
-    )
-    torch.manual_seed(0)
-    qk_norm_block = ViTBlock(
-        BlockConfig(
-            embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qk_norm=True
-        )
-    )
-
-    plain_block.eval()
-    qk_norm_block.eval()
-    with torch.no_grad():
-        plain_out = plain_block(x)
-        qk_norm_out = qk_norm_block(x)
-
-    assert not torch.allclose(plain_out, qk_norm_out)
-
-
-def test_layer_scale_changes_block_output():
-    embed_dim, num_heads, mlp_ratio = 16, 4, 2.0
-    x = torch.randn(2, 5, embed_dim)
-
-    torch.manual_seed(0)
-    off_block = ViTBlock(
-        BlockConfig(embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
-    )
-    torch.manual_seed(0)
-    scaled_block = ViTBlock(
-        BlockConfig(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-            layer_scale_init=1e-5,
-        )
-    )
-
-    off_block.eval()
-    scaled_block.eval()
-    with torch.no_grad():
-        off_out = off_block(x)
-        scaled_out = scaled_block(x)
-
-    assert not torch.allclose(off_out, scaled_out)
 
 
 def test_vit_block_forwards_attn_mask_to_attention(monkeypatch):

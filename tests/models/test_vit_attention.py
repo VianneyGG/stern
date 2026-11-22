@@ -45,18 +45,7 @@ def test_self_attention_need_weights_returns_valid_softmax_rows():
     assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5)
 
 
-def test_qk_norm_changes_output_versus_no_qk_norm():
-    torch.manual_seed(0)
-    x = torch.randn(2, 5, 16)
 
-    torch.manual_seed(1)
-    plain = SelfAttention(embed_dim=16, num_heads=4, qk_norm=False)
-    torch.manual_seed(1)
-    normed = SelfAttention(embed_dim=16, num_heads=4, qk_norm=True)
-
-    out_plain, _ = plain(x, need_weights=False)
-    out_normed, _ = normed(x, need_weights=False)
-    assert not torch.allclose(out_plain, out_normed)
 
 
 def test_qk_norm_logit_scale_is_a_learnable_parameter_init_to_sqrt_head_dim():
@@ -135,19 +124,31 @@ def test_self_attention_attn_mask_blocks_masked_positions():
     assert torch.allclose(out_a[0, 0], out_b[0, 0], atol=1e-5)
 
 
-def test_self_attention_rotary_changes_output_vs_no_rotary():
+_ROTARY_COORDS = torch.tensor([[[0, 0, 0], [0, 0, 1], [1, 0, 0]]], dtype=torch.long)
+
+
+@pytest.mark.parametrize("axis", ["qk_norm", "rotary"])
+def test_each_attention_axis_changes_output(axis):
+    """Same weights and input with and without the axis; the outputs must differ."""
     from stern.models.vit.rope import Rotary3D
 
-    torch.manual_seed(0)
     embed_dim, num_heads = 24, 4
-    head_dim = embed_dim // num_heads
-    attn = SelfAttention(embed_dim=embed_dim, num_heads=num_heads)
-    attn.eval()
+    torch.manual_seed(0)
     x = torch.randn(1, 3, embed_dim)
-    rope = Rotary3D(head_dim=head_dim)
-    coords = torch.tensor([[[0, 0, 0], [0, 0, 1], [1, 0, 0]]], dtype=torch.long)
-    cos, sin = rope(coords)
+
+    torch.manual_seed(1)
+    plain = SelfAttention(embed_dim=embed_dim, num_heads=num_heads)
+    torch.manual_seed(1)
+    variant = SelfAttention(
+        embed_dim=embed_dim, num_heads=num_heads, qk_norm=axis == "qk_norm"
+    )
+    plain.eval()
+    variant.eval()
+
+    rotary = None
+    if axis == "rotary":
+        rotary = Rotary3D(head_dim=embed_dim // num_heads)(_ROTARY_COORDS)
     with torch.no_grad():
-        out_plain, _ = attn(x)
-        out_rotary, _ = attn(x, rotary=(cos, sin))
-    assert not torch.allclose(out_plain, out_rotary)
+        out_plain, _ = plain(x)
+        out_variant, _ = variant(x, rotary=rotary)
+    assert not torch.allclose(out_plain, out_variant)

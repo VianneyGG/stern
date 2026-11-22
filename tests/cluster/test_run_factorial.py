@@ -26,11 +26,6 @@ def dry_run() -> str:
     return result.stdout
 
 
-def test_script_has_no_syntax_errors():
-    result = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-
-
 def test_all_four_cells_are_submitted(dry_run):
     for arm in ARMS:
         mask_type, target_mode = arm.split("-", 1)

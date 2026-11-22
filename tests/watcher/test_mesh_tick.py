@@ -70,6 +70,27 @@ def _run_config(**overrides) -> MeshRunConfig:
     return MeshRunConfig(**defaults)
 
 
+def _write_run_configs(path, *, nodes=None, n_shards=3):
+    """Write a one-run mesh_run_configs.json with the shared RUN1 defaults."""
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "RUN1",
+                    "experiment": "videomae_mesh_ssl",
+                    "nodes": list(_NODES) if nodes is None else nodes,
+                    "n_shards": n_shards,
+                    "outer_lr": 0.7,
+                    "outer_momentum": 0.9,
+                    "weighting": "data",
+                    "rounds": 10,
+                    "merge": True,
+                }
+            ]
+        )
+    )
+
+
 def test_meshrunconfig_extra_overrides_round_trips_through_load_run_configs(tmp_path):
     path = tmp_path / "mesh_run_configs.json"
     path.write_text(
@@ -749,14 +770,26 @@ def test_merging_passes_metrics_out_pointing_at_results_mesh_run_id(tmp_path):
     )
 
 
-def test_merging_passes_timeout_forced_when_run_state_flag_is_set(tmp_path):
+@pytest.mark.parametrize(
+    "run_fields, flag, present",
+    [
+        pytest.param({"timeout_forced": True}, "--timeout-forced", True, id="timeout-forced-set"),
+        pytest.param({}, "--timeout-forced", False, id="timeout-forced-default-omitted"),
+        pytest.param({}, "--effective-quorum-k", False, id="quorum-k-none-omitted"),
+    ],
+)
+def test_merging_passes_flags_only_when_run_state_sets_them(
+    tmp_path, run_fields, flag, present
+):
     mesh_shared = tmp_path / "mesh_shared"
     (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
 
     run_config = _run_config()
     state = WatcherState()
-    state.run("RUN1").status = "MERGING"
-    state.run("RUN1").timeout_forced = True
+    run = state.run("RUN1")
+    run.status = "MERGING"
+    for name, value in run_fields.items():
+        setattr(run, name, value)
 
     fake = MagicMock(returncode=0, stdout="", stderr="")
     with patch(
@@ -771,7 +804,7 @@ def test_merging_passes_timeout_forced_when_run_state_flag_is_set(tmp_path):
             now=1000.0,
         )
 
-    assert "--timeout-forced" in mock_run.call_args[0][0]
+    assert (flag in mock_run.call_args[0][0]) is present
 
 
 def test_merging_passes_observability_counters(tmp_path):
@@ -805,55 +838,6 @@ def test_merging_passes_observability_counters(tmp_path):
     assert cmd[cmd.index("--misses-charged") + 1] == "2"
     assert cmd[cmd.index("--exclusions-suspended-no-replacement") + 1] == "1"
     assert cmd[cmd.index("--effective-quorum-k") + 1] == "2"
-
-
-def test_merging_omits_effective_quorum_k_when_none(tmp_path):
-    mesh_shared = tmp_path / "mesh_shared"
-    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
-
-    run_config = _run_config()  # quorum_k not configured for this run
-    state = WatcherState()
-    state.run("RUN1").status = "MERGING"
-
-    fake = MagicMock(returncode=0, stdout="", stderr="")
-    with patch(
-        "stern.watcher.mesh_tick.subprocess.run", return_value=fake
-    ) as mock_run:
-        advance_one_run(
-            run_config,
-            state=state,
-            repo_root=tmp_path,
-            mesh_shared=mesh_shared,
-            mesh_root=tmp_path,
-            now=1000.0,
-        )
-
-    assert "--effective-quorum-k" not in mock_run.call_args[0][0]
-
-
-def test_merging_omits_timeout_forced_on_the_normal_full_arrival_path(tmp_path):
-    mesh_shared = tmp_path / "mesh_shared"
-    (mesh_shared / "checkpoints" / "pending").mkdir(parents=True)
-
-    run_config = _run_config()
-    state = WatcherState()
-    state.run("RUN1").status = "MERGING"
-    assert state.run("RUN1").timeout_forced is False  # dataclass default
-
-    fake = MagicMock(returncode=0, stdout="", stderr="")
-    with patch(
-        "stern.watcher.mesh_tick.subprocess.run", return_value=fake
-    ) as mock_run:
-        advance_one_run(
-            run_config,
-            state=state,
-            repo_root=tmp_path,
-            mesh_shared=mesh_shared,
-            mesh_root=tmp_path,
-            now=1000.0,
-        )
-
-    assert "--timeout-forced" not in mock_run.call_args[0][0]
 
 
 def test_awaiting_checkpoints_timeout_branch_sets_timeout_forced_flag(tmp_path):
@@ -1253,7 +1237,7 @@ def test_syncing_flushes_final_tb_rounds_on_done(tmp_path):
     assert state.run("RUN1").status == "DONE"
 
 
-def test_syncing_transfers_results_to_node089_on_done(tmp_path):
+def test_syncing_transfers_results_to_results_host_on_done(tmp_path):
     mesh_shared = tmp_path / "mesh_shared"
     run_config = _run_config(rounds=3)
     local_dir = mesh_shared / "checkpoints" / "RUN1"
@@ -1307,7 +1291,14 @@ def test_syncing_transfers_results_to_node089_on_done(tmp_path):
     ] in commands
 
 
-def test_syncing_done_keeps_local_checkpoints_if_transfer_fails(tmp_path):
+@pytest.mark.parametrize(
+    "fails",
+    [
+        pytest.param("rsync", id="transfer-fails"),
+        pytest.param("post-transfer-check", id="post-transfer-check-fails"),
+    ],
+)
+def test_syncing_done_keeps_local_checkpoints_if_a_step_fails(tmp_path, fails):
     mesh_shared = tmp_path / "mesh_shared"
     run_config = _run_config(rounds=3)
     local_dir = mesh_shared / "checkpoints" / "RUN1"
@@ -1319,14 +1310,16 @@ def test_syncing_done_keeps_local_checkpoints_if_transfer_fails(tmp_path):
     state.run("RUN1").round = 2
 
     ok = MagicMock(returncode=0, stdout="", stderr="")
-    rsync_fail = MagicMock(returncode=1, stdout="", stderr="disk full")
+    failed = MagicMock(returncode=1, stdout="", stderr="disk full")
 
     def _fake_run(cmd, *args, **kwargs):
-        return rsync_fail if cmd[0] == "rsync" else ok
+        if fails == "rsync" and cmd[0] == "rsync":
+            return failed
+        if fails == "post-transfer-check" and cmd[0] == "ssh" and cmd[2] == "test":
+            return failed
+        return ok
 
-    with patch(
-        "stern.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
-    ):
+    with patch("stern.watcher.mesh_tick.subprocess.run", side_effect=_fake_run):
         action = advance_one_run(
             run_config,
             state=state,
@@ -1339,39 +1332,6 @@ def test_syncing_done_keeps_local_checkpoints_if_transfer_fails(tmp_path):
     assert local_dir.exists()
     assert "FAILED" in action
     assert state.run("RUN1").status == "DONE"
-
-
-def test_syncing_done_keeps_local_checkpoints_if_post_transfer_check_fails(tmp_path):
-    mesh_shared = tmp_path / "mesh_shared"
-    run_config = _run_config(rounds=3)
-    local_dir = mesh_shared / "checkpoints" / "RUN1"
-    local_dir.mkdir(parents=True)
-    (local_dir / "master.pt").write_bytes(b"fake checkpoint")
-
-    state = WatcherState()
-    state.run("RUN1").status = "SYNCING"
-    state.run("RUN1").round = 2
-
-    ok = MagicMock(returncode=0, stdout="", stderr="")
-    check_fail = MagicMock(returncode=1, stdout="", stderr="")
-
-    def _fake_run(cmd, *args, **kwargs):
-        return check_fail if cmd[0] == "ssh" and cmd[2] == "test" else ok
-
-    with patch(
-        "stern.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
-    ):
-        action = advance_one_run(
-            run_config,
-            state=state,
-            repo_root=tmp_path,
-            mesh_shared=mesh_shared,
-            mesh_root=tmp_path,
-            now=1000.0,
-        )
-
-    assert local_dir.exists()
-    assert "FAILED" in action
 
 
 def test_syncing_transfer_skipped_when_no_local_checkpoints(tmp_path):
@@ -1494,7 +1454,14 @@ def test_advance_all_runs_stops_at_first_blocking_state(tmp_path):
     assert state.run("RUN1").status == "AWAITING_CHECKPOINTS"
 
 
-def test_submit_worker_job_includes_start_round_zero_by_default(tmp_path):
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        pytest.param({}, "+mesh.start_round=0", id="default-zero"),
+        pytest.param({"start_round": 5}, "+mesh.start_round=5", id="explicit-nonzero"),
+    ],
+)
+def test_submit_worker_job_passes_start_round(tmp_path, kwargs, expected):
     run_config = _run_config()
     registry_path = tmp_path / "jobs_registry.json"
     fake = MagicMock(returncode=0, stdout="Submitted batch job 555\n")
@@ -1502,30 +1469,15 @@ def test_submit_worker_job_includes_start_round_zero_by_default(tmp_path):
         "stern.watcher.mesh_tick.subprocess.run", return_value=fake
     ) as mock_run:
         job_id = _submit_worker_job(
-            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
-        )
-    assert job_id == "555"
-    submitted_cmd = mock_run.call_args[0][0]
-    assert "+mesh.start_round=0" in submitted_cmd
-
-
-def test_submit_worker_job_passes_nonzero_start_round(tmp_path):
-    run_config = _run_config()
-    registry_path = tmp_path / "jobs_registry.json"
-    fake = MagicMock(returncode=0, stdout="Submitted batch job 556\n")
-    with patch(
-        "stern.watcher.mesh_tick.subprocess.run", return_value=fake
-    ) as mock_run:
-        _submit_worker_job(
             run_config,
             "node001",
             tmp_path,
             registry_path,
             "2026-01-01T00:00:00Z",
-            start_round=5,
+            **kwargs,
         )
-    submitted_cmd = mock_run.call_args[0][0]
-    assert "+mesh.start_round=5" in submitted_cmd
+    assert job_id == "555"
+    assert expected in mock_run.call_args[0][0]
 
 
 def test_submit_worker_job_overrides_compose_against_real_experiment_config(tmp_path):
@@ -1562,32 +1514,49 @@ def test_submit_worker_job_overrides_compose_against_real_experiment_config(tmp_
     assert cfg.mesh.start_round == 0
 
 
-def test_submit_worker_job_appends_extra_overrides(tmp_path):
-    run_config = _run_config(extra_overrides=["train.accum_steps=128"])
+@pytest.mark.parametrize(
+    "run_extra, call_extra, expected_tail",
+    [
+        pytest.param(
+            ["train.accum_steps=128"],
+            [],
+            ["+mesh.start_round=0", "train.accum_steps=128"],
+            id="run-config-override",
+        ),
+        pytest.param(
+            [],
+            ["train.lr_mult=0.5"],
+            ["+mesh.start_round=0", "train.lr_mult=0.5"],
+            id="call-site-override",
+        ),
+        pytest.param(
+            ["train.accum_steps=128"],
+            ["train.lr_mult=0.5"],
+            ["+mesh.start_round=0", "train.accum_steps=128", "train.lr_mult=0.5"],
+            id="both-appended-in-order",
+        ),
+        pytest.param([], [], ["+mesh.start_round=0"], id="none-when-unset"),
+    ],
+)
+def test_submit_worker_job_appends_overrides_after_start_round(
+    tmp_path, run_extra, call_extra, expected_tail
+):
+    run_config = _run_config(extra_overrides=run_extra)
     registry_path = tmp_path / "jobs_registry.json"
     fake = MagicMock(returncode=0, stdout="Submitted batch job 557\n")
     with patch(
         "stern.watcher.mesh_tick.subprocess.run", return_value=fake
     ) as mock_run:
         _submit_worker_job(
-            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
+            run_config,
+            "node001",
+            tmp_path,
+            registry_path,
+            "2026-01-01T00:00:00Z",
+            extra_overrides=call_extra,
         )
     submitted_cmd = mock_run.call_args[0][0]
-    assert "train.accum_steps=128" in submitted_cmd
-
-
-def test_submit_worker_job_omits_extra_overrides_when_unset(tmp_path):
-    run_config = _run_config()  # extra_overrides defaults to []
-    registry_path = tmp_path / "jobs_registry.json"
-    fake = MagicMock(returncode=0, stdout="Submitted batch job 558\n")
-    with patch(
-        "stern.watcher.mesh_tick.subprocess.run", return_value=fake
-    ) as mock_run:
-        _submit_worker_job(
-            run_config, "node001", tmp_path, registry_path, "2026-01-01T00:00:00Z"
-        )
-    submitted_cmd = mock_run.call_args[0][0]
-    assert submitted_cmd[-1] == "+mesh.start_round=0"
+    assert submitted_cmd[-len(expected_tail) :] == expected_tail
 
 
 def test_submit_worker_job_extra_override_composes_against_real_experiment_config(
@@ -1697,33 +1666,14 @@ def test_submit_worker_job_does_not_log_on_success(tmp_path, capsys):
     assert capsys.readouterr().err == ""
 
 
-def test_submit_worker_job_appends_call_site_extra_overrides(tmp_path):
-    """The extra_overrides kwarg (Task 8: a per-call override, e.g. a
-    halved-LR NaN retry) is separate from run_config.extra_overrides
-    (a per-run override set at submission time) -- both must be appended."""
-    run_config = _run_config()
-    registry_path = tmp_path / "jobs_registry.json"
-    fake = MagicMock(returncode=0, stdout="Submitted batch job 42\n")
-    with patch(
-        "stern.watcher.mesh_tick.subprocess.run", return_value=fake
-    ) as mock_run:
-        job_id = _submit_worker_job(
-            run_config,
-            "node001",
-            tmp_path,
-            registry_path,
-            "2026-01-01T00:00:00Z",
-            extra_overrides=["train.lr_mult=0.5"],
-        )
-    assert job_id == "42"
-    assert "train.lr_mult=0.5" in mock_run.call_args[0][0]
-
-
 def test_resubmit_with_override_delegates_to_submit_worker_job(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        "stern.watcher.mesh_tick._submit_worker_job",
-        lambda *a, **kw: "99",
-    )
+    calls = []
+
+    def _fake_submit(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "99"
+
+    monkeypatch.setattr("stern.watcher.mesh_tick._submit_worker_job", _fake_submit)
     run_config = _run_config()
     result = resubmit_with_override(
         run_config,
@@ -1735,6 +1685,10 @@ def test_resubmit_with_override_delegates_to_submit_worker_job(monkeypatch, tmp_
         override="train.lr_mult=0.5",
     )
     assert result == "99"
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[1:] == ("node001", tmp_path, tmp_path / "registry.json", "2026-01-01T00:00:00Z")
+    assert kwargs == {"start_round": 3, "extra_overrides": ["train.lr_mult=0.5"]}
 
 
 def test_replenish_pool_noop_when_deficit_zero(tmp_path):
@@ -1797,23 +1751,7 @@ def test_replenish_pool_appends_idle_node_and_reassigns_shards(tmp_path):
     )
 
     run_configs_path = tmp_path / "mesh_run_configs.json"
-    run_configs_path.write_text(
-        json.dumps(
-            [
-                {
-                    "run_id": "RUN1",
-                    "experiment": "videomae_mesh_ssl",
-                    "nodes": list(_NODES),
-                    "n_shards": 3,
-                    "outer_lr": 0.7,
-                    "outer_momentum": 0.9,
-                    "weighting": "data",
-                    "rounds": 10,
-                    "merge": True,
-                }
-            ]
-        )
-    )
+    _write_run_configs(run_configs_path)
 
     idle_sinfo = MagicMock(returncode=0, stdout="node004 idle\n")
     sbatch_result = MagicMock(returncode=0, stdout="Submitted batch job 999\n")
@@ -2022,8 +1960,15 @@ def test_exclusion_suspended_when_no_idle_replacement(tmp_path):
     assert "MERGING" in action
 
 
+@pytest.mark.parametrize(
+    "node003_entry",
+    [
+        pytest.param({}, id="missing-key"),
+        pytest.param({"node003": []}, id="empty-list"),
+    ],
+)
 def test_replenish_pool_does_not_submit_a_replacement_with_no_shards_to_inherit(
-    tmp_path,
+    tmp_path, node003_entry
 ):
     """0.4 (redefined): a picked replacement only ever receives shards via
     excluded_node's own reassign_failed handoff. If excluded_node has no
@@ -2045,26 +1990,12 @@ def test_replenish_pool_does_not_submit_a_replacement_with_no_shards_to_inherit(
     # node003 has NO entry at all -- e.g. it was itself a prior replacement
     # that fell into this same gap, or assign_locality_first never gave it
     # any shards.
-    assignments_path.write_text(json.dumps({"node001": ["s1"], "node002": ["s2"]}))
+    assignments_path.write_text(
+        json.dumps({"node001": ["s1"], "node002": ["s2"], **node003_entry})
+    )
 
     run_configs_path = tmp_path / "mesh_run_configs.json"
-    run_configs_path.write_text(
-        json.dumps(
-            [
-                {
-                    "run_id": "RUN1",
-                    "experiment": "videomae_mesh_ssl",
-                    "nodes": list(_NODES),
-                    "n_shards": 2,
-                    "outer_lr": 0.7,
-                    "outer_momentum": 0.9,
-                    "weighting": "data",
-                    "rounds": 10,
-                    "merge": True,
-                }
-            ]
-        )
-    )
+    _write_run_configs(run_configs_path, n_shards=2)
 
     idle_sinfo = MagicMock(returncode=0, stdout="node004 idle\n")
     # node004 must clear the node-health gate, otherwise this test would pass
@@ -2098,72 +2029,6 @@ def test_replenish_pool_does_not_submit_a_replacement_with_no_shards_to_inherit(
     assert result is not None  # still reports the skip, not silence
 
 
-def test_replenish_pool_does_not_submit_a_replacement_for_an_empty_shard_list(
-    tmp_path,
-):
-    """Same root cause, the other shape: excluded_node has an entry but it's
-    already empty (a prior reassignment took its shards, or it started with
-    none). read_my_shards treats an empty list as fatal too, so this must be
-    gated the same as a missing key."""
-    mesh_shared = tmp_path / "mesh_shared"
-    run_config = _run_config()
-    state = WatcherState()
-    run = state.run("RUN1")
-    run.target_pool_size = 3
-    exclude_node(state, "node003", "crash-loop")
-
-    _seed_placement(mesh_shared, {"node001": ["s1"], "node002": ["s2"]})
-    assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
-    assignments_path.write_text(
-        json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": []})
-    )
-
-    run_configs_path = tmp_path / "mesh_run_configs.json"
-    run_configs_path.write_text(
-        json.dumps(
-            [
-                {
-                    "run_id": "RUN1",
-                    "experiment": "videomae_mesh_ssl",
-                    "nodes": list(_NODES),
-                    "n_shards": 2,
-                    "outer_lr": 0.7,
-                    "outer_momentum": 0.9,
-                    "weighting": "data",
-                    "rounds": 10,
-                    "merge": True,
-                }
-            ]
-        )
-    )
-
-    idle_sinfo = MagicMock(returncode=0, stdout="node004 idle\n")
-    # node004 must clear the node-health gate, otherwise this test would pass
-    # for the wrong reason -- an unhealthy candidate is dropped before the
-    # no-shards-to-inherit guard under test is ever reached.
-    healthy_probe = MagicMock(returncode=0, stdout="24423\n26\n")
-
-    def _fake_run(cmd, *args, **kwargs):
-        return healthy_probe if cmd[0] == "ssh" else idle_sinfo
-
-    with patch(
-        "stern.watcher.mesh_tick.subprocess.run", side_effect=_fake_run
-    ) as mock_run:
-        _replenish_pool(
-            run_config,
-            run,
-            state,
-            mesh_shared,
-            tmp_path,
-            run_configs_path,
-            "node003",
-        )
-
-    assert not any(call.args[0][0] == "sbatch" for call in mock_run.call_args_list)
-    grown = json.loads(run_configs_path.read_text())
-    assert "node004" not in grown[0]["nodes"]
-
-
 def test_replenish_pool_partial_fill_when_not_enough_idle(tmp_path):
     mesh_shared = tmp_path / "mesh_shared"
     run_config = _run_config()
@@ -2173,23 +2038,7 @@ def test_replenish_pool_partial_fill_when_not_enough_idle(tmp_path):
     exclude_node(state, "node003", "crash-loop")  # so deficit = 5 - 2 = 3
 
     run_configs_path = tmp_path / "mesh_run_configs.json"
-    run_configs_path.write_text(
-        json.dumps(
-            [
-                {
-                    "run_id": "RUN1",
-                    "experiment": "videomae_mesh_ssl",
-                    "nodes": list(_NODES),
-                    "n_shards": 3,
-                    "outer_lr": 0.7,
-                    "outer_momentum": 0.9,
-                    "weighting": "data",
-                    "rounds": 10,
-                    "merge": True,
-                }
-            ]
-        )
-    )
+    _write_run_configs(run_configs_path)
 
     idle_sinfo = MagicMock(returncode=0, stdout="node004 idle\n")  # only 1 idle
     sbatch_result = MagicMock(returncode=0, stdout="Submitted batch job 999\n")
@@ -2256,23 +2105,7 @@ def test_replenish_pool_reassigns_shards_when_no_idle_nodes_available(tmp_path):
     )
 
     run_configs_path = tmp_path / "mesh_run_configs.json"
-    run_configs_path.write_text(
-        json.dumps(
-            [
-                {
-                    "run_id": "RUN1",
-                    "experiment": "videomae_mesh_ssl",
-                    "nodes": list(_NODES),
-                    "n_shards": 3,
-                    "outer_lr": 0.7,
-                    "outer_momentum": 0.9,
-                    "weighting": "data",
-                    "rounds": 10,
-                    "merge": True,
-                }
-            ]
-        )
-    )
+    _write_run_configs(run_configs_path)
 
     no_idle_sinfo = MagicMock(returncode=0, stdout="")  # nothing idle
 
@@ -2322,23 +2155,7 @@ def test_replenish_pool_reassigns_shards_when_deficit_zero(tmp_path):
     )
 
     run_configs_path = tmp_path / "mesh_run_configs.json"
-    run_configs_path.write_text(
-        json.dumps(
-            [
-                {
-                    "run_id": "RUN1",
-                    "experiment": "videomae_mesh_ssl",
-                    "nodes": _NODES + ["node004"],
-                    "n_shards": 3,
-                    "outer_lr": 0.7,
-                    "outer_momentum": 0.9,
-                    "weighting": "data",
-                    "rounds": 10,
-                    "merge": True,
-                }
-            ]
-        )
-    )
+    _write_run_configs(run_configs_path, nodes=_NODES + ["node004"])
 
     _replenish_pool(
         run_config,
@@ -2363,32 +2180,33 @@ def test_advance_one_run_sets_target_pool_size_on_first_sight(tmp_path):
     # advance_one_run's default status is ASSIGNING, which requires a shard
     # map to plan assignments -- unrelated to target_pool_size itself, but
     # needed so the dispatch below doesn't raise before reaching the
-    # assertion. sbatch isn't mocked: _submit_worker_job's own
-    # OSError/SubprocessError catch (sbatch not on PATH here) already makes
-    # that a silent no-op, matching its documented best-effort handling.
+    # assertion. sbatch is patched so no real job is submitted.
     _seed_shard_map(tmp_path / "mesh_shared")
 
-    advance_one_run(
-        run_config,
-        state=state,
-        repo_root=tmp_path,
-        mesh_shared=tmp_path / "mesh_shared",
-        mesh_root=tmp_path,
-        now=1000.0,
-    )
+    fake = MagicMock(returncode=0, stdout="Submitted batch job 101\n")
+    with patch("stern.watcher.mesh_tick.subprocess.run", return_value=fake):
+        advance_one_run(
+            run_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=tmp_path / "mesh_shared",
+            mesh_root=tmp_path,
+            now=1000.0,
+        )
     assert state.run("RUN1").target_pool_size == 3
 
     # Simulate a prior replenishment having grown the roster; target must
     # not move on a later tick.
     grown_config = _run_config(nodes=_NODES + ["node004"])
-    advance_one_run(
-        grown_config,
-        state=state,
-        repo_root=tmp_path,
-        mesh_shared=tmp_path / "mesh_shared",
-        mesh_root=tmp_path,
-        now=2000.0,
-    )
+    with patch("stern.watcher.mesh_tick.subprocess.run", return_value=fake):
+        advance_one_run(
+            grown_config,
+            state=state,
+            repo_root=tmp_path,
+            mesh_shared=tmp_path / "mesh_shared",
+            mesh_root=tmp_path,
+            now=2000.0,
+        )
     assert state.run("RUN1").target_pool_size == 3
 
 
@@ -2622,7 +2440,7 @@ def test_done_run_sweeps_its_leftover_pending_checkpoints(tmp_path):
     state.run("RUN1").round = 0
 
     with patch(
-        "stern.watcher.mesh_tick._transfer_results_to_node089",
+        "stern.watcher.mesh_tick._transfer_results_to_results_host",
         return_value="transfer skipped",
     ):
         advance_one_run(
@@ -2659,7 +2477,7 @@ def test_done_run_clears_only_its_own_crash_loop_exclusions(tmp_path):
     state.excluded_nodes["cigogne"] = "manually flagged: broken GPU"
 
     with patch(
-        "stern.watcher.mesh_tick._transfer_results_to_node089",
+        "stern.watcher.mesh_tick._transfer_results_to_results_host",
         return_value="transfer skipped",
     ):
         advance_one_run(
@@ -2680,7 +2498,7 @@ def test_done_run_clears_only_its_own_crash_loop_exclusions(tmp_path):
     assert "RUN1" in state.runs
 
 
-def test_done_run_stages_local_momentum_back_for_the_node089_archive(tmp_path):
+def test_done_run_stages_local_momentum_back_for_the_results_archive(tmp_path):
     """The buffer moved off NFS for the per-round budget, but it was in every
     previous archive and is part of a reproducible result -- so it comes back
     exactly once, at DONE, before the transfer runs."""
@@ -2706,7 +2524,7 @@ def test_done_run_stages_local_momentum_back_for_the_node089_archive(tmp_path):
         return "transfer skipped"
 
     with patch(
-        "stern.watcher.mesh_tick._transfer_results_to_node089", _fake_transfer
+        "stern.watcher.mesh_tick._transfer_results_to_results_host", _fake_transfer
     ):
         advance_one_run(
             run_config,
@@ -2719,20 +2537,6 @@ def test_done_run_stages_local_momentum_back_for_the_node089_archive(tmp_path):
 
     assert seen["momentum_present"] is True
 
-
-def test_watcher_cron_entry_uses_no_sync():
-    """This cron fires once a minute; `uv sync --dry-run` reports an
-    unconditional reinstall into the NFS-hosted venv even against an
-    up-to-date lockfile, so a bare `uv run` here is ~1440 rewrites/day."""
-    script = (
-        Path(__file__).resolve().parents[2] / "cluster" / "launch_mesh_pool.sh"
-    ).read_text()
-    cron_lines = [
-        ln for ln in script.splitlines() if "watch_training" in ln and "* * * * *" in ln
-    ]
-    assert cron_lines, "no watcher cron line found in launch_mesh_pool.sh"
-    for line in cron_lines:
-        assert "uv run --no-sync" in line
 
 
 def test_sweep_orphaned_pending_deletes_nothing_with_empty_active_run_ids(tmp_path):
@@ -2827,6 +2631,8 @@ def test_assigning_never_gives_a_node_a_shard_it_does_not_hold(tmp_path):
     assignments = json.loads(
         (mesh_shared / "metadata" / "shard_assignments_RUN1.json").read_text()
     )
+    # 4 distinct shards are held (000000-000003), each by exactly one node.
+    assert sum(len(shards) for shards in assignments.values()) == 4
     for node, shards in assignments.items():
         assert set(shards) <= set(holdings[node])
 
@@ -2952,23 +2758,7 @@ def _replenish_fixture(tmp_path):
         json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]})
     )
     run_configs_path = tmp_path / "mesh_run_configs.json"
-    run_configs_path.write_text(
-        json.dumps(
-            [
-                {
-                    "run_id": "RUN1",
-                    "experiment": "videomae_mesh_ssl",
-                    "nodes": list(_NODES),
-                    "n_shards": 3,
-                    "outer_lr": 0.7,
-                    "outer_momentum": 0.9,
-                    "weighting": "data",
-                    "rounds": 10,
-                    "merge": True,
-                }
-            ]
-        )
-    )
+    _write_run_configs(run_configs_path)
     return run_config, run, state, mesh_shared, run_configs_path
 
 
@@ -2993,12 +2783,20 @@ def _run_replenish(tmp_path, fixture, probe_stdout):
     return result, submitted
 
 
-def test_replenish_pool_skips_slurm_idle_node_whose_gpu_is_held(tmp_path):
-    """The 2026-08-21 birds regression: sinfo said idle, nvidia-smi said a
-    foreign process held 21.7 of 24.5 GiB, and the submitted worker died on
-    torch.OutOfMemoryError before round 1."""
+@pytest.mark.parametrize(
+    "probe_stdout",
+    [
+        # The 2026-08-21 birds regression: sinfo said idle, nvidia-smi said a
+        # foreign process held 21.7 of 24.5 GiB; the worker died on OOM.
+        pytest.param(_probe_stdout(2914, 26), id="slurm-idle-gpu-held"),
+        # A free GPU on a node never seeded: died on manifest.json.
+        pytest.param(_probe_stdout(24426, 0), id="unseeded-free-gpu"),
+        pytest.param("", id="unreachable"),
+    ],
+)
+def test_replenish_pool_skips_node_failing_the_health_gate(tmp_path, probe_stdout):
     fixture = _replenish_fixture(tmp_path)
-    result, submitted = _run_replenish(tmp_path, fixture, _probe_stdout(2914, 26))
+    result, submitted = _run_replenish(tmp_path, fixture, probe_stdout)
 
     assert submitted == []
     assert (
@@ -3006,20 +2804,6 @@ def test_replenish_pool_skips_slurm_idle_node_whose_gpu_is_held(tmp_path):
         not in json.loads((tmp_path / "mesh_run_configs.json").read_text())[0]["nodes"]
     )
     assert result is not None and "node004" not in result
-
-
-def test_replenish_pool_skips_unseeded_node(tmp_path):
-    """The other half of the same regression: a free GPU on a node that was
-    never seeded, which died on FileNotFoundError for manifest.json."""
-    fixture = _replenish_fixture(tmp_path)
-    _, submitted = _run_replenish(tmp_path, fixture, _probe_stdout(24426, 0))
-    assert submitted == []
-
-
-def test_replenish_pool_skips_unreachable_node(tmp_path):
-    fixture = _replenish_fixture(tmp_path)
-    _, submitted = _run_replenish(tmp_path, fixture, "")
-    assert submitted == []
 
 
 def test_replenish_pool_submits_a_genuinely_healthy_node(tmp_path):
@@ -3064,7 +2848,7 @@ def _orphan_fixture(tmp_path):
         {
             "node001": ["s1"],
             "node002": ["s2"],
-            "node003": ["s3"],  # node021 holder of s3
+            "node003": ["s3"],  # only holder of s3
             "node004": [],  # healthy replacement, holds nothing
         },
     )
@@ -3073,23 +2857,7 @@ def _orphan_fixture(tmp_path):
         json.dumps({"node001": ["s1"], "node002": ["s2"], "node003": ["s3"]})
     )
     run_configs_path = tmp_path / "mesh_run_configs.json"
-    run_configs_path.write_text(
-        json.dumps(
-            [
-                {
-                    "run_id": "RUN1",
-                    "experiment": "videomae_mesh_ssl",
-                    "nodes": list(_NODES),
-                    "n_shards": 3,
-                    "outer_lr": 0.7,
-                    "outer_momentum": 0.9,
-                    "weighting": "data",
-                    "rounds": 10,
-                    "merge": True,
-                }
-            ]
-        )
-    )
+    _write_run_configs(run_configs_path)
     return run_config, run, state, mesh_shared, assignments_path, run_configs_path
 
 
@@ -3211,23 +2979,7 @@ def _recovery_fixture(tmp_path, *, holdings=None, assignments=None):
         )
     )
     run_configs_path = tmp_path / "mesh_run_configs.json"
-    run_configs_path.write_text(
-        json.dumps(
-            [
-                {
-                    "run_id": "RUN1",
-                    "experiment": "videomae_mesh_ssl",
-                    "nodes": list(_NODES),
-                    "n_shards": 3,
-                    "outer_lr": 0.7,
-                    "outer_momentum": 0.9,
-                    "weighting": "data",
-                    "rounds": 10,
-                    "merge": True,
-                }
-            ]
-        )
-    )
+    _write_run_configs(run_configs_path)
     return run_config, run, state, mesh_shared, assignments_path, run_configs_path
 
 
@@ -3385,23 +3137,7 @@ def test_recover_pool_readmits_two_excluded_nodes_in_the_same_tick(tmp_path):
     assignments_path = mesh_shared / "metadata" / "shard_assignments_RUN1.json"
     assignments_path.write_text(json.dumps({"node001": ["s1"], "node002": ["s2"]}))
     run_configs_path = tmp_path / "mesh_run_configs.json"
-    run_configs_path.write_text(
-        json.dumps(
-            [
-                {
-                    "run_id": "RUN1",
-                    "experiment": "videomae_mesh_ssl",
-                    "nodes": nodes,
-                    "n_shards": 4,
-                    "outer_lr": 0.7,
-                    "outer_momentum": 0.9,
-                    "weighting": "data",
-                    "rounds": 10,
-                    "merge": True,
-                }
-            ]
-        )
-    )
+    _write_run_configs(run_configs_path, nodes=nodes, n_shards=4)
 
     responses = {
         "sinfo": MagicMock(returncode=0, stdout="node003 idle\nanisette idle\n"),

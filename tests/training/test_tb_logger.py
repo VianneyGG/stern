@@ -318,14 +318,24 @@ def test_flush_final_tb_rounds_never_raises_on_a_bad_tb_dir(tmp_path, monkeypatc
     flush_final_tb_rounds(tmp_path / "tb", tmp_path / "mesh_shared", "run1")
 
 
-def test_result_json_filename_with_run_tag():
-    assert result_json_filename("videomae_ssl_pretrain_voxmini", "p2-eb256") == (
-        "videomae_ssl_pretrain_voxmini-p2-eb256.json"
-    )
-
-
-def test_result_json_filename_without_run_tag():
-    assert result_json_filename("test_va_finetune", None) == "test_va_finetune.json"
+@pytest.mark.parametrize(
+    ("experiment_name", "run_tag", "expected"),
+    [
+        pytest.param(
+            "videomae_ssl_pretrain_voxmini",
+            "p2-eb256",
+            "videomae_ssl_pretrain_voxmini-p2-eb256.json",
+            id="with_run_tag",
+        ),
+        pytest.param(
+            "test_va_finetune", None, "test_va_finetune.json", id="without_run_tag"
+        ),
+    ],
+)
+def test_result_json_filename_appends_run_tag_when_set(
+    experiment_name, run_tag, expected
+):
+    assert result_json_filename(experiment_name, run_tag) == expected
 
 
 def _cfg(run_tag=None):

@@ -1,5 +1,6 @@
 """Unit tests for tube masking."""
 
+import pytest
 import torch
 
 from stern.models.videomae.masking import (
@@ -20,41 +21,51 @@ def _expected_kept(grid: tuple[int, int, int], ratio: float) -> int:
     return t * keep_spatial
 
 
+@pytest.mark.parametrize(
+    "grid, ratio",
+    [
+        pytest.param(BASE_GRID, 0.9, id="base-grid-0.9"),
+        pytest.param((4, 25, 10), 0.5, id="grid-4x25x10-0.5"),
+        pytest.param((4, 25, 10), 0.75, id="grid-4x25x10-0.75"),
+        pytest.param((4, 25, 10), 0.9, id="grid-4x25x10-0.9"),
+        pytest.param((4, 25, 10), 0.95, id="grid-4x25x10-0.95"),
+    ],
+)
+def test_tube_keeps_exactly_the_mask_ratio_share_of_tokens(grid, ratio):
+    """Kept count is T' * round((1 - ratio) * H'*W'); the rest is masked."""
+    keep_indices, mask_indices = RandomTubeMasking(mask_ratio=ratio)._sample_one(
+        None, grid, torch.device("cpu")
+    )
+    num_tokens = grid[0] * grid[1] * grid[2]
+    expected_kept = _expected_kept(grid, ratio)
+    assert len(keep_indices) == expected_kept, (
+        f"mask_ratio={ratio}: expected {expected_kept} kept, got {len(keep_indices)}"
+    )
+    assert len(mask_indices) == num_tokens - expected_kept
+
+
+@pytest.mark.parametrize(
+    "masker, pixel_values, grid",
+    [
+        pytest.param(RandomTubeMasking(mask_ratio=0.9), None, BASE_GRID, id="tube"),
+        pytest.param(RandomFrameMasking(mask_ratio=0.9), None, BASE_GRID, id="frame"),
+        pytest.param(
+            MotionGuidedTubeMasking(mask_ratio=0.75),
+            torch.randn(2, 3, 8, 32, 32),
+            (4, 2, 2),
+            id="motion-guided",
+        ),
+    ],
+)
+def test_keep_and_mask_partition_all_tokens(masker, pixel_values, grid):
+    """Keep and mask indices are disjoint and together cover exactly [0, N)."""
+    keep, mask = masker._sample_one(pixel_values, grid, torch.device("cpu"))
+    n = grid[0] * grid[1] * grid[2]
+    assert torch.equal(torch.sort(torch.cat([keep, mask]))[0], torch.arange(n))
+
+
 class TestRandomTubeMasking:
     """Verify tube masking keeps exactly the right number of tokens."""
-
-    def test_mask_ratio_preserved(self):
-        """Check that exactly T' * round((1 - mask_ratio) * H'*W') tokens are kept."""
-        masker = RandomTubeMasking(mask_ratio=0.9)
-        device = torch.device("cpu")
-
-        keep_indices, mask_indices = masker._sample_one(None, BASE_GRID, device)
-
-        num_tokens = BASE_GRID[0] * BASE_GRID[1] * BASE_GRID[2]
-        expected_kept = _expected_kept(BASE_GRID, 0.9)
-        assert len(keep_indices) == expected_kept, (
-            f"expected {expected_kept} kept tokens, got {len(keep_indices)}"
-        )
-        assert len(mask_indices) == num_tokens - expected_kept
-
-    def test_indices_disjoint_and_complete(self):
-        """Check that keep + mask indices partition [0, N)."""
-        masker = RandomTubeMasking(mask_ratio=0.9)
-        device = torch.device("cpu")
-
-        keep_indices, mask_indices = masker._sample_one(None, BASE_GRID, device)
-
-        num_tokens = BASE_GRID[0] * BASE_GRID[1] * BASE_GRID[2]
-
-        # Indices must be disjoint
-        combined = torch.cat([keep_indices, mask_indices])
-        unique = torch.unique(combined)
-        assert len(unique) == len(combined), "keep and mask indices overlap"
-
-        # Indices must cover [0, N)
-        assert len(unique) == num_tokens, (
-            f"indices do not cover full range: got {len(unique)}, expected {num_tokens}"
-        )
 
     def test_is_tube_structured(self):
         """The defining property: each spatial position is kept in ALL frames or none.
@@ -125,19 +136,6 @@ class TestMotionGuidedTubeMasking:
         assert 0 in masked_spatial
         assert 0 not in kept_spatial
 
-    def test_indices_disjoint_and_complete(self):
-        device = torch.device("cpu")
-        grid = (4, 2, 2)
-        pixel_values = torch.randn(2, 3, 8, 32, 32)
-        masker = MotionGuidedTubeMasking(mask_ratio=0.75)
-        keep_indices, mask_indices = masker._sample_one(pixel_values, grid, device)
-
-        num_tokens = 4 * 2 * 2
-        combined = torch.cat([keep_indices, mask_indices])
-        unique = torch.unique(combined)
-        assert len(unique) == len(combined)
-        assert len(unique) == num_tokens
-
 
 def _is_tube_structured(keep_indices: torch.Tensor, grid: tuple[int, int, int]) -> bool:
     """True when every spatial column is kept in every frame or in none."""
@@ -155,13 +153,6 @@ def _expected_masked_tube(grid: tuple[int, int, int], ratio: float) -> int:
 
 
 class TestRandomFrameMasking:
-    def test_partitions_all_tokens(self):
-        keep, mask = RandomFrameMasking(mask_ratio=0.9)._sample_one(
-            None, BASE_GRID, torch.device("cpu")
-        )
-        n = BASE_GRID[0] * BASE_GRID[1] * BASE_GRID[2]
-        assert torch.equal(torch.sort(torch.cat([keep, mask]))[0], torch.arange(n))
-
     def test_exact_mask_count(self):
         n = BASE_GRID[0] * BASE_GRID[1] * BASE_GRID[2]
         keep, mask = RandomFrameMasking(mask_ratio=0.9)._sample_one(
@@ -288,6 +279,7 @@ class TestPerSampleBatching:
         """The mixin is shared, but each masker must actually inherit it."""
         device = torch.device("cpu")
         pixel_values = torch.randn(3, 3, 16, 224, 224)
+        torch.manual_seed(0)
         for masker in (
             RandomTubeMasking(mask_ratio=0.9),
             RandomFrameMasking(mask_ratio=0.9),
@@ -296,6 +288,9 @@ class TestPerSampleBatching:
         ):
             keep, mask = masker(pixel_values, BASE_GRID, device, batch_size=3)
             assert keep.shape[0] == 3 and mask.shape[0] == 3, type(masker).__name__
+            assert len({tuple(row.tolist()) for row in keep}) == 3, (
+                f"{type(masker).__name__}: batch rows share one keep set"
+            )
 
     def test_motion_guided_masking_follows_each_sample_own_motion(self):
         """Motion is per-sample, not averaged across the batch.

@@ -1529,7 +1529,7 @@ RESULTS_HOST = setting("STERN_RESULTS_HOST")
 RESULTS_ROOT = str(data_root() / "stern_mesh_results")
 
 
-def _transfer_results_to_node089(run_config: MeshRunConfig, mesh_shared: Path) -> str:
+def _transfer_results_to_results_host(run_config: MeshRunConfig, mesh_shared: Path) -> str:
     """Best-effort: rsync the run's checkpoint dir to the results host, then
     delete the NFS copy.
 
@@ -1708,7 +1708,7 @@ def _do_syncing(
             run_config.run_id,
         )
         _stage_local_merge_state_for_archive(run_config, mesh_shared)
-        transfer_note = _transfer_results_to_node089(run_config, mesh_shared)
+        transfer_note = _transfer_results_to_results_host(run_config, mesh_shared)
         # Cancel before sweeping, so no straggler writes into pending/ after the
         # sweep.
         cancel_note = _cancel_run_workers(run_config.run_id, repo_root)

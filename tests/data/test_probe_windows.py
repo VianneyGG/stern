@@ -377,20 +377,16 @@ class TestFrameStride:
     (AFEW-VA ~30fps vs 8.33fps shards). What must not break is the alignment
     contract: the label has to describe the frames the model was handed."""
 
-    def test_stride_one_is_the_pre_stride_behaviour(self, tmp_path):
-        labelled = _labelled(tmp_path, ["a/clip"], n_frames=NUM_FRAMES * 4)
-        assert len(_dataset(labelled, hi=100.0)) == len(
-            VAWindowDataset(
-                labelled,
-                num_frames=NUM_FRAMES,
-                image_size=IMAGE_SIZE,
-                overlap=0.0,
-                va_range=(0.0, 100.0),
-                frame_stride=1,
-            )
-        )
-
-    def test_strided_window_returns_every_nth_frame(self, tmp_path):
+    @pytest.mark.parametrize(
+        "frame_stride, sampled_frames",
+        [
+            pytest.param(1, [0, 1, 2, 3], id="stride_1_contiguous"),
+            pytest.param(3, [0, 3, 6, 9], id="stride_3_every_third"),
+        ],
+    )
+    def test_window_returns_frames_at_the_stride_step(
+        self, tmp_path, frame_stride, sampled_frames
+    ):
         labelled = _labelled(tmp_path, ["a/clip"], n_frames=NUM_FRAMES * 4)
         dataset = VAWindowDataset(
             labelled,
@@ -398,16 +394,15 @@ class TestFrameStride:
             image_size=IMAGE_SIZE,
             overlap=0.0,
             va_range=(0.0, 100.0),
-            frame_stride=3,
+            frame_stride=frame_stride,
         )
         pixel_values, _ = dataset[0]
-        # frame i is a solid image of value i (see _write_indexed_frames), and
-        # preprocess_window normalises, so compare the *ordering* of frame means
-        # against the strided index list rather than raw pixel values.
-        frame_means = pixel_values[0].mean(dim=(1, 2))
-        steps = (frame_means[1:] - frame_means[:-1]).tolist()
-        assert all(step > 0 for step in steps)
-        assert steps[0] == pytest.approx(steps[-1], rel=1e-3)
+        # Frame v is solid pixel value v (uint8). preprocess_window maps it to
+        # (v/255 - mean_0) / std_0 on channel 0 with ImageNet mean 0.485 and
+        # std 0.229, e.g. v=0 -> -0.485/0.229 = -2.1179 and v=3 -> -2.0665.
+        expected = [(v / 255.0 - 0.485) / 0.229 for v in sampled_frames]
+        frame_means = pixel_values[0].mean(dim=(1, 2)).tolist()
+        assert frame_means == pytest.approx(expected, abs=1e-4)
 
     def test_strided_label_averages_only_the_sampled_rows(self, tmp_path):
         """The trap: averaging `va[start:start+num_frames]` under a stride would

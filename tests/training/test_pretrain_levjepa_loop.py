@@ -30,15 +30,32 @@ class _FakeRawDataset(torch.utils.data.Dataset):
         )
 
 
-def test_levjepa_view_dataset_builds_views_per_item():
-    raw = _FakeRawDataset(n=2, num_frames=16, size=32)
-    ds = LeVJEPAViewDataset(raw, num_local=3, global_size=32, local_size=16)
+@pytest.mark.parametrize(
+    ("dataset_kind", "num_local", "expected_items"),
+    [
+        pytest.param("map_style", 3, 1, id="map_style_first_item"),
+        pytest.param("iterable", 2, 3, id="iterable_stream"),
+    ],
+)
+def test_levjepa_view_dataset_builds_views_per_item(
+    dataset_kind, num_local, expected_items
+):
+    if dataset_kind == "map_style":
+        raw = _FakeRawDataset(n=2, num_frames=16, size=32)
+        ds = LeVJEPAViewDataset(raw, num_local=num_local, global_size=32, local_size=16)
+        items = [ds[0]]
+    else:
+        raw = _FakeRawIterableDataset(n=3, num_frames=16, size=32)
+        ds = LeVJEPAViewIterableDataset(
+            raw, num_local=num_local, global_size=32, local_size=16
+        )
+        items = list(ds)
 
-    global_view, local_views, crop_boxes = ds[0]
-
+    assert len(items) == expected_items
+    global_view, local_views, crop_boxes = items[0]
     assert global_view.shape == (3, 16, 32, 32)
-    assert local_views.shape == (3, 3, 16, 16, 16)
-    assert crop_boxes.shape == (3, 4)
+    assert local_views.shape == (num_local, 3, 16, 16, 16)
+    assert crop_boxes.shape == (num_local, 4)
 
 
 class _FakeRawIterableDataset(torch.utils.data.IterableDataset):
@@ -59,19 +76,6 @@ class _FakeRawIterableDataset(torch.utils.data.IterableDataset):
             yield torch.randint(
                 0, 256, (self._num_frames, self._size, self._size, 3), dtype=torch.uint8
             )
-
-
-def test_levjepa_view_iterable_dataset_builds_views_per_clip():
-    raw = _FakeRawIterableDataset(n=3, num_frames=16, size=32)
-    ds = LeVJEPAViewIterableDataset(raw, num_local=2, global_size=32, local_size=16)
-
-    items = list(ds)
-
-    assert len(items) == 3
-    global_view, local_views, crop_boxes = items[0]
-    assert global_view.shape == (3, 16, 32, 32)
-    assert local_views.shape == (2, 3, 16, 16, 16)
-    assert crop_boxes.shape == (2, 4)
 
 
 def test_levjepa_view_iterable_dataset_forwards_set_round():
@@ -183,11 +187,24 @@ def test_resume_continues_from_saved_epoch(tmp_path, monkeypatch):
         mod, "_build_levjepa_loader", lambda cfg, rank, world_size: _fake_loader()
     )
 
+    # Epoch 0 (2 batches) in the first call leaves AdamW step=2 on disk.
     cfg = _tiny_levjepa_cfg(tmp_path, epochs=1)
     run_levjepa_pretrain_stage(
         cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
     )
 
+    saved_epochs: list[int] = []
+    real_payload = mod._payload
+
+    def _spying_payload(
+        encoder, projector, optimizer, ema, epoch, total_loss, **kwargs
+    ):
+        saved_epochs.append(epoch)
+        return real_payload(
+            encoder, projector, optimizer, ema, epoch, total_loss, **kwargs
+        )
+
+    monkeypatch.setattr(mod, "_payload", _spying_payload)
     cfg_resumed = _tiny_levjepa_cfg(tmp_path, epochs=2, resume=True)
     result = run_levjepa_pretrain_stage(
         cfg_resumed, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
@@ -195,7 +212,13 @@ def test_resume_continues_from_saved_epoch(tmp_path, monkeypatch):
 
     ckpt_root = tmp_path / cfg.experiment.name
     latest = torch.load(ckpt_root / "latest.pt", weights_only=False)
+    # Only epoch 1 runs on resume; a run that ignores the checkpoint saves [0, 1].
+    assert saved_epochs == [1]
     assert latest["epoch"] == 1
+    # Epoch 1 adds 2 batches: 2 + 2 = 4 only if the AdamW state was reloaded
+    # (a fresh optimizer would end at 2).
+    steps = {int(s["step"]) for s in latest["optimizer_state_dict"]["state"].values()}
+    assert steps == {4}
     assert not torch.isnan(torch.tensor(result["total_loss"]))
 
 
@@ -268,7 +291,6 @@ def test_lr_follows_warmup_cosine_schedule(tmp_path, monkeypatch):
     at a flat LR for the whole run -- flat AdamW has no LR decay at all,
     which this regresses against."""
     import stern.training.pretrain_levjepa as mod
-    from stern.training.pretrain import _build_scheduler
 
     captured_lrs = []
     real_payload = mod._payload
@@ -291,19 +313,15 @@ def test_lr_follows_warmup_cosine_schedule(tmp_path, monkeypatch):
         cfg, rank=0, world_size=1, local_rank=0, device=torch.device("cpu")
     )
 
-    ref_optimizer = torch.optim.AdamW(
-        [torch.nn.Parameter(torch.zeros(1))], lr=cfg.train.lr
-    )
-    ref_scheduler = _build_scheduler(ref_optimizer, cfg)
-    expected_lrs = []
-    for _ in range(3):
-        ref_scheduler.step()
-        expected_lrs.append(ref_optimizer.param_groups[0]["lr"])
-
+    # Hand-derived for lr=1e-4, epochs=3, warmup_epochs=1. Warmup is a
+    # LinearLR for one step (start_factor=1e-2); from step 1 on it is a
+    # CosineAnnealingLR with T_max = epochs - warmup = 2. The payload is
+    # written after scheduler.step(), so epoch e records the LR after e+1 steps:
+    #   after 1 step: cosine at t=0          -> 1e-4
+    #   after 2 steps: 1e-4 * (1+cos(pi/2))/2 -> 5e-5
+    #   after 3 steps: 1e-4 * (1+cos(pi))/2   -> 0
     assert len(captured_lrs) == 3
-    assert captured_lrs == pytest.approx(expected_lrs, rel=1e-5)
-    # warmup_epochs=1 with epochs=3 guarantees a strict LR change epoch-to-epoch
-    assert captured_lrs[0] != pytest.approx(captured_lrs[1])
+    assert captured_lrs == pytest.approx([1e-4, 5e-5, 0.0], rel=1e-6, abs=1e-12)
 
 
 def _run_capturing_lrs(cfg, monkeypatch, *, mod, real_payload):

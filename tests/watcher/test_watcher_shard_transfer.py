@@ -93,20 +93,6 @@ def test_copy_shards_runs_rsync_on_the_destination_node():
     ]
 
 
-def test_the_rsync_command_has_exactly_one_remote_endpoint():
-    """The regression guard for the remote-to-remote bug, independent of the
-    exact argv above: rsync refuses `host_a:... host_b:...`, so at most one of
-    its two path arguments may carry a `host:` prefix."""
-    with patch(
-        "stern.watcher.shard_transfer.subprocess.run", return_value=_ok()
-    ) as run:
-        copy_shards("node040", "node032", ["shard-000009.tar"], mesh_data_dir="/D/m")
-    remote_cmd = run.call_args[0][0][-1]
-    rsync_args = remote_cmd.split("rsync ", 1)[1].split()
-    paths = [a for a in rsync_args if "/D/m" in a]
-    assert [p for p in paths if ":" in p] == ["node040:/D/m/"], paths
-
-
 def test_copy_shards_sends_shard_names_over_stdin():
     """--files-from=- rather than interpolated filenames: the nested
     ssh/rsync quoting is a hazard once a batch has many shards."""

@@ -72,14 +72,20 @@ def test_another_runs_live_job_does_not_mask_this_runs_departure():
     assert _call(registry=[_job("1", "run-b")], snapshot={}) is False
 
 
-@pytest.mark.parametrize("status", ["MERGING", "SYNCING", "DONE", "ASSIGNING"])
-def test_only_relaunches_from_states_where_workers_should_be_running(status):
-    assert _call(status=status) is False
-
-
-@pytest.mark.parametrize("status", ["RUNNING", "AWAITING_CHECKPOINTS", "DEGRADED"])
-def test_relaunches_from_all_worker_running_states(status):
-    assert _call(status=status) is True
+@pytest.mark.parametrize(
+    "status, relaunches",
+    [
+        ("RUNNING", True),
+        ("AWAITING_CHECKPOINTS", True),
+        ("DEGRADED", True),
+        ("MERGING", False),
+        ("SYNCING", False),
+        ("DONE", False),
+        ("ASSIGNING", False),
+    ],
+)
+def test_relaunches_only_from_worker_running_states(status, relaunches):
+    assert _call(status=status) is relaunches
 
 
 def test_a_just_submitted_chunk_is_not_immediately_relaunched():

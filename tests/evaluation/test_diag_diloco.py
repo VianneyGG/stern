@@ -1072,30 +1072,35 @@ def test_check_replays_the_run_configured_weighting(tmp_path):
     )
 
 
-def test_forward_pass_failure_is_a_skip_and_12a_survives(tmp_path, monkeypatch):
-    def oom(*args, **kwargs):
-        raise RuntimeError("CUDA out of memory")
+@pytest.mark.parametrize(
+    "trigger, expected_reason",
+    [
+        pytest.param("forward_pass_oom", "RuntimeError: CUDA out of memory", id="forward_pass_oom"),
+        pytest.param("unreplayable_weighting", "no_such_weighting", id="unreplayable_weighting"),
+    ],
+)
+def test_12b_is_skipped_with_its_reason_and_12a_survives(
+    tmp_path, monkeypatch, trigger, expected_reason
+):
+    inputs = _forward_pass_inputs(tmp_path)
+    if trigger == "forward_pass_oom":
 
-    monkeypatch.setattr(diag_diloco, "mae_loss_fn", oom)
-    reports = check(None, _forward_pass_inputs(tmp_path))
+        def oom(*args, **kwargs):
+            raise RuntimeError("CUDA out of memory")
+
+        monkeypatch.setattr(diag_diloco, "mae_loss_fn", oom)
+    else:
+        inputs["diloco_weighting"] = "no_such_weighting"
+    reports = check(None, inputs)
     assert "mean_cos" in reports["agreement_matrix"].metrics
     for name in ("merge_regression", "counterfactual_sweep"):
         assert reports[name].metrics == {}
-        assert "RuntimeError: CUDA out of memory" in reports[name].meta["skipped"]
+        assert expected_reason in reports[name].meta["skipped"]
 
 
 def test_check_reports_a_custom_skip_reason_without_a_snapshot():
     reports = check(None, {"diloco_skip_reason": "no outer hyperparameters"})
     assert {r.meta["skipped"] for r in reports.values()} == {"no outer hyperparameters"}
-
-
-def test_an_unreplayable_run_weighting_skips_12b(tmp_path):
-    inputs = _forward_pass_inputs(tmp_path)
-    inputs["diloco_weighting"] = "no_such_weighting"
-    reports = check(None, inputs)
-    assert "mean_cos" in reports["agreement_matrix"].metrics
-    for name in ("merge_regression", "counterfactual_sweep"):
-        assert "no_such_weighting" in reports[name].meta["skipped"]
 
 
 def test_fewer_than_three_replicates_is_refused_before_any_forward_pass(tmp_path, monkeypatch):

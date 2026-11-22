@@ -70,7 +70,23 @@ def _completed(returncode=0):
     return r
 
 
-def test_train_shards_land_flat_under_mesh_dir_matching_resolve_shard():
+@pytest.mark.parametrize(
+    ("subdir", "remote_source_dir", "dest"),
+    [
+        # Train shards land flat under mesh_dir, where resolve_shard looks.
+        pytest.param(None, "/Data/stern-user/shards", "/Data/stern-user/mesh", id="train_flat"),
+        # Val shards stay under mesh_dir/val, isolated from train.
+        pytest.param(
+            "val",
+            "/Data/stern-user/shards/val",
+            "/Data/stern-user/mesh/val",
+            id="val_subdir",
+        ),
+    ],
+)
+def test_pull_lands_shards_in_the_layout_resolve_shard_expects(
+    subdir, remote_source_dir, dest
+):
     with patch("stern.mesh.seed_nodes.subprocess.run") as run:
         run.return_value = _completed()
         _execute_rsync_pull(
@@ -78,35 +94,15 @@ def test_train_shards_land_flat_under_mesh_dir_matching_resolve_shard():
             "node002",
             ["shard-000000.tar"],
             mesh_dir="/Data/stern-user/mesh",
-            remote_source_dir="/Data/stern-user/shards",
+            remote_source_dir=remote_source_dir,
+            subdir=subdir,
         )
 
     remote_cmd = run.call_args.args[0][-1]
-    assert "mkdir -p /Data/stern-user/mesh &&" in remote_cmd
-    assert "chmod 700 /Data/stern-user/mesh &&" in remote_cmd
-    assert remote_cmd.rstrip().endswith("/Data/stern-user/mesh/")
+    assert remote_cmd.rstrip().endswith(f"{dest}/")
+    assert dest in remote_cmd.split("mkdir -p", 1)[1].split("&&")[0]
+    assert dest in remote_cmd.split("chmod 700", 1)[1].split("&&")[0]
     assert "/mesh/shards" not in remote_cmd
-
-
-def test_val_shards_stay_under_a_val_subdir_isolated_from_train():
-    with patch("stern.mesh.seed_nodes.subprocess.run") as run:
-        run.return_value = _completed()
-        _execute_rsync_pull(
-            "node001",
-            "node002",
-            ["shard-000000.tar"],
-            mesh_dir="/Data/stern-user/mesh",
-            remote_source_dir="/Data/stern-user/shards/val",
-            subdir="val",
-        )
-
-    remote_cmd = run.call_args.args[0][-1]
-    assert "/Data/stern-user/mesh/val" in remote_cmd
-    assert "chmod 700" in remote_cmd
-    assert (
-        "/Data/stern-user/mesh/val"
-        in remote_cmd.split("chmod 700", 1)[1].split("&&")[0]
-    )
 
 
 def test_symlink_source_node_links_own_train_and_val_shards_not_copies():

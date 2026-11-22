@@ -13,17 +13,21 @@ from stern.prep.download_voxmini import (
 pytestmark = pytest.mark.integration
 
 
-def test_require_credentials_raises_when_unset(monkeypatch):
+@pytest.mark.parametrize(
+    "user, password",
+    [
+        pytest.param(None, None, id="neither_set"),
+        pytest.param("alice", None, id="only_user_set"),
+        pytest.param(None, "secret", id="only_password_set"),
+    ],
+)
+def test_require_credentials_raises_unless_both_are_set(monkeypatch, user, password):
     monkeypatch.delenv("VOXCELEB_USER", raising=False)
     monkeypatch.delenv("VOXCELEB_PASS", raising=False)
-
-    with pytest.raises(MissingCredentialsError, match="must both be set"):
-        require_credentials()
-
-
-def test_require_credentials_raises_when_only_one_set(monkeypatch):
-    monkeypatch.setenv("VOXCELEB_USER", "alice")
-    monkeypatch.delenv("VOXCELEB_PASS", raising=False)
+    if user is not None:
+        monkeypatch.setenv("VOXCELEB_USER", user)
+    if password is not None:
+        monkeypatch.setenv("VOXCELEB_PASS", password)
 
     with pytest.raises(MissingCredentialsError, match="must both be set"):
         require_credentials()

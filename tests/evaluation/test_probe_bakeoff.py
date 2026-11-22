@@ -9,6 +9,7 @@ isn't one.
 from __future__ import annotations
 
 import json
+import random
 
 import pytest
 import torch
@@ -152,20 +153,15 @@ def test_model_cfg_for_run_raises_when_the_entry_names_no_experiment(tmp_path):
 
 
 def test_permuted_labels_are_a_permutation_of_the_originals():
-    """Bound to the exact rows `torch.randperm` produces for this seed
-    ([2, 5, 3, 0, 1, 4]), so a change of generator, of dimension permuted, or
-    of the seed's derivation shows up here rather than in a CCC that merely
-    looks low."""
+    """Same multiset of rows, reordered: no row is lost, duplicated or altered,
+    and the order actually changes (an identity permutation would make the
+    negative control a no-op)."""
     labels = torch.arange(12, dtype=torch.float32).reshape(6, 2)
     permuted = probe_bakeoff.permute_labels(labels, seed=0)
-    assert permuted.tolist() == [
-        [4.0, 5.0],
-        [10.0, 11.0],
-        [6.0, 7.0],
-        [0.0, 1.0],
-        [2.0, 3.0],
-        [8.0, 9.0],
-    ]
+    assert sorted(map(tuple, permuted.tolist())) == sorted(
+        map(tuple, labels.tolist())
+    )
+    assert not torch.equal(permuted, labels)
 
 
 def test_permuted_labels_keep_each_row_intact():
@@ -239,39 +235,42 @@ def _tiny_base_cfg_file(tmp_path):
     return path
 
 
-def test_main_writes_a_report_with_both_arms_per_layer(tmp_path, monkeypatch):
-    recorder: dict = {}
-    monkeypatch.setattr(probe_bakeoff, "probe_by_depth", _stub_probe_by_depth(recorder))
-    experiment_dir = _write_experiment(tmp_path, "solo", "model: {}\n")
+def _random_init_argv(tmp_path, *, layers: str, extra=(), experiment_body="model: {}\n"):
+    """argv for a random_init run; the main() tests in this block share it."""
+    experiment_dir = _write_experiment(tmp_path, "solo", experiment_body)
     configs = tmp_path / "mesh_run_configs.json"
     configs.write_text(json.dumps([{"run_id": "random_init", "experiment": "solo"}]))
     manifest = tmp_path / "manifest.csv"
     manifest.write_text("")
-    out = tmp_path / "report.json"
+    return [
+        "--run-id",
+        "random_init",
+        "--manifest",
+        str(manifest),
+        "--mesh-shared",
+        str(tmp_path),
+        "--configs",
+        str(configs),
+        "--model-cfg",
+        str(_tiny_base_cfg_file(tmp_path)),
+        "--experiment-dir",
+        str(experiment_dir),
+        "--layers",
+        layers,
+        "--out",
+        str(tmp_path / "report.json"),
+        *extra,
+    ]
 
-    exit_code = probe_bakeoff.main(
-        [
-            "--run-id",
-            "random_init",
-            "--manifest",
-            str(manifest),
-            "--mesh-shared",
-            str(tmp_path),
-            "--configs",
-            str(configs),
-            "--model-cfg",
-            str(_tiny_base_cfg_file(tmp_path)),
-            "--experiment-dir",
-            str(experiment_dir),
-            "--layers",
-            "1,2",
-            "--out",
-            str(out),
-        ]
-    )
+
+def test_main_writes_a_report_with_both_arms_per_layer(tmp_path, monkeypatch):
+    recorder: dict = {}
+    monkeypatch.setattr(probe_bakeoff, "probe_by_depth", _stub_probe_by_depth(recorder))
+
+    exit_code = probe_bakeoff.main(_random_init_argv(tmp_path, layers="1,2"))
 
     assert exit_code == 0
-    payload = json.loads(out.read_text())
+    payload = json.loads((tmp_path / "report.json").read_text())
     assert payload["metrics"]["probe_ccc_L1"]["mean"] == pytest.approx(0.5)
     assert payload["metrics"]["probe_ccc_L1_control"]["mean"] == pytest.approx(0.4)
     assert payload["metrics"]["probe_ccc_L2"]["mean"] == pytest.approx(0.5)
@@ -291,105 +290,36 @@ def test_main_random_init_run_id_touches_no_checkpoint(tmp_path, monkeypatch):
         raise AssertionError("load_bundle must not be called for random_init")
 
     monkeypatch.setattr(probe_bakeoff, "load_bundle", _fail)
-    experiment_dir = _write_experiment(tmp_path, "solo", "model: {}\n")
-    configs = tmp_path / "mesh_run_configs.json"
-    configs.write_text(json.dumps([{"run_id": "random_init", "experiment": "solo"}]))
-    manifest = tmp_path / "manifest.csv"
-    manifest.write_text("")
 
-    probe_bakeoff.main(
-        [
-            "--run-id",
-            "random_init",
-            "--manifest",
-            str(manifest),
-            "--mesh-shared",
-            str(tmp_path),
-            "--configs",
-            str(configs),
-            "--model-cfg",
-            str(_tiny_base_cfg_file(tmp_path)),
-            "--experiment-dir",
-            str(experiment_dir),
-            "--layers",
-            "1",
-            "--out",
-            str(tmp_path / "report.json"),
-        ]
-    )
+    probe_bakeoff.main(_random_init_argv(tmp_path, layers="1"))
     assert recorder["bundle"].run_id == "random_init"
 
 
 def test_main_passes_the_permute_seed_through(tmp_path, monkeypatch):
     recorder: dict = {}
     monkeypatch.setattr(probe_bakeoff, "probe_by_depth", _stub_probe_by_depth(recorder))
-    experiment_dir = _write_experiment(tmp_path, "solo", "model: {}\n")
-    configs = tmp_path / "mesh_run_configs.json"
-    configs.write_text(json.dumps([{"run_id": "random_init", "experiment": "solo"}]))
-    manifest = tmp_path / "manifest.csv"
-    manifest.write_text("")
-    out = tmp_path / "report.json"
 
     probe_bakeoff.main(
-        [
-            "--run-id",
-            "random_init",
-            "--manifest",
-            str(manifest),
-            "--mesh-shared",
-            str(tmp_path),
-            "--configs",
-            str(configs),
-            "--model-cfg",
-            str(_tiny_base_cfg_file(tmp_path)),
-            "--experiment-dir",
-            str(experiment_dir),
-            "--layers",
-            "1",
-            "--permute-labels-seed",
-            "7",
-            "--out",
-            str(out),
-        ]
+        _random_init_argv(tmp_path, layers="1", extra=("--permute-labels-seed", "7"))
     )
     assert recorder["kwargs"]["permute_labels_seed"] == 7
-    assert json.loads(out.read_text())["meta"]["permute_labels_seed"] == 7
+    meta = json.loads((tmp_path / "report.json").read_text())["meta"]
+    assert meta["permute_labels_seed"] == 7
 
 
 def test_main_records_the_resolved_model_cfg_in_the_report(tmp_path, monkeypatch):
     """The report has to say which geometry was loaded: two arms probed under
     different depths are not comparable, and the run_id does not carry it."""
     monkeypatch.setattr(probe_bakeoff, "probe_by_depth", _stub_probe_by_depth({}))
-    experiment_dir = _write_experiment(
-        tmp_path, "solo", "model:\n  target_mode: per_frame\n"
-    )
-    configs = tmp_path / "mesh_run_configs.json"
-    configs.write_text(json.dumps([{"run_id": "random_init", "experiment": "solo"}]))
-    manifest = tmp_path / "manifest.csv"
-    manifest.write_text("")
-    out = tmp_path / "report.json"
 
     probe_bakeoff.main(
-        [
-            "--run-id",
-            "random_init",
-            "--manifest",
-            str(manifest),
-            "--mesh-shared",
-            str(tmp_path),
-            "--configs",
-            str(configs),
-            "--model-cfg",
-            str(_tiny_base_cfg_file(tmp_path)),
-            "--experiment-dir",
-            str(experiment_dir),
-            "--layers",
-            "1",
-            "--out",
-            str(out),
-        ]
+        _random_init_argv(
+            tmp_path,
+            layers="1",
+            experiment_body="model:\n  target_mode: per_frame\n",
+        )
     )
-    meta = json.loads(out.read_text())["meta"]
+    meta = json.loads((tmp_path / "report.json").read_text())["meta"]
     assert meta["model_cfg"]["target_mode"] == "per_frame"
     assert meta["model_cfg"]["depth"] == _base_cfg().depth
 
@@ -442,10 +372,10 @@ def _record_probe_ccc(monkeypatch):
     return calls
 
 
-def _replicate_seeds(base: int, n: int = 3) -> list[int]:
-    import random
-
-    rng = random.Random(base)
+def _expected_seeds(seed_base: int, n: int = 3) -> list[int]:
+    """The seeds an arm's replicates should get, derived independently of
+    production: a local `random.Random(seed_base)` drawing `n` values below 2**32."""
+    rng = random.Random(seed_base)
     return [rng.randrange(2**32) for _ in range(n)]
 
 
@@ -466,7 +396,7 @@ def test_control_arm_never_loads_the_checkpoint_and_writes_only_control_keys(
     assert payload["meta"]["arm"] == "control"
     assert payload["meta"]["run_id"] == "lev-run"
     # The paired sweep's control seed base (1), so a split run reproduces it.
-    assert [c["seed"] for c in calls if c["layer"] == 1] == _replicate_seeds(1)
+    assert [c["seed"] for c in calls if c["layer"] == 1] == _expected_seeds(1)
     assert sorted({c["layer"] for c in calls}) == [1, 2]
 
 
@@ -484,7 +414,7 @@ def test_checkpoint_arm_writes_only_checkpoint_keys_on_the_loaded_bundle(
     assert payload["metrics"]["probe_ccc_L2"]["n"] == 3
     assert payload["meta"]["arm"] == "checkpoint"
     assert all(c["bundle"] is loaded for c in calls)
-    assert [c["seed"] for c in calls if c["layer"] == 2] == _replicate_seeds(0)
+    assert [c["seed"] for c in calls if c["layer"] == 2] == _expected_seeds(0)
 
 
 def test_control_encoder_is_identical_across_invocations():

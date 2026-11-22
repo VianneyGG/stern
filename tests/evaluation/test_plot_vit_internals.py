@@ -33,19 +33,18 @@ def _fake_data(n_runs=2, n_windows=2, grid=4, img_size=8, depth=3, n_bins=5):
     }
 
 
-def test_plot_contact_sheet_writes_a_readable_png(tmp_path):
-    out = tmp_path / "contact_sheet.png"
-    plot_contact_sheet(_fake_data(), out)
-
-    assert out.exists()
-    assert out.stat().st_size > 0
-    img = Image.open(out)
-    assert img.width > 0 and img.height > 0
-
-
-def test_plot_layer_diagnostics_writes_a_readable_png(tmp_path):
-    out = tmp_path / "layer_diagnostics.png"
-    plot_layer_diagnostics(_fake_data(), out)
+@pytest.mark.parametrize(
+    "plot, filename",
+    [
+        pytest.param(plot_contact_sheet, "contact_sheet.png", id="contact_sheet"),
+        pytest.param(
+            plot_layer_diagnostics, "layer_diagnostics.png", id="layer_diagnostics"
+        ),
+    ],
+)
+def test_plot_writes_a_readable_png(tmp_path, plot, filename):
+    out = tmp_path / filename
+    plot(_fake_data(), out)
 
     assert out.exists()
     assert out.stat().st_size > 0

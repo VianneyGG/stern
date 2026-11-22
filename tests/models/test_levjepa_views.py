@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from stern.models.levjepa.views import build_views
 
 
-def test_build_views_shapes():
+@pytest.mark.parametrize("num_local", [4, 6])
+def test_build_views_shapes_follow_num_local(num_local):
     clip = torch.randint(0, 256, (16, 224, 224, 3), dtype=torch.uint8)
     global_view, local_views, crop_boxes = build_views(
-        clip, num_local=4, global_size=224, local_size=96
+        clip, num_local=num_local, global_size=224, local_size=96
     )
     assert global_view.shape == (3, 16, 224, 224)
-    assert local_views.shape == (4, 3, 16, 96, 96)
-    assert crop_boxes.shape == (4, 4)  # (num_local, [top, left, height, width])
+    assert local_views.shape == (num_local, 3, 16, 96, 96)
+    assert crop_boxes.shape == (num_local, 4)  # (num_local, [top, left, height, width])
 
 
 def test_build_views_local_views_differ_from_each_other():
@@ -20,12 +22,6 @@ def test_build_views_local_views_differ_from_each_other():
     clip = torch.randint(0, 256, (16, 224, 224, 3), dtype=torch.uint8)
     _, local_views, _crop = build_views(clip, num_local=4)
     assert not torch.allclose(local_views[0], local_views[1])
-
-
-def test_build_views_respects_num_local():
-    clip = torch.randint(0, 256, (16, 224, 224, 3), dtype=torch.uint8)
-    _, local_views, _crop = build_views(clip, num_local=6)
-    assert local_views.shape[0] == 6
 
 
 def test_build_views_crop_boxes_are_fractional_and_within_bounds():

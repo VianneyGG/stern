@@ -102,7 +102,18 @@ def test_a_missing_val_shard_fails_the_pool():
     assert report.nodes[0].val_missing == ("shard-000000.tar",)
 
 
-def test_a_missing_train_manifest_fails_the_pool():
+@pytest.mark.parametrize(
+    ("has_manifest", "missing"),
+    [
+        pytest.param((False, True), ("manifest.json",), id="train_manifest_missing"),
+        # val/ has its own non-interchangeable manifest (seed_nodes.py) and
+        # MeshShardIterableDataset loads it unconditionally.
+        pytest.param((True, False), ("val/manifest.json",), id="val_manifest_missing"),
+    ],
+)
+def test_a_missing_manifest_fails_the_pool_and_names_the_missing_file(
+    has_manifest, missing
+):
     report = _validate(
         {
             "node001": {
@@ -111,27 +122,10 @@ def test_a_missing_train_manifest_fails_the_pool():
                 "shard-000002.tar": 100,
             }
         },
-        has_manifest={"node001": (False, True)},
+        has_manifest={"node001": has_manifest},
     )
     assert not report.ok
-    assert report.nodes[0].manifest_missing == ("manifest.json",)
-
-
-def test_a_missing_val_manifest_fails_the_pool_separately():
-    """val/ has its own non-interchangeable manifest (seed_mesh.py) and
-    MeshShardIterableDataset loads it unconditionally."""
-    report = _validate(
-        {
-            "node001": {
-                "shard-000000.tar": 100,
-                "shard-000001.tar": 100,
-                "shard-000002.tar": 100,
-            }
-        },
-        has_manifest={"node001": (True, False)},
-    )
-    assert not report.ok
-    assert report.nodes[0].manifest_missing == ("val/manifest.json",)
+    assert report.nodes[0].manifest_missing == missing
 
 
 def test_an_empty_pool_scan_is_zero_coverage_not_a_crash():

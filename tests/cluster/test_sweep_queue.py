@@ -254,13 +254,15 @@ class Sweep:
             if proc.poll() is None:
                 self.stop()
                 try:
-                    proc.wait(timeout=20)
+                    proc.wait(timeout=90)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
 
 
-def wait_until(predicate, timeout: float = 25.0):
+def wait_until(predicate, timeout: float = 90.0):
+    # Generous on purpose: returns as soon as the condition holds, and the script
+    # under test polls once a second, which stretches badly on a loaded machine.
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -309,7 +311,7 @@ def test_second_instance_exits_nonzero_and_changes_nothing(sweep):
     with sweep.running():
         wait_until(lambda: _registered(sweep, "run_a"))
         calls_before = sweep.call_log()
-        second = sweep.run(timeout=20)
+        second = sweep.run(timeout=90)
         assert second.returncode != 0
         assert "another sweep_queue" in second.stderr
         # The first instance keeps polling at SWEEP_POLL_S=1 throughout, so its
@@ -327,7 +329,7 @@ def test_stop_file_exits_cleanly_and_leaves_the_run_untouched(sweep):
     proc = sweep.popen()
     wait_until(lambda: _registered(sweep, "run_a"))
     sweep.stop()
-    assert proc.wait(timeout=20) == 0
+    assert proc.wait(timeout=90) == 0
     assert _entry(sweep.configs(), "run_a")["rounds"] == 25
     assert "run_b" not in sweep.call_log()
 
@@ -677,7 +679,7 @@ def test_deadline_reached_exits_before_starting_the_next_item(sweep):
     sweep.deadline_epoch = str(int(time.time()) - 1)
     sweep.set_queue(["run_a 25 0.7 0.9", "run_b 30 0.45 0.8"])
     with sweep.running() as proc:
-        assert proc.wait(timeout=20) == 0
+        assert proc.wait(timeout=90) == 0
     assert "deadline" in sweep.log()
     assert not sweep.configs_path.exists()
     assert "register" not in sweep.call_log()

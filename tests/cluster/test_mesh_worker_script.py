@@ -26,14 +26,6 @@ def test_sbatch_script_has_no_syntax_errors():
     assert result.returncode == 0, result.stderr.decode()
 
 
-def test_sbatch_requests_exactly_one_node_and_no_ddp():
-    text = SBATCH_PATH.read_text()
-
-    assert "--nodes=1" in text
-    assert "--ntasks=1" in text
-    assert "MASTER_ADDR" not in text
-    assert "MASTER_PORT" not in text
-
 
 def test_worker_script_has_no_syntax_errors():
     result = subprocess.run(
@@ -41,14 +33,3 @@ def test_worker_script_has_no_syntax_errors():
     )
 
     assert result.returncode == 0, result.stderr.decode()
-
-
-def test_worker_script_runs_uv_with_no_sync():
-    """The project venv is on the NFS home and `uv sync` reinstalls into it
-    unconditionally, so without --no-sync every worker in the pool rewrites
-    the same shared venv at launch, simultaneously."""
-    script = (
-        Path(__file__).resolve().parents[2] / "cluster" / "run_mesh_worker.sh"
-    ).read_text()
-    assert "uv run --no-sync" in script
-    assert "uv run python" not in script

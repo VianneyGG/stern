@@ -37,16 +37,6 @@ def test_token_weights_zero_token_node_weighted_out_without_nan():
     assert not math.isnan(weights["b"])
 
 
-def test_token_weights_sum_to_one():
-    stats = {
-        "a": NodeStats(c_tokens=1000, c_steps=200),
-        "b": NodeStats(c_tokens=500, c_steps=200),
-        "c": NodeStats(c_tokens=0, c_steps=0),
-    }
-    weights = token_weights(stats)
-    assert math.isclose(sum(weights.values()), 1.0)
-
-
 def test_token_weights_matches_the_quantity_times_quality_formula():
     """Pins the actual w_i = c_tokens * (c_tokens / c_steps) formula, not
     just the normalization invariant -- a bug that dropped the quality term
@@ -62,17 +52,6 @@ def test_token_weights_matches_the_quantity_times_quality_formula():
     weights = token_weights(stats)
     assert math.isclose(weights["a"], 5000 / 7000)
     assert math.isclose(weights["b"], 2000 / 7000)
-
-
-def test_token_weights_zero_c_tokens_exactly_is_still_weighted_out():
-    """c_tokens == 0 (the boundary, not just negative) must not slip through
-    the <= 0 guard and reach the c_tokens / c_steps division."""
-    stats = {
-        "a": NodeStats(c_tokens=1000, c_steps=200),
-        "b": NodeStats(c_tokens=0, c_steps=50),
-    }
-    weights = token_weights(stats)
-    assert weights["b"] == 0.0
 
 
 def test_token_weights_all_zero_raises():

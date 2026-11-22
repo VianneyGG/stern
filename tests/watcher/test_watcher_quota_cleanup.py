@@ -130,18 +130,12 @@ def test_stale_outer_momentum_checkpoints_missing_file_is_skipped(tmp_path):
 # --- safe_node_checkpoints ------------------------------------------------
 
 
-def test_safe_node_checkpoints_matches_done_run_pt():
-    assert safe_node_checkpoints(["done-run.pt"], {"done-run"}) == ["done-run.pt"]
-
-
-def test_safe_node_checkpoints_matches_done_run_push_residual():
-    names = ["done-run_push_residual.pt"]
-    assert safe_node_checkpoints(names, {"done-run"}) == names
-
-
-def test_safe_node_checkpoints_matches_done_run_tmp():
-    names = ["done-run.pt.tmp"]
-    assert safe_node_checkpoints(names, {"done-run"}) == names
+@pytest.mark.parametrize(
+    "name",
+    ["done-run.pt", "done-run_push_residual.pt", "done-run.pt.tmp"],
+)
+def test_safe_node_checkpoints_matches_done_run_files(name):
+    assert safe_node_checkpoints([name], {"done-run"}) == [name]
 
 
 def test_safe_node_checkpoints_excludes_non_done_run():

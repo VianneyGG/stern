@@ -11,16 +11,30 @@ def test_rotary_rejects_odd_head_dim():
         Rotary3D(head_dim=11)
 
 
-def test_rotary_accepts_head_dim_not_divisible_by_six():
-    """ViT-B geometry (embed_dim=768, num_heads=12) gives head_dim=64, which
-    is not divisible by 6 -- the axis split must tolerate uneven (but each
-    still even, for rotate-half pairing) group sizes."""
-    head_dim = 64
+@pytest.mark.parametrize(
+    "head_dim, expected_groups",
+    [
+        pytest.param(12, [4, 4, 4], id="divisible-by-six"),
+        # ViT-B geometry (embed_dim=768, num_heads=12): uneven but still even groups.
+        pytest.param(64, [22, 22, 20], id="not-divisible-by-six"),
+    ],
+)
+def test_rotary_splits_head_dim_into_even_axis_groups_and_preserves_shapes(
+    head_dim, expected_groups
+):
     rope = Rotary3D(head_dim=head_dim)
-    coords = torch.randint(0, 8, (1, 3, 3), dtype=torch.long)
+    assert rope.group_dims == expected_groups
+
+    coords = torch.randint(0, 8, (2, 5, 3), dtype=torch.long)
     cos, sin = rope(coords)
-    assert cos.shape == (1, 3, head_dim)
-    assert sin.shape == (1, 3, head_dim)
+    assert cos.shape == (2, 5, head_dim)
+    assert sin.shape == (2, 5, head_dim)
+
+    q = torch.randn(2, 4, 5, head_dim)
+    k = torch.randn(2, 4, 5, head_dim)
+    q_out, k_out = apply_rotary(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
+    assert q_out.shape == q.shape
+    assert k_out.shape == k.shape
 
 
 def test_rotary_zero_coords_is_identity_rotation():
@@ -32,18 +46,6 @@ def test_rotary_zero_coords_is_identity_rotation():
     assert sin.shape == (1, 3, head_dim)
     assert torch.allclose(cos, torch.ones_like(cos))
     assert torch.allclose(sin, torch.zeros_like(sin), atol=1e-6)
-
-
-def test_apply_rotary_preserves_shapes():
-    head_dim = 12
-    q = torch.randn(2, 4, 5, head_dim)
-    k = torch.randn(2, 4, 5, head_dim)
-    rope = Rotary3D(head_dim=head_dim)
-    coords = torch.randint(0, 8, (2, 5, 3), dtype=torch.long)
-    cos, sin = rope(coords)
-    q_out, k_out = apply_rotary(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
-    assert q_out.shape == q.shape
-    assert k_out.shape == k.shape
 
 
 def test_rotary_relative_position_invariance():

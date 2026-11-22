@@ -50,13 +50,15 @@ def test_update_rate_ema_adopts_the_first_observation_outright():
     assert update_rate_ema(None, 9.9) == 9.9
 
 
-def test_update_rate_ema_blends_against_history():
-    """alpha=0.3 (the real default), prev != observed enough that a role
-    swap (alpha*prev + (1-alpha)*observed) lands on a different, equally
-    plausible-looking number -- alpha=0.5 with symmetric inputs can't tell
-    the two formulas apart."""
-    assert math.isclose(update_rate_ema(10.0, 4.0, alpha=0.3), 8.2)
-
-
-def test_update_rate_ema_defaults_alpha_to_point_three():
-    assert math.isclose(update_rate_ema(10.0, 4.0), 8.2)
+@pytest.mark.parametrize(
+    "alpha_kwargs",
+    [
+        pytest.param({"alpha": 0.3}, id="explicit_alpha_0.3"),
+        # 0.3 is the real default; prev != observed so a role swap
+        # (alpha*prev + (1-alpha)*observed) gives a different number.
+        pytest.param({}, id="default_alpha_is_0.3"),
+    ],
+)
+def test_update_rate_ema_blends_against_history_with_alpha_point_three(alpha_kwargs):
+    # (1-0.3)*prev + 0.3*observed = 0.7*10.0 + 0.3*4.0 = 7.0 + 1.2 = 8.2
+    assert math.isclose(update_rate_ema(10.0, 4.0, **alpha_kwargs), 8.2)

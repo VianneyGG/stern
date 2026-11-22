@@ -30,12 +30,13 @@ def test_block_ln_scale_scales_both_prenorm_outputs():
 
 def test_block_ln_scale_default_is_unscaled():
     torch.manual_seed(0)
-    a = ViTBlock(BlockConfig(embed_dim=16, num_heads=2))
-    b = ViTBlock(BlockConfig(embed_dim=16, num_heads=2, ln_scale=0.5))
-    b.load_state_dict(a.state_dict())
+    blk = ViTBlock(BlockConfig(embed_dim=16, num_heads=2))
     x = torch.randn(2, 5, 16)
-    assert a.ln_scale == 1.0
-    assert not torch.allclose(a(x), b(x))
+    assert blk.ln_scale == 1.0
+    # Hand-written pre-norm composition with no multiplier on either norm output.
+    x1 = x + blk.attn(blk.norm1(x), need_weights=False)[0]
+    want = x1 + blk.mlp(blk.norm2(x1))
+    torch.testing.assert_close(blk(x), want)
 
 
 def test_encoder_layernorm_scaling_sets_inverse_sqrt_depth():
