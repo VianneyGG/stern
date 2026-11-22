@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from stern.cluster_env import data_root
 from stern.watcher.detectors import detect_nan
 from stern.watcher.escalate import remediate_nan_node
 from stern.watcher.mesh_tick import (
@@ -120,7 +121,7 @@ def main() -> int:
                 state=state,
                 repo_root=REPO_ROOT,
                 mesh_shared=mesh_shared,
-                mesh_root=Path("/Data/$USER/mesh"),
+                mesh_root=data_root() / "mesh",
                 now=now,
                 run_configs_path=STATE_DIR / "mesh_run_configs.json",
             )

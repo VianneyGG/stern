@@ -14,12 +14,12 @@
 #
 # Why this exists: launch_mesh_pool.sh polls a single tier, so one arm per tier
 # was the only shape available. That makes "arm" and "GPU tier" the same
-# variable -- the 2026-08-21 factorial ran mask_type on cars and tube on fish,
-# and no difference between them was attributable to mask_type. Dealing every
-# arm the same number of nodes from every tier makes GPU heterogeneity a
-# constant across arms instead of a confound. It costs wall-clock: with
-# mesh.round_budget_s=null every node runs the same step count, so each round
-# ends at the slowest tier's pace and faster nodes idle at the barrier.
+# variable: an arm also differs in hardware, so no difference between arms can
+# be attributed to the setting under test. Dealing every arm the same number of
+# nodes from every tier keeps GPU heterogeneity constant across arms. It costs
+# wall-clock: with mesh.round_budget_s=null every node runs the same step count,
+# so each round ends at the slowest tier's pace and faster nodes idle at the
+# barrier.
 #
 # Blocks until every tier has n_pools*per_tier idle nodes, polling every 60s,
 # because a partially-idle cluster would otherwise yield short rosters and

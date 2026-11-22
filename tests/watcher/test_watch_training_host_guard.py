@@ -50,7 +50,7 @@ def test_designation_ignores_surrounding_whitespace_and_case(tmp_path):
     from stern.watcher.watch_training import is_designated_watcher
 
     host_file = tmp_path / "watcher_host"
-    host_file.write_text("  node089  \n")
+    host_file.write_text("  Node089  \n")
 
     assert is_designated_watcher(host_file, "node089") is True
 
@@ -61,9 +61,9 @@ def test_designation_compares_short_names_when_either_side_is_an_fqdn(tmp_path):
     from stern.watcher.watch_training import is_designated_watcher
 
     host_file = tmp_path / "watcher_host"
-    host_file.write_text("node089.polytechnique.fr\n")
+    host_file.write_text("node089.example.edu\n")
 
-    assert is_designated_watcher(host_file, "node089.polytechnique.fr") is True
+    assert is_designated_watcher(host_file, "node089.example.edu") is True
     assert is_designated_watcher(host_file, "node089") is True
 
 

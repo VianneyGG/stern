@@ -24,9 +24,8 @@ def picker(tmp_path):
     """Returns a `run(*args, idle=...)` callable -> CompletedProcess."""
     scripts = tmp_path / "cluster"
     scripts.mkdir(parents=True)
-    for name in ("pick_cross_tier_pools.sh", "tiers_lib.sh"):
+    for name in ("pick_cross_tier_pools.sh", "tiers_lib.sh", "cluster_env.sh", "site.conf.example", "tiers.example.tsv"):
         shutil.copy2(REPO_ROOT / "cluster" / name, scripts / name)
-    shutil.copy2(REPO_ROOT / "cluster" / "tiers.tsv", scripts / "tiers.tsv")
 
     bindir = tmp_path / "bin"
     bindir.mkdir()

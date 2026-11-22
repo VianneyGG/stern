@@ -10,14 +10,11 @@
 # watcher (stern/watcher/epoch_advance.py), not retried here -- an
 # in-job retry would hide the failure from round bookkeeping.
 #
-# Cluster facts (T1.1/T1.2/T1.7): single partition SallesInfo, no GPU GRES
-# (whole-node allocation -- request nodes not gres), 16 cores/node, ~63 GB
-# RAM, no preemption. Max walltime is 2h: the cluster was rebuilt on
-# 2026-08-22 (SLURM 26.05.2, job counter reset, MaxNodes=5) and the new
-# slurm.conf sets SallesInfo MaxTime=2:00:00, down from 3 days. SLURM does
-# not reject an over-limit --time; it parks the job as PENDING
-# (PartitionTimeLimit) forever, so exceeding this is silent -- 64 jobs sat
-# unschedulable while the watcher logged them as RUNNING.
+# Cluster facts: single partition, no GPU GRES (whole-node allocation, so
+# request nodes, not gres), 16 cores/node, ~63 GB RAM, no preemption. Max
+# walltime is 2h, down from 3 days. SLURM does not reject an over-limit --time;
+# it parks the job as PENDING (PartitionTimeLimit) forever, so exceeding the
+# limit fails silently while the watcher logs the job as RUNNING.
 #
 # Usage: sbatch mesh_train.sbatch <experiment-name> <run-id> [overrides...]
 #SBATCH --job-name=stern-mesh-worker
@@ -37,22 +34,19 @@
 # exit cleanly under this cap and resume via +mesh.start_round + master.pt.
 #SBATCH --time=02:00:00
 #SBATCH --signal=B:USR1@180
-# --requeue is a genuine safety net (node failure, not just walltime), but
-# it competes with the watcher's own chunk relaunch for the same
-# --exclusive node whenever a worker hits its 2h cap instead of exiting
-# early at the chunk boundary -- a self-requeued job goes back to PENDING
-# under the same job id, requesting the same node. The watcher reconciles
-# this itself before resubmitting (chunk_relaunch.stale_jobs_for_nodes,
-# scancel'd in mesh_tick._relaunch_chunk_if_finished) rather than dropping
-# the flag, so a true node failure still gets SLURM's own retry
-# (observed 2026-09-07, lev-fix16c).
+# --requeue is a safety net for node failure, not just walltime, but it
+# competes with the watcher's own chunk relaunch for the same --exclusive node
+# when a worker hits its 2h cap instead of exiting at the chunk boundary: a
+# self-requeued job goes back to PENDING under the same job id, requesting the
+# same node. The watcher reconciles this before resubmitting (stale jobs are
+# scancel'd in mesh_tick._relaunch_chunk_if_finished) rather than dropping the
+# flag, so a true node failure still gets SLURM's own retry.
 #
-# Separate from that: run_mesh_worker.sh also self-chains on a CLEAN exit,
-# via its own explicit `scontrol requeue` (not this flag). That loop is
-# bounded to the job's chunk_rounds by MESH_MAX_REQUEUES
-# (mesh_tick._submit_worker_job -> mesh_continue_allowed.sh Layer 2) so it
-# stops at the chunk boundary instead of racing the watcher's next-chunk
-# submission for the same node (same 2026-09-07 incident).
+# Separate from that: run_mesh_worker.sh also self-chains on a CLEAN exit, via
+# its own explicit `scontrol requeue` (not this flag). That loop is bounded to
+# the job's chunk_rounds by MESH_MAX_REQUEUES (mesh_continue_allowed.sh, layer 2)
+# so it stops at the chunk boundary instead of racing the watcher's next-chunk
+# submission for the same node.
 #SBATCH --requeue
 #SBATCH --output=cluster/slurm/logs/%x-%j.out
 

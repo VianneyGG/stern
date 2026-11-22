@@ -32,7 +32,7 @@
 #   the run's own persisted JSON config rather than passed per-launch.
 #   Omitted/empty -> no "extra_overrides" key in the JSON entry.
 #
-# EXPERIMENT (env, optional): which conf/experiment/<name>.yaml every worker
+# EXPERIMENT (env, optional): which configs/experiment/<name>.yaml every worker
 #   sbatch for this run composes. Omitted -> videomae_mesh_ssl, the only value
 #   this script could produce before, so existing launches are unchanged.
 #   Validated against the config tree here rather than at submission: a typo
@@ -43,8 +43,8 @@
 #   rounds ONE worker job runs before exiting cleanly, after which the watcher
 #   submits the next chunk resuming from master.pt. Omitted -> None, i.e. one
 #   job spans the whole run (correct only where a run fits in the partition
-#   walltime). Required since the 2026-08-22 cluster rebuild capped SallesInfo
-#   at 2h: size it so chunk_rounds * round_wall_s stays well under that, since
+#   walltime). Required because the partition caps walltime at 2h: size it so
+#   chunk_rounds * round_wall_s stays well under that, since
 #   overrunning kills all workers mid-round at once and every one then misses
 #   the same round, which permanently excludes the whole roster.
 #
@@ -53,7 +53,7 @@
 #   ROUND_TIMEOUT_S=900. Raise it for a roster whose slowest node cannot finish
 #   steps_per_round inside 900s: with mesh.round_budget_s=null every node runs
 #   the same step count, and 9600 steps takes 622s on cars but 912s on birds
-#   (medians measured from the 2026-08-21 factorial arms), so 900s would time
+#   (medians measured on the factorial arms), so 900s would time
 #   out the slow tier every round. An env var rather than a ninth positional --
 #   every existing caller passes eight and must keep working unchanged.
 #

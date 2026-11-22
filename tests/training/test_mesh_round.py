@@ -967,13 +967,13 @@ def test_run_mesh_pretrain_stage_strips_fqdn_before_shard_lookup(tmp_path, monke
     keyed by short hostnames ('node008'), matching NODE_SUBNETS and the
     per-node checkpoint naming convention. socket.gethostname() returns
     whatever the node's NSS/DNS config reports, which can be the FQDN
-    ('node008.polytechnique.fr') depending on cluster configuration --
+    ('node008.example.edu') depending on cluster configuration --
     observed in the wild on 2026-07-22 when every mesh worker crashed with
     KeyError after a cluster-wide config change made gethostname() start
     returning FQDNs. The lookup must be robust to either form.
     """
     torch.manual_seed(0)
-    monkeypatch.setattr(socket, "gethostname", lambda: "node008.polytechnique.fr")
+    monkeypatch.setattr(socket, "gethostname", lambda: "node008.example.edu")
 
     mesh_root = tmp_path / "mesh_root"
     shard_name = _write_shard(mesh_root, "clip0", n_frames=4)

@@ -19,6 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from stern.cluster_env import data_root
 from stern.mesh.shard_map import save_shard_map
 from stern.mesh.shard_map_recovery import build_shard_map_from_holdings
 from stern.mesh.seed_nodes import _list_remote_shards
@@ -50,7 +51,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--mesh-dir",
-        default="/Data/$USER/mesh",
+        default=str(data_root() / "mesh"),
         help="remote shard directory on each node",
     )
     parser.add_argument(

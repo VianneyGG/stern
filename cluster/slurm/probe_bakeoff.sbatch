@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cluster/slurm/probe_bakeoff.sbatch
-# One arm of the AFEW-VA frozen-probe bake-off (scripts/probe_bakeoff.py).
+# One arm of the AFEW-VA frozen-probe bake-off (stern/evaluation/probes/bakeoff.py).
 #
 # Usage: sbatch [--nodelist=NODE] probe_bakeoff.sbatch <run_id> [layers] [extra args...]
 #
@@ -31,7 +31,7 @@ shift
 LAYERS="${1:-2,4,6,9,12}"
 if [[ $# -gt 0 ]]; then shift; fi
 
-# Caches on node-local /tmp, never the 30 GB student home quota (train.sbatch).
+# Caches on node-local /tmp, never the small NFS home quota (train.sbatch).
 export UV_CACHE_DIR="/tmp/uv_cache_${SLURM_JOB_ID}"
 export TORCH_HOME="/tmp/torch_home_${SLURM_JOB_ID}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -44,7 +44,7 @@ AFEWVA_ROOT="${AFEWVA_ROOT:-/Data/$USER/afewva/raw}"
 MANIFEST="${PROBE_MANIFEST:-${AFEWVA_ROOT}/manifest.csv}"
 if [[ ! -f "${MANIFEST}" ]]; then
   echo "ERROR: no probe manifest at ${MANIFEST} on $(hostname) -- AFEW-VA is staged" \
-       "on login-node only (see scripts/afewva_staging_notes.md)." >&2
+       "on the login node only." >&2
   exit 1
 fi
 
@@ -55,7 +55,7 @@ OUT="${OUT_DIR}/${RUN_ID}-L${LAYERS//,/_}.json"
 
 # Absolute uv path and `-m`: cron/SLURM PATH lacks ~/.local/bin, and there is no
 # editable install, so sys.path[0] must be the repo root. --no-sync: the venv is
-# 9.4 GB on NFS (conf/CONFIGS.md).
+# 9.4 GB on NFS (configs/CONFIGS.md).
 ~/.local/bin/uv run --no-sync python -m stern.evaluation.probes.bakeoff \
   --run-id "${RUN_ID}" \
   --manifest "${MANIFEST}" \

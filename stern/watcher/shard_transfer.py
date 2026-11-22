@@ -21,7 +21,9 @@ import subprocess
 import sys
 from collections.abc import Sequence
 
-MESH_DATA_DIR = "/Data/$USER/mesh"
+from stern.cluster_env import data_root
+
+MESH_DATA_DIR = str(data_root() / "mesh")
 
 # Shards are ~350 MB each over 1GbE (every tier is 1GbE -- there is no
 # higher-bandwidth tier), so a handful of them is minutes, not seconds.

@@ -77,14 +77,14 @@ def test_train_shards_land_flat_under_mesh_dir_matching_resolve_shard():
             "node001",
             "node002",
             ["shard-000000.tar"],
-            mesh_dir="/Data/$USER/mesh",
-            remote_source_dir="/Data/$USER/shards",
+            mesh_dir="/Data/stern-user/mesh",
+            remote_source_dir="/Data/stern-user/shards",
         )
 
     remote_cmd = run.call_args.args[0][-1]
-    assert "mkdir -p /Data/$USER/mesh &&" in remote_cmd
-    assert "chmod 700 /Data/$USER/mesh &&" in remote_cmd
-    assert remote_cmd.rstrip().endswith("/Data/$USER/mesh/")
+    assert "mkdir -p /Data/stern-user/mesh &&" in remote_cmd
+    assert "chmod 700 /Data/stern-user/mesh &&" in remote_cmd
+    assert remote_cmd.rstrip().endswith("/Data/stern-user/mesh/")
     assert "/mesh/shards" not in remote_cmd
 
 
@@ -95,16 +95,16 @@ def test_val_shards_stay_under_a_val_subdir_isolated_from_train():
             "node001",
             "node002",
             ["shard-000000.tar"],
-            mesh_dir="/Data/$USER/mesh",
-            remote_source_dir="/Data/$USER/shards/val",
+            mesh_dir="/Data/stern-user/mesh",
+            remote_source_dir="/Data/stern-user/shards/val",
             subdir="val",
         )
 
     remote_cmd = run.call_args.args[0][-1]
-    assert "/Data/$USER/mesh/val" in remote_cmd
+    assert "/Data/stern-user/mesh/val" in remote_cmd
     assert "chmod 700" in remote_cmd
     assert (
-        "/Data/$USER/mesh/val"
+        "/Data/stern-user/mesh/val"
         in remote_cmd.split("chmod 700", 1)[1].split("&&")[0]
     )
 
@@ -116,8 +116,8 @@ def test_symlink_source_node_links_own_train_and_val_shards_not_copies():
             "node089",
             ["shard-000000.tar", "shard-000001.tar"],
             ["shard-000000.tar"],
-            mesh_dir="/Data/$USER/mesh",
-            remote_source_dir="/Data/$USER/voxceleb2_shards",
+            mesh_dir="/Data/stern-user/mesh",
+            remote_source_dir="/Data/stern-user/voxceleb2_shards",
         )
 
     assert run.call_count == 2
@@ -131,7 +131,7 @@ def test_symlink_source_node_links_own_train_and_val_shards_not_copies():
 
     val_cmd = val_call.args[0][-1]
     assert "ln -sf" in val_cmd
-    assert "/Data/$USER/mesh/val" in val_cmd
+    assert "/Data/stern-user/mesh/val" in val_cmd
     val_stdin = val_call.kwargs["input"]
     assert val_stdin == "shard-000000.tar\nmanifest.json\n"
 
@@ -143,7 +143,7 @@ def test_remote_file_exists_returns_true_when_test_dash_f_succeeds():
 
     with patch("stern.mesh.seed_nodes._run_ssh", fake_run_ssh):
         assert _remote_file_exists(
-            "node001", "/Data/$USER/shards/manifest.json"
+            "node001", "/Data/stern-user/shards/manifest.json"
         )
 
 
@@ -178,7 +178,7 @@ def test_main_rejects_more_reachable_nodes_than_the_seeded_quota_allows(
             "--source-node",
             "n0",
             "--shards-dir",
-            "/Data/$USER/shards",
+            "/Data/stern-user/shards",
             "--shard-map",
             "/tmp/shard_map.json",
             "--dataset-gb",
@@ -212,7 +212,7 @@ def test_main_rejects_too_many_active_nodes_even_within_seeded_quota(
             "--source-node",
             "n0",
             "--shards-dir",
-            "/Data/$USER/shards",
+            "/Data/stern-user/shards",
             "--shard-map",
             "/tmp/shard_map.json",
             "--dataset-gb",
@@ -236,7 +236,7 @@ def test_main_rejects_active_nodes_not_a_subset_of_nodes(monkeypatch, capsys):
             "--source-node",
             "n0",
             "--shards-dir",
-            "/Data/$USER/shards",
+            "/Data/stern-user/shards",
             "--shard-map",
             "/tmp/shard_map.json",
             "--dataset-gb",
@@ -256,7 +256,7 @@ def _base_argv(tmp_path, nodes: list[str], source_node: str) -> list[str]:
         "--source-node",
         source_node,
         "--shards-dir",
-        "/Data/$USER/shards",
+        "/Data/stern-user/shards",
         "--shard-map",
         str(tmp_path / "shard_map.json"),
         "--dataset-gb",
@@ -325,7 +325,7 @@ def test_main_replicates_val_manifest_alongside_val_shards_to_every_replica(
     (args, kwargs) = val_calls[0]
     shards_arg = args[2]
     assert "manifest.json" in shards_arg
-    assert kwargs["remote_source_dir"] == "/Data/$USER/shards/val"
+    assert kwargs["remote_source_dir"] == "/Data/stern-user/shards/val"
 
 
 def _dry_run_argv(nodes: list[str], source: str) -> list[str]:
@@ -336,7 +336,7 @@ def _dry_run_argv(nodes: list[str], source: str) -> list[str]:
         "--source-node",
         source,
         "--shards-dir",
-        "/Data/$USER/shards",
+        "/Data/stern-user/shards",
         "--shard-map",
         "/tmp/shard_map.json",
         "--dataset-gb",

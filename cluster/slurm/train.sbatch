@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # cluster/slurm/train.sbatch
-# Generic SLURM submission wrapper around scripts/run_experiment.sh.
-# Submitted via submit_login-node.sh, which overrides --nodes/--ntasks/--nodelist
+# Generic SLURM submission wrapper around cluster/run_experiment.sh.
+# Submitted via submit_to_cluster.sh, which overrides --nodes/--ntasks/--nodelist
 # at submission time via pick_nodes.sh. Directives here are fallback defaults.
 # Also submitted directly (same --nodes/--ntasks/--nodelist flag contract, no
 # pick_nodes.sh) by the training watcher's auto-resubmit path,
 # stern/watcher/remediate.py -- keep both callers in sync if this
 # script's flag/argument contract ever changes.
 #
-# Cluster facts (T1.1/T1.2/T1.7): single partition SallesInfo, no GPU GRES
-# (whole-node allocation — request nodes not gres), 16 cores/node, ~63 GB RAM,
-# 3-day max walltime, no preemption.
+# Cluster facts: single partition, no GPU GRES (whole-node allocation, so
+# request nodes, not gres), 16 cores/node, ~63 GB RAM, 3-day max walltime,
+# no preemption.
 #
 # Usage: sbatch [--nodes=N --ntasks=N --nodelist=...] train.sbatch <experiment-name> [overrides]
 #SBATCH --job-name=stern-train
@@ -22,8 +22,8 @@
 #SBATCH --mem=60G
 #SBATCH --exclusive
 # --exclusive: SLURM here does NOT enforce GPU isolation, so without this other
-# students' jobs land on the same node and the 24 GB GPU OOMs (observed). WHN
-# uses the same guard. Costs scheduling latency (needs a fully-free node).
+# jobs land on the same node and the 24 GB GPU OOMs (observed). Costs scheduling
+# latency (needs a fully-free node).
 #SBATCH --time=3-00:00:00
 #SBATCH --signal=USR1@120
 #SBATCH --output=cluster/slurm/logs/%x-%j.out
@@ -55,24 +55,22 @@ export MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1
 export MASTER_PORT="$((15000 + SLURM_JOB_ID % 5000))"
 
 # Checkpoints go to node-local /Data (1TB, persistent across jobs), NOT $HOME:
-# the student home is a 30 GB quota with only ~11 GB free, and there is no
-# shared large filesystem on this cluster. /Data is where the VoxCeleb2 frames
-# are staged too, so a run is already pinned to its data node — same-node
-# resubmit resumes cleanly from here. Retrieve checkpoints with an explicit
-# rsync from the node (they are not in the sync_login-node pull set). Overridable.
+# the NFS home quota is small, and there is no shared large filesystem on this
+# cluster. /Data is also where the VoxCeleb2 frames are staged, so a run is
+# pinned to its data node, and a same-node resubmit resumes from here.
+# Retrieve checkpoints with an explicit rsync from the node (they are not in
+# the sync_to_cluster pull set). Overridable.
 export STERN_CHECKPOINT_ROOT="${STERN_CHECKPOINT_ROOT:-/Data/$USER/stern_checkpoints}"
 
-# VoxCeleb2 SSL data. Staged node-locally under /Data on the fish nodes
-# (node001/node002/node003/node004, plus node023 for single-node traditional
-# training) as balanced WDS shards (stern/prep/build_wds_shards.py
-# + distribute_shards.sh). The job MUST be pinned to a data node (see
-# submit_login-node.sh's FIXED_NODELIST).
+# VoxCeleb2 SSL data. Staged node-locally under /Data on the fish nodes as
+# balanced WDS shards (stern/prep/build_wds_shards.py + distribute_shards.sh).
+# The job MUST be pinned to a data node (see submit_to_cluster.sh's
+# FIXED_NODELIST).
 export VOXMINI_PRESENT="${VOXMINI_PRESENT:-true}"
 export VOXMINI_ROOT="${VOXMINI_ROOT:-/Data/$USER/voxceleb2}"
 export VOXMINI_SHARDS_ROOT="${VOXMINI_SHARDS_ROOT:-/Data/$USER/voxceleb2_shards}"
-# Expected shard count -- override if a node stages a different-sized subset
-# (the full corpus, staged 2026-07-17, is 260 shards; the original 218h
-# voxmini subset was 100).
+# Expected shard count. Override if a node stages a different-sized subset.
+# The full corpus is 260 shards.
 export VOXMINI_N_SHARDS="${VOXMINI_N_SHARDS:-260}"
 
 # Fail fast if this node doesn't actually have the shard set, instead of
@@ -88,9 +86,8 @@ if [[ "${VOXMINI_PRESENT}" == "true" ]]; then
   fi
 fi
 
-# Keep uv's wheel cache + torch caches on node-local /tmp, NOT the 30 GB student
-# home quota (~11 GB free): cu128 torch wheels are multi-GB and would blow it.
-# (Mirrors the What_Happens_Next slurm scripts on this cluster.)
+# Keep uv's wheel cache + torch caches on node-local /tmp, NOT the small NFS
+# home quota: cu128 torch wheels are multi-GB and would blow it.
 export UV_CACHE_DIR="/tmp/uv_cache_${SLURM_JOB_ID}"
 export TORCH_HOME="/tmp/torch_home_${SLURM_JOB_ID}"
 export TORCHINDUCTOR_CACHE_DIR="/tmp/torch_inductor_${SLURM_JOB_ID}"
@@ -100,7 +97,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800
 
 # SLURM executes the batch script from a spool copy, so BASH_SOURCE is unreliable
-# here. Use SLURM_SUBMIT_DIR (the repo root ~/stern that submit_login-node ran
+# here. Use SLURM_SUBMIT_DIR (the repo root ~/stern that submit_to_cluster ran
 # `sbatch` from); run_experiment.sh re-cds to the repo root itself.
 cd "${SLURM_SUBMIT_DIR:-$HOME/stern}"
 # --kill-on-bad-exit=1: without this, if some ranks crash early (e.g. missing

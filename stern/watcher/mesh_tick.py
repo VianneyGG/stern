@@ -31,6 +31,7 @@ from pathlib import Path
 
 import torch
 
+from stern.cluster_env import data_root, setting
 from stern.mesh.outer_step import BOOTSTRAP_MASTER_VERSION
 from stern.mesh.assignment import (
     assign_static,
@@ -100,7 +101,7 @@ ROUND_TIMEOUT_S = 900.0
 # The momentum buffer is still copied back to the run's NFS dir at DONE so
 # _transfer_results_to_node089 keeps archiving it; the residual is a pure
 # optimization and is deliberately not preserved.
-MESH_LOCAL_ROOT_DEFAULT = Path("/Data/$USER/stern_mesh_local")
+MESH_LOCAL_ROOT_DEFAULT = data_root() / "stern_mesh_local"
 
 
 def _mesh_local_root() -> Path:
@@ -1758,12 +1759,12 @@ def _do_merging(
 
 # --- SYNCING -------------------------------------------------------------
 
-node089_HOST = "node089"
-node089_RESULTS_ROOT = "/Data/$USER/stern_mesh_results"
+RESULTS_HOST = setting("STERN_RESULTS_HOST")
+RESULTS_ROOT = str(data_root() / "stern_mesh_results")
 
 
 def _transfer_results_to_node089(run_config: MeshRunConfig, mesh_shared: Path) -> str:
-    """Best-effort: rsync this run's checkpoint dir to node089's local NVMe,
+    """Best-effort: rsync this run's checkpoint dir to the results host's local NVMe,
     then delete the NFS copy on success to free quota.
 
     Never raises -- a failed transfer just leaves the run's results on NFS
@@ -1775,17 +1776,17 @@ def _transfer_results_to_node089(run_config: MeshRunConfig, mesh_shared: Path) -
     if not local_dir.exists() or not any(local_dir.iterdir()):
         return f"{run_config.run_id}: transfer skipped -- no local checkpoint dir"
 
-    remote_dir = f"{node089_RESULTS_ROOT}/{run_config.run_id}"
+    remote_dir = f"{RESULTS_ROOT}/{run_config.run_id}"
     try:
         mkdir_result = subprocess.run(
-            ["ssh", node089_HOST, "mkdir", "-p", remote_dir],
+            ["ssh", RESULTS_HOST, "mkdir", "-p", remote_dir],
             capture_output=True,
             text=True,
             timeout=60,
         )
         if mkdir_result.returncode != 0:
             return (
-                f"{run_config.run_id}: transfer to node089 FAILED "
+                f"{run_config.run_id}: transfer to {RESULTS_HOST} FAILED "
                 f"(mkdir: {mkdir_result.stderr.strip()}) -- results kept on NFS"
             )
 
@@ -1795,7 +1796,7 @@ def _transfer_results_to_node089(run_config: MeshRunConfig, mesh_shared: Path) -
                 "-az",
                 "--checksum",
                 f"{local_dir}/",
-                f"{node089_HOST}:{remote_dir}/",
+                f"{RESULTS_HOST}:{remote_dir}/",
             ],
             capture_output=True,
             text=True,
@@ -1803,30 +1804,30 @@ def _transfer_results_to_node089(run_config: MeshRunConfig, mesh_shared: Path) -
         )
         if rsync_result.returncode != 0:
             return (
-                f"{run_config.run_id}: transfer to node089 FAILED "
+                f"{run_config.run_id}: transfer to {RESULTS_HOST} FAILED "
                 f"(rsync exit {rsync_result.returncode}) -- results kept on NFS"
             )
 
         # rsync exiting 0 doesn't guarantee the destination is intact (e.g.
-        # node089 ran out of disk mid-transfer) -- the next step deletes the
+        # the results host ran out of disk mid-transfer) -- the next step deletes the
         # only other copy, so verify before committing to that.
         check_result = subprocess.run(
-            ["ssh", node089_HOST, "test", "-s", f"{remote_dir}/master.pt"],
+            ["ssh", RESULTS_HOST, "test", "-s", f"{remote_dir}/master.pt"],
             capture_output=True,
             text=True,
             timeout=30,
         )
         if check_result.returncode != 0:
             return (
-                f"{run_config.run_id}: transfer to node089 FAILED "
+                f"{run_config.run_id}: transfer to {RESULTS_HOST} FAILED "
                 f"(post-transfer check) -- results kept on NFS"
             )
     except (OSError, subprocess.SubprocessError) as exc:
-        return f"{run_config.run_id}: transfer to node089 FAILED ({exc}) -- results kept on NFS"
+        return f"{run_config.run_id}: transfer to {RESULTS_HOST} FAILED ({exc}) -- results kept on NFS"
 
     shutil.rmtree(local_dir)
     return (
-        f"{run_config.run_id}: results transferred to node089:{remote_dir}, freed NFS"
+        f"{run_config.run_id}: results transferred to {RESULTS_HOST}:{remote_dir}, freed NFS"
     )
 
 

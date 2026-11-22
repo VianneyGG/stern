@@ -98,8 +98,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             (__doc__ or "") + "\n\nPull evidence first:\n"
-            "  ssh login-node 'cat ~/stern/runs/state/mesh_run_configs.json' > /tmp/mesh_run_configs.json\n"
-            "  ssh login-node 'cat ~/stern/runs/state/watcher.log' > /tmp/watcher.log\n"
+            "  ssh <login-node> 'cat ~/stern/runs/state/mesh_run_configs.json' > /tmp/mesh_run_configs.json\n"
+            "  ssh <login-node> 'cat ~/stern/runs/state/watcher.log' > /tmp/watcher.log\n"
         )
     )
     parser.add_argument("quorum_config_json", type=Path)

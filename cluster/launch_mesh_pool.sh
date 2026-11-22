@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # cluster/launch_mesh_pool.sh
 # Bring up one tier's 16-node mesh pool (+6 idle backup nodes left for
-# auto-replenishment) once enough of the tier is idle. Run ON login-node
-# (requires sinfo, and seed_mesh.py's --shard-map output must land on the
-# shared NFS home the workers actually read from).
+# auto-replenishment) once enough of the tier is idle. Run on the login node
+# (needs sinfo; the --shard-map output must land on the shared NFS home that
+# the workers read from).
 #
 # Usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds] [outer_lr] [outer_momentum]
 #   [rounds]          number of DiLoCo merge rounds for the pool; default 25
@@ -11,37 +11,33 @@
 #   [outer_momentum]   DiLoCo outer-optimizer momentum; default 0.9 (literature)
 #
 # Environment overrides: NEED (idle nodes to wait for), DATASET_HOLDER,
-# EXPECTED_SHARDS, SHARDS_DIR (default /Data/voxceleb2_shards_8fps on node114;
-# point at a smaller subset dir -- e.g. symlinked shards + val/ -- for a lean
-# test run that shouldn't seed the full 841GB corpus), DATASET_GB (must match
+# EXPECTED_SHARDS, SHARDS_DIR (default: the 8fps shard dir on the dataset
+# source node, STERN_SOURCE_NODE; point it at a smaller subset dir, e.g.
+# symlinked shards plus val/, for a lean test run), DATASET_GB (must match
 # SHARDS_DIR's actual size for plan_placement's capacity math; default 841),
 # QUORUM_K, WEIGHTING, SKIP_SEED_VALIDATION, CHUNK_ROUNDS,
-# EXPERIMENT (conf/experiment/<name>.yaml the workers compose; default
-# videomae_mesh_ssl), GRACE_S, REPLICATION (seed_mesh.py's --replication;
-# default 1 -- a dead node is replenished on demand by watcher/shard_transfer.py
-# rather than served from a pre-replicated peer, so paying the extra transfer
-# and disk cost for a second copy of every shard is no longer the default)
-# (inherited by register_mesh_run.sh, not read here -- raise it above the
-# 900s default for a roster whose slowest tier cannot finish a round in time),
-# EXTRA_OVERRIDES (space-separated Hydra tokens, e.g.
-# "model.mask_type=mixed model.target_mode=per_frame", forwarded verbatim to
-# register_mesh_run.sh so every worker sbatch for this run carries them).
+# EXPERIMENT (configs/experiment/<name>.yaml the workers compose; default
+# videomae_mesh_ssl), GRACE_S, REPLICATION (seed_nodes' --replication;
+# default 1: a dead node is replenished on demand by watcher/shard_transfer.py,
+# not served from a pre-replicated peer), inherited by register_mesh_run.sh
+# and not read here. Raise GRACE_S above the 900s default for a roster whose
+# slowest tier cannot finish a round in time. EXTRA_OVERRIDES is space-separated
+# Hydra tokens, e.g. "model.mask_type=mixed model.target_mode=per_frame",
+# forwarded verbatim to register_mesh_run.sh so every worker sbatch carries them.
 #
 # POOL_NODES  explicit comma-separated roster, bypassing the tier idle poll.
-#   The first positional then names the POOL LABEL, not a tier -- it keys
+#   The first positional then names the POOL LABEL, not a tier. The label keys
 #   verified_holdings.json and runs/state/mesh_pool_*_<label>.txt, and need not
-#   exist in tiers.tsv. Use it for a cross-tier pool (pick_cross_tier_pools.sh),
-#   which is how an experiment arm is decoupled from a single GPU tier: with one
-#   tier per arm, "arm" and "tier" are the same variable and no comparison
-#   between arms is attributable to the arm.
-#   Every listed node is active -- there are no seeded backups, because the
-#   whole roster is what plan_placement spreads over, and planning over a
-#   superset of the active nodes is what left the 2026-08-21 factorial arms
-#   holding 192-250 of 260 shards. A node lost mid-run is replenished on demand
-#   by watcher/shard_transfer.py rather than from a pre-seeded spare.
-# POOL_SOURCE_NODE  node seed_mesh distributes from; default is the first of
+#   exist in the tiers file. Use it for a cross-tier pool (pick_cross_tier_pools.sh):
+#   with one tier per arm, "arm" and "tier" are the same variable, so no
+#   comparison between arms can be attributed to the arm.
+#   Every listed node is active, with no seeded backups. plan_placement spreads
+#   over the whole roster, and planning over a superset of the active nodes
+#   leaves shards unplaced. A node lost mid-run is replenished on demand by
+#   watcher/shard_transfer.py rather than from a pre-seeded spare.
+# POOL_SOURCE_NODE  node seed_nodes distributes from; default is the first of
 #   the roster. Point it at a node that already holds the full shard set to
-#   skip a 223 GB pre-stage.
+#   skip the pre-stage copy.
 set -euo pipefail
 
 TIER="${1:?usage: launch_mesh_pool.sh <fish|birds|cars> <run_id> [rounds] [outer_lr] [outer_momentum]}"
@@ -81,8 +77,8 @@ if [[ -n "${POOL_NODES:-}" ]]; then
   echo "launch_mesh_pool: ${TIER} explicit roster, ${#ACTIVE[@]} node(s), no idle poll"
 else
   # 16 active + 6 backup. Overridable because not every tier is that big --
-  # countries has only 19 nodes total, so the default can never be satisfied
-  # and the poll loop spins forever.
+  # some tiers have fewer nodes than that, so the default can never be met and
+  # the poll loop would spin forever.
   NEED="${NEED:-22}"
 
   echo "launch_mesh_pool: polling ${TIER} for ${NEED} idle nodes (60s interval)..."
@@ -109,34 +105,32 @@ READY_CSV=$(IFS=,; echo "${READY[*]}")
 echo "launch_mesh_pool: ${TIER} active=[${ACTIVE_CSV}]"
 echo "launch_mesh_pool: ${TIER} backup (seeded, not active)=[$(IFS=,; echo "${BACKUP[*]}")]"
 
-# Active + backup, one hostname per line -- lets the watcher replenish a dead
-# active node from a backup that already has a seeded
-# /Data/$USER/mesh payload, instead of the replacement dying on
-# read_my_shards' KeyError with an empty local shard dir. With POOL_NODES there
-# are no backups here and replenishment goes through shard_transfer.py instead.
+# Active + backup, one hostname per line. The watcher replenishes a dead active
+# node from a backup that already has a seeded mesh payload; a replacement with
+# an empty local shard dir would die on read_my_shards' KeyError. With POOL_NODES
+# there are no backups, and replenishment goes through shard_transfer.py instead.
 printf '%s\n' "${READY[@]}" > "runs/state/mesh_pool_ready_${TIER}.txt"
 
-# 2026-09-19: the 8fps corpus (800 shards) is the default; it lives only on
-# node114 (serve-only, outside the pool). The 2fps voxceleb2_shards set is retired.
-SOURCE_NODE="${POOL_SOURCE_NODE:-node114}"
-# Node holding the full 260-shard dataset that seed_mesh distributes from.
-# This was node089 until the 2026-08-17 reboot wiped node-local /Data there;
-# node001 is the node whose copy survived. Overridable because the holder is
-# a fact about the cluster today, not a property of any tier.
-DATASET_HOLDER="${DATASET_HOLDER:-node114}"
+# The 8fps corpus (800 shards) is the default. It lives only on the dataset
+# source node, which serves it and is outside the pool.
+SOURCE_NODE="${POOL_SOURCE_NODE:-${STERN_SOURCE_NODE}}"
+# Node holding the full 260-shard dataset that seed_nodes distributes from.
+# Overridable because the holder is a property of the cluster today, not of
+# any tier.
+DATASET_HOLDER="${DATASET_HOLDER:-${STERN_SOURCE_NODE}}"
 # Ask the node what it actually has rather than trusting a hostname: several
 # tiers' first nodes already carry the full set, and reseeding one needlessly
 # drags 223 GB across a 1GbE link for nothing.
 EXPECTED_SHARDS="${EXPECTED_SHARDS:-800}"
 HAVE=$(ssh -o ConnectTimeout=15 "${SOURCE_NODE}" \
-  "ls /Data/$USER/voxceleb2_shards/*.tar 2>/dev/null | wc -l" || echo 0)
+  "ls ${STERN_DATA_ROOT}/voxceleb2_shards/*.tar 2>/dev/null | wc -l" || echo 0)
 if [[ "${SOURCE_NODE}" == "${DATASET_HOLDER}" || "${HAVE}" -ge "${EXPECTED_SHARDS}" ]]; then
   echo "launch_mesh_pool: ${SOURCE_NODE} already holds ${HAVE} shard(s) -- no reseed needed"
 else
   echo "launch_mesh_pool: reseeding ${SOURCE_NODE} from ${DATASET_HOLDER}..."
   ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "${SOURCE_NODE}" \
-    "mkdir -p /Data/$USER/voxceleb2_shards && \
-     rsync -az ${DATASET_HOLDER}:/Data/$USER/voxceleb2_shards/ /Data/$USER/voxceleb2_shards/"
+    "mkdir -p ${STERN_DATA_ROOT}/voxceleb2_shards && \
+     rsync -az ${DATASET_HOLDER}:${STERN_DATA_ROOT}/voxceleb2_shards/ ${STERN_DATA_ROOT}/voxceleb2_shards/"
 fi
 
 echo "launch_mesh_pool: seeding mesh across ${TIER} pool (${#READY[@]} = ${#ACTIVE[@]} active + ${#BACKUP[@]} backup)..."
@@ -150,19 +144,17 @@ uv run python -m stern.mesh.seed_nodes \
   --replication "${REPLICATION:-1}"
 
 # Verify what actually landed on every node before anything trains against
-# it. seed_mesh reports success per rsync, not per shard, and on 2026-08-20 a
-# pool whose placement metadata disagreed with its disks trained zero samples
-# for eleven hours without a single error. validate_seeding writes
+# it. seed_nodes reports success per rsync, not per shard, so placement metadata
+# can disagree with the disks without any error. validate_seeding writes
 # verified_holdings.json, which _do_assigning then requires.
 if [[ -n "${SKIP_SEED_VALIDATION:-}" ]]; then
   echo "launch_mesh_pool: WARNING -- SKIP_SEED_VALIDATION set, registering ${RUN_ID} without verifying seeded shards" >&2
 else
   echo "launch_mesh_pool: validating seeded shards across ${TIER} pool..."
   # set -e aborts here on a non-zero exit, before the run is registered.
-  # --nodes, not the whole tier: the gate must cover exactly the roster being
-  # launched. A cross-tier pool has no tier to look up, and for a tier pool the
-  # unused two thirds of the tier could fail the gate for a run that never
-  # touches them.
+  # Pass --nodes, not the whole tier: the gate must cover exactly the roster
+  # being launched. Unused nodes in the tier could fail the gate for a run that
+  # never touches them.
   uv run python -m stern.mesh.validate_seeding \
     --pool "${TIER}" \
     --nodes "${READY_CSV}" \
@@ -170,21 +162,18 @@ else
 fi
 
 # Merge once three quarters of the pool has checked in rather than waiting
-# all-or-ROUND_TIMEOUT_S: one dead node otherwise costs every round a
-# 30-minute stall. Pair it with token weighting, which corrects a partial
-# merge's sample-count bias instead of plain renormalization.
-# Rounds per worker job, against the partition's 2h walltime. Measured
-# 2026-08-23 on idle node055 (cars) and node035 (birds), running the real
-# dataset + model: 28.0 and 28.3 samples/s, so 9600 steps is ~340s of
-# training on either tier, plus ~271s of merge/broadcast/barrier = ~611s a
-# round. 8 rounds is 4888s, 68% of the 7200s cap.
+# all-or-ROUND_TIMEOUT_S: one dead node would otherwise stall every round.
+# Pair it with token weighting, which corrects a partial merge's sample-count
+# bias instead of plain renormalization.
+# Rounds per worker job, against the partition's 2h walltime. At the measured
+# throughput (~28 samples/s, 9600 steps) a round is ~340s of training plus
+# ~271s of merge, broadcast and barrier, about 611s. Eight rounds is 4888s,
+# 68% of the 7200s cap.
 #
-# It was 4 when a round took 1230s. The tier spread that used to set the
-# barrier is gone: the bottleneck was read_shard_frames_at re-scanning every
-# shard's tar headers per window (CPU), and with the indexed reader every
-# tier is GPU-bound on the same RTX 4000 Ada -- birds went 10.0 -> 28.3
-# samp/s (x2.8) against cars' x1.8, and the two now land within 1% of each
-# other.
+# Four rounds was the old setting, from when a round took 1230s. The bottleneck
+# was read_shard_frames_at re-scanning every shard's tar headers per window
+# (CPU). With the indexed reader every tier is GPU-bound, so the tier spread
+# that used to set the barrier is gone.
 CHUNK_ROUNDS="${CHUNK_ROUNDS:-8}"
 export CHUNK_ROUNDS
 

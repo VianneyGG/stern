@@ -37,10 +37,9 @@ def harness(tmp_path):
     """Mirrored repo + stubbed PATH. Returns (env, call_log, tmp_path)."""
     scripts = tmp_path / "cluster"
     scripts.mkdir(parents=True)
-    for name in ("launch_mesh_pool.sh", "tiers_lib.sh"):
+    for name in ("launch_mesh_pool.sh", "tiers_lib.sh", "cluster_env.sh", "site.conf.example", "tiers.example.tsv"):
         shutil.copy2(REPO_ROOT / "cluster" / name, scripts / name)
     (scripts / "launch_mesh_pool.sh").chmod(0o755)
-    shutil.copy2(REPO_ROOT / "cluster" / "tiers.tsv", scripts / "tiers.tsv")
     (tmp_path / "runs" / "state").mkdir(parents=True)
 
     call_log = tmp_path / "calls.log"

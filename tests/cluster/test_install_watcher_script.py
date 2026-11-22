@@ -1,6 +1,6 @@
 """install_watcher.sh -- converges one host onto the watcher designation.
 
-Replaces the timer-install block that submit_login-node.sh used to run
+Replaces the timer-install block that submit_to_cluster.sh used to run
 unconditionally, which silently made any host that ran a submit a second
 watcher writer.
 """
@@ -41,7 +41,7 @@ def env(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
 
-    def run(*args, hostname="node089.polytechnique.fr"):
+    def run(*args, hostname="node089.example.edu"):
         (bin_dir / "hostname").write_text(f'#!/bin/sh\necho "{hostname}"\n')
         (bin_dir / "hostname").chmod(0o755)
         return subprocess.run(
@@ -74,7 +74,7 @@ def test_non_designated_host_stops_but_never_disables_the_timer(env):
     `disable` here deletes the designated host's symlink too, and whichever
     host converged last would win. `stop` is per-host runtime state, so it
     quiets this machine without touching what the other one reads."""
-    result = env("node089", hostname="login-node.polytechnique.fr")
+    result = env("node089", hostname="login-node.example.edu")
 
     assert result.returncode == 0, result.stderr
     assert env.host_file.read_text().strip() == "node089"
@@ -88,7 +88,7 @@ def test_no_argument_converges_against_the_existing_designation(env):
     env.host_file.parent.mkdir(parents=True, exist_ok=True)
     env.host_file.write_text("node089\n")
 
-    result = env(hostname="login-node.polytechnique.fr")
+    result = env(hostname="login-node.example.edu")
 
     assert result.returncode == 0, result.stderr
     assert env.host_file.read_text().strip() == "node089"

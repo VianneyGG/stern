@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # cluster/mesh_continue_allowed.sh
-# Layers 1/2/4 of the self-requeue termination guarantee (design §1.2).
-# Layer 3 (futile-requeue counter) is added by Task 3 -- this file's
-# structure leaves a clearly marked insertion point for it.
+# Decides whether a mesh worker may requeue itself. Each check can stop the
+# loop; the checks run in order (deadline, requeue budget, watcher staleness,
+# futile-requeue counter, HALT and quarantine files).
 #
 # Usage: mesh_continue_allowed.sh <run_id> <node>
 # Exit 0 = continue (requeue), exit 1 = stop.
@@ -33,7 +33,7 @@ if [[ -n "${MESH_MAX_REQUEUES:-}" ]]; then
   fi
 fi
 
-# --- Watcher staleness (fifth, cheaper signal; design §3b) -----------------
+# --- Watcher staleness: a cheap signal that the watcher has stopped ticking --
 MESH_WATCHER_STALE_S="${MESH_WATCHER_STALE_S:-600}"
 WATCHER_STATE="${STATE_DIR}/watcher_state.json"
 if [[ -f "${WATCHER_STATE}" ]]; then
@@ -80,9 +80,8 @@ if (( new_futile >= MESH_MAX_FUTILE_REQUEUES )); then
   detail="worker ${NODE} made ${new_futile} requeues with no round advancement on ${RUN_ID} (stuck at round ${current_round}) -- watcher likely down or wedged"
   escalation_file="${escalation_dir}/watcher_stalled-${RUN_ID}-${NODE}-${ts}.md"
   echo "${detail}" > "${escalation_file}"
-  # Dependency-free delivery (design §3 worker-side half): a bare curl, not a
-  # re-entry into the watcher's own Python/NFS-venv stack, since that stack
-  # may be exactly what's down.
+  # Dependency-free delivery: a bare curl, not a re-entry into the watcher's
+  # Python/NFS-venv stack, since that stack may be exactly what is down.
   if [[ -n "${MESH_NOTIFY_WEBHOOK_URL:-}" ]]; then
     curl -sf -m 5 -X POST "${MESH_NOTIFY_WEBHOOK_URL}" \
       -H "Content-Type: application/json" \

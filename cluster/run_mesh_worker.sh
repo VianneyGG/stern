@@ -17,6 +17,8 @@ EXPERIMENT="${1:?usage: run_mesh_worker.sh <experiment> <run-id> [hydra override
 RUN_ID="${2:?usage: run_mesh_worker.sh <experiment> <run-id> [hydra overrides...]}"
 shift 2
 
+source "$(dirname "${BASH_SOURCE[0]}")/cluster_env.sh"
+
 # Run from the repo root, same resolution pattern as run_experiment.sh.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
@@ -30,18 +32,17 @@ cd "${REPO_ROOT}"
 export PATH="${HOME}/.local/bin:${PATH}"
 
 export MESH_RUN_ID="${RUN_ID}"
-# Deliberately OUTSIDE ~/stern: sync_login-node.sh pushes source with
+# Deliberately OUTSIDE ~/stern: sync_to_cluster.sh pushes source with
 # `rsync --delete`, which would wipe round-local mesh state (assignments,
 # shard map, pending checkpoints) if it lived under the synced repo tree.
 export MESH_SHARED="${MESH_SHARED:-${HOME}/stern_mesh}"
-export MESH_ROOT="${MESH_ROOT:-/Data/$USER/mesh}"
+export MESH_ROOT="${MESH_ROOT:-${STERN_DATA_ROOT}/mesh}"
 export MESH_ASSIGNMENTS="${MESH_ASSIGNMENTS:-${MESH_SHARED}/metadata/shard_assignments_${MESH_RUN_ID}.json}"
 export MESH_SHARD_MAP="${MESH_SHARD_MAP:-${MESH_SHARED}/metadata/shard_map.json}"
 
-# Fail fast, before the trainer's dataloader would otherwise discover any of
-# this deep inside its first batch. train.sbatch documents a 48-minute hang
-# from exactly this class of gap (a straggler waiting on data that was never
-# going to arrive) -- catch it here in seconds instead.
+# Fail fast, before the trainer's dataloader would discover any of this deep
+# inside its first batch. A straggler waiting on data that never arrives can
+# hang a DDP job for close to an hour (see train.sbatch), so catch it here.
 if [[ ! -f "${MESH_ASSIGNMENTS}" ]]; then
   echo "ERROR: MESH_ASSIGNMENTS=${MESH_ASSIGNMENTS} not found on $(hostname)" >&2
   exit 1
@@ -55,9 +56,8 @@ if [[ ! -d "${MESH_ROOT}" ]]; then
   exit 1
 fi
 
-# val/manifest.json has been observed missing at this exact instant even
-# though seed_mesh.py already wrote it (confirmed present on disk moments
-# later on the same node) -- an NFS/automount visibility race on freshly
+# val/manifest.json can be missing for a moment after seeding even though the
+# seeding step has written it: an NFS/automount visibility race on freshly
 # seeded nodes, not missing data. Retry briefly instead of failing fast.
 _VAL_MANIFEST="${MESH_ROOT}/val/manifest.json"
 for _i in $(seq 1 10); do
@@ -69,14 +69,14 @@ if [[ ! -f "${_VAL_MANIFEST}" ]]; then
   exit 1
 fi
 
-# Node-local caches under /tmp, NOT the student home quota (~5 GB free): the
+# Node-local caches under /tmp, NOT the NFS home quota, which is small: the
 # cu128 torch wheels uv installs are multi-GB. Mirrors train.sbatch.
 export UV_CACHE_DIR="/tmp/uv_cache_${SLURM_JOB_ID:-$$}"
 export TORCH_HOME="/tmp/torch_home_${SLURM_JOB_ID:-$$}"
 export TORCHINDUCTOR_CACHE_DIR="/tmp/torch_inductor_${SLURM_JOB_ID:-$$}"
 
 # Checkpoints go to node-local /Data, not $HOME, for the same quota reason.
-export STERN_CHECKPOINT_ROOT="${STERN_CHECKPOINT_ROOT:-/Data/$USER/stern_checkpoints}"
+export STERN_CHECKPOINT_ROOT="${STERN_CHECKPOINT_ROOT:-${STERN_DATA_ROOT}/stern_checkpoints}"
 mkdir -p "${STERN_CHECKPOINT_ROOT}"
 chmod 700 "${STERN_CHECKPOINT_ROOT}"
 

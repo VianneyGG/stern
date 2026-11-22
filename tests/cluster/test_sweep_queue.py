@@ -689,7 +689,7 @@ def test_sweep_refuses_to_run_off_the_designated_host(sweep):
     mesh_run_configs.json, and flock does not exclude them from each other
     across the shared NFSv3 home -- so they have to be on the same machine."""
     sweep.set_configs([])
-    sweep.set_hostname("login-node.polytechnique.fr")
+    sweep.set_hostname("login-node.example.edu")
     sweep.set_queue(["sw3-fish-a 10 0.7 0.9"])
     before = sweep.configs_path.read_text()
 

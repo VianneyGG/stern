@@ -1,8 +1,7 @@
 # Lean LeVJEPA: levjepa_base with the "Leaner Transformers: More Heads, Less
 # Depth" geometry (arXiv 2505.20802) -- depth 12->7, heads 12->16 (head_dim
-# 48), mlp_ratio 4.0->2.0. The geometry of lev-sigfix-cars-20r and of
-# levjepa_leaner_smoke on login-node; committed here so it stops living as an
-# untracked override. No pretrained weights.
+# 48), mlp_ratio 4.0->2.0. The geometry used by the lev-sigfix-cars-20r run.
+# No pretrained weights.
 name: levjepa_lean
 encoder: levjepa
 # --- input geometry ---

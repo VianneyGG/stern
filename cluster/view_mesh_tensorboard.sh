@@ -10,24 +10,25 @@
 # selector -- runs can be compared side by side, and no run_id/exp name needs
 # to be passed to this script.
 #
-# Host: node089 is preferred, login-node is the fallback, and exactly one of
-# them serves TensorBoard at a time -- picked by SSH reachability, since
-# node089 is not yet online as of 2026-08 but is meant to take over once it
-# is. On failover, any stray instance left running on the other candidate
-# host is killed so viewers are never split across two hosts/ports.
+# Host: the results host is preferred and the login node is the fallback. Exactly
+# one of them serves TensorBoard at a time, picked by SSH reachability, since the
+# results host may be offline. On failover, any stray instance left running on
+# the other candidate host is killed so viewers are never split across two
+# hosts or ports.
 #
-# The remote command below is base64-encoded before transmission: piping a
-# literal multi-line/quoted command through SSH re-parses it in the remote
-# shell and silently mangles quoting (the same hazard flagged in
-# seed_mesh.py's nested-ssh comments) -- base64 sidesteps that entirely.
+# The remote command below is base64-encoded before transmission. Piping a
+# literal multi-line, quoted command through SSH re-parses it in the remote
+# shell and silently mangles quoting; base64 avoids that.
 #
 # Usage: cluster/view_mesh_tensorboard.sh
 set -euo pipefail
 
-LOCAL_PORT=3003
-CANDIDATE_HOSTS=(node089 login-node)
+source "$(dirname "${BASH_SOURCE[0]}")/cluster_env.sh"
 
-# --- Step 0: pick the first reachable host, preferring node089 -------------
+LOCAL_PORT=3003
+CANDIDATE_HOSTS=("${STERN_RESULTS_HOST}" "${STERN_LOGIN_HOST}")
+
+# --- Step 0: pick the first reachable host, preferring the results host -------------
 REMOTE_HOST=""
 for host in "${CANDIDATE_HOSTS[@]}"; do
   if ssh -o ConnectTimeout=5 -o BatchMode=yes "${host}" true 2>/dev/null; then
@@ -36,7 +37,7 @@ for host in "${CANDIDATE_HOSTS[@]}"; do
   fi
 done
 if [[ -z "${REMOTE_HOST}" ]]; then
-  echo "view_mesh_tensorboard: ERROR -- neither node089 nor login-node is reachable" >&2
+  echo "view_mesh_tensorboard: ERROR -- neither ${STERN_RESULTS_HOST} nor ${STERN_LOGIN_HOST} is reachable" >&2
   exit 1
 fi
 echo "view_mesh_tensorboard: using ${REMOTE_HOST}"
@@ -83,8 +84,8 @@ ssh -o ServerAliveInterval=30 "${REMOTE_HOST}" \
     "echo ${ENCODED_INNER} | base64 -d | bash -s --"
 
 # --- Step 2: local tunnel (laptop side), kill-and-replace -------------------
-# The tunnel target may have changed hosts since the last run (node089 <->
-# login-node failover) -- always tear down any existing tunnel before opening
+# The tunnel target may have changed hosts since the last run (results host <->
+# login node failover) -- always tear down any existing tunnel before opening
 # this one so it can't silently point at a dead host.
 pkill -f "L ${LOCAL_PORT}:localhost:${LOCAL_PORT}" 2>/dev/null || true
 

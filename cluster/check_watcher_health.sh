@@ -3,15 +3,14 @@
 #
 # Self-check for the designated watcher host: re-converges stern-watcher.timer
 # if it isn't active. Runs from system cron, deliberately NOT systemd --user --
-# a dead/restarted user manager (the failure mode that caused the 2026-09-03
-# outage) is invisible to anything that itself depends on that same manager,
-# so this needs an independent trigger. Install with `crontab -e` on the
-# designated host only (currently node089):
+# a dead or restarted user manager is invisible to anything that depends on that
+# same manager, so this needs an independent trigger. Install with `crontab -e`
+# on the designated host only:
 #
 #   */15 * * * * XDG_RUNTIME_DIR=/run/user/$(id -u) $HOME/stern/cluster/check_watcher_health.sh >> $HOME/stern/runs/state/watcher_health_cron.log 2>&1
 #
 # Requires loginctl linger enabled for XDG_RUNTIME_DIR to exist outside a login
-# session (`loginctl enable-linger $USER`; already on as of 2026-09-03).
+# session (`loginctl enable-linger $USER`).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

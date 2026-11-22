@@ -14,7 +14,7 @@ from stern.watcher.cluster import (
 @pytest.mark.integration
 def test_query_idle_nodes_parses_idle_hosts():
     fake = MagicMock(
-        returncode=0, stdout="node001 idle\nanchois mixed\nanguille idle\n"
+        returncode=0, stdout="node001 idle\nnode002 mixed\nnode003 idle\n"
     )
     with patch("stern.watcher.cluster.subprocess.run", return_value=fake):
         assert query_idle_nodes() == {"node001", "node003"}
@@ -65,7 +65,7 @@ def test_query_job_states_returns_empty_dict_for_empty_job_id_list():
 
 def test_query_node_states_parses_all_node_states():
     fake = MagicMock(
-        returncode=0, stdout="node001 idle\nanchois drained\nanguille down\n"
+        returncode=0, stdout="node001 idle\nnode002 drained\nnode003 down\n"
     )
     with patch("stern.watcher.cluster.subprocess.run", return_value=fake):
         assert query_node_states() == {

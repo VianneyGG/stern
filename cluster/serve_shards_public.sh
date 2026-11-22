@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # cluster/serve_shards_public.sh
 #
-# NOT the mesh's serve_shards.sh (that one serves /Data/<user>/mesh to the
-# trusted cluster subnet, unauthenticated, via crontab). This script serves
-# a VoxCeleb2-derived shard directory to the public internet via
-# cloudflared, so it puts a random token in the URL path -- an
-# unauthenticated bare tunnel would publish licensed corpus data at a
-# guessable/loggable URL.
+# Not the mesh's own shard server, which serves the mesh payload to the trusted
+# cluster subnet without auth. This script serves a VoxCeleb2-derived shard
+# directory to the public internet via cloudflared. It puts a random token in
+# the URL path, because a bare tunnel would publish licensed corpus data at a
+# guessable or loggable URL.
 #
-# Usage: scripts/serve_shards_public.sh <shards-dir> <manifest-csv-path> [port] [--local-only]
+# Usage: cluster/serve_shards_public.sh <shards-dir> <manifest-csv-path> [port] [--local-only]
 #   <shards-dir>        directory of shard-*.tar + manifest.json (build_wds_shards.py output)
 #   <manifest-csv-path> path to the dataset's manifest.csv (ManifestRecord CSV)
 #   [port]              default 8080

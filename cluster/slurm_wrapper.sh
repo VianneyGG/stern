@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # cluster/slurm_wrapper.sh
 # Minimal allowlisted gateway to SLURM commands for the training watcher's
-# escalation call (docs/superpowers/specs/2026-07-15-slurm-training-watcher-design.md
-# §3/§5). The escalation `claude -p` invocation gets Bash access scoped to
-# ONLY this script (not general shell) -- this script in turn only forwards
-# to exactly these four SLURM binaries, so an escalated call cannot shell out
-# to anything else even if it tried.
+# escalation call. The escalation `claude -p` call gets Bash access scoped to
+# this script only, and this script forwards to exactly four SLURM binaries,
+# so an escalated call cannot shell out to anything else.
 #
 # Usage: slurm_wrapper.sh <sbatch|scancel|squeue|sacct> [args...]
 set -euo pipefail

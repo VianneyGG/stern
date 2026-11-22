@@ -14,10 +14,10 @@
 #   manifest.jsonl                one record per round, gaps listed explicitly
 #
 # Both residuals are captured because deltas AND the master broadcast are
-# quantized with carry-over (mesh_round.py:935, run_outer_step.py:526). Master
-# + pending + momentum alone reconstructs a merge only up to an error that is
-# correlated across rounds -- exactly the systematic offset a DiLoCo divergence
-# check would misread as signal.
+# quantized with carry-over (see mesh_round.py and run_outer_step.py). Master,
+# pending and momentum alone reconstruct a merge only up to an error that is
+# correlated across rounds, which a DiLoCo divergence check would misread as
+# signal.
 #
 # Usage: snapshot_mesh_checkpoints.sh <run_id> <every_n> <max_round> [poll_interval_s]
 #
@@ -26,9 +26,7 @@
 # watcher/mesh_tick.py -- copying files needs no coupling to the coordinator
 # state machine.
 #
-# NOT a drop-in for pre-2026-09 invocations: output moved off ${HOME} (see the
-# NFS guard below), so a running snapshotter must be relaunched with
-# SNAPSHOT_DEST on local NVMe. Snapshots taken before that stay where they are.
+# SNAPSHOT_DEST must be on local NVMe, not under the NFS home (enforced below).
 #
 # Round semantics: mesh_tick's _do_syncing increments run.round *after* round
 # R's merge and sync complete, so watcher_state's `round == N` means rounds
@@ -69,10 +67,9 @@ CAPTURED_MARKER="${OUT_DIR}/.rounds_captured"
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) snapshot[${RUN_ID}] $*"; }
 
-# master.pt alone is 183MB and the NFS-quota-constrained home holds under 55 of
-# them, so a dest there fills the quota mid-run and fails partway. Refuse up
-# front instead: a run that never started is recoverable, a half-captured round
-# axis is not.
+# master.pt alone is 183MB and the NFS home quota holds fewer than 55 of them,
+# so a dest there fills the quota mid-run and fails partway. Refuse up front:
+# a run that never started is recoverable, a half-captured round axis is not.
 abs_dest="$(readlink -m "${DEST_ROOT}")"
 for forbidden in "${HOME}" "${REPO_ROOT}"; do
   [[ -n "${forbidden}" ]] || continue
@@ -86,7 +83,7 @@ for forbidden in "${HOME}" "${REPO_ROOT}"; do
   esac
 done
 
-# "<status> <round>", or "MISSING 0" -- same idiom as sweep_queue.sh's run_status.
+# "<status> <round>", or "MISSING 0" -- same idiom as sweep_queue.sh.
 run_status() {
   python3 - "${WATCHER_STATE}" "${RUN_ID}" <<'PYEOF'
 import json
@@ -300,16 +297,13 @@ log "watching for rounds 1-10 then every ${EVERY_N} up to ${MAX_ROUND} (poll ${P
 while true; do
   read -r status round <<<"$(run_status)"
 
-  # Only capture the round master.pt CURRENTLY holds -- never backfill earlier
-  # boundaries the loop didn't poll at. master.pt is overwritten on every merge,
-  # so if the round counter advanced past several boundaries between two polls
-  # (poll interval coarser than the round cadence, or the script started
-  # mid-run), today's master.pt is NOT those earlier rounds' weights; copying it
-  # under an earlier round's filename would silently mislabel a checkpoint (bug
-  # caught in review, 2026-08-17). The same reasoning holds for both residuals,
-  # which additionally carry quantization error forward across rounds. A
-  # boundary missed this way is simply never captured -- logged as a gap, not
-  # faked.
+  # Only capture the round master.pt currently holds. Never backfill earlier
+  # boundaries: master.pt is overwritten on every merge, so if the round counter
+  # advanced past several boundaries between two polls, today's master.pt is not
+  # those earlier rounds' weights. Copying it under an earlier round's name would
+  # silently mislabel a checkpoint. The same holds for both residuals, which also
+  # carry quantization error forward across rounds. A missed boundary is never
+  # captured, and is logged as a gap rather than faked.
   if eligible_round "${round}" && ! already_captured "${round}"; then
     capture_round "${round}"
   fi

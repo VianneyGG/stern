@@ -45,7 +45,7 @@ def _golden_ssh(host, command):
 
 def test_build_manifest_returns_train_and_val_separately():
     train, val = build_manifest(
-        "node001", "/Data/$USER/voxceleb2_shards", run_ssh=_golden_ssh
+        "node001", "/Data/stern-user/voxceleb2_shards", run_ssh=_golden_ssh
     )
     assert train == {"shard-000000.tar": 100, "shard-000001.tar": 100}
     assert val == {"shard-000000.tar": 50}

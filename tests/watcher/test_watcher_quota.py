@@ -14,11 +14,11 @@ from stern.watcher.quota import (
 # Captured from `quota -p` on login-node during the 2026-08-14 incident
 # investigation: 19955708/31457280 blocks (~63.4%), 87843/300000 files (~29.3%).
 _REAL_QUOTA_OUTPUT = (
-    "Disk quotas for user $USER (uid 13828): \n"
+    "Disk quotas for user stern-user (uid 13828): \n"
     "     Filesystem  blocks   quota   limit   grace   files   quota   limit   grace\n"
-    "storage-node.polytechnique.fr:/students\n"
+    "storage-node.example.edu:/students\n"
     "                19955708  31457280 31457280       0   87843  300000  300000       0\n"
-    "storage-node.polytechnique.fr:/students/.snapshot/daily.2026-08-09_0010\n"
+    "storage-node.example.edu:/students/.snapshot/daily.2026-08-09_0010\n"
     "                19955708  31457280 31457280       0   87843  300000  300000       0\n"
 )
 
@@ -44,7 +44,7 @@ def test_parse_quota_output_ignores_snapshot_duplicate_rows():
     # .snapshot repeat) -- only the first is used, per parse_quota_output's
     # docstring; asserting equality to the single-row value proves it.
     single_row = (
-        "storage-node.polytechnique.fr:/students\n"
+        "storage-node.example.edu:/students\n"
         "                19955708  31457280 31457280       0   87843  300000  300000       0\n"
     )
     expected = 100.0 * 19955708 / 31457280
@@ -83,7 +83,7 @@ def test_parse_quota_output_handles_no_wrap_single_line_row():
     stdout = (
         "Disk quotas for user x (uid 1): \n"
         "     Filesystem  blocks   quota   limit   grace   files   quota   limit   grace\n"
-        "storage-node.polytechnique.fr:/students 24148844  31457280 31457280       0   88326  300000  300000       0\n"
+        "storage-node.example.edu:/students 24148844  31457280 31457280       0   88326  300000  300000       0\n"
     )
     assert parse_quota_output(stdout) == 100.0 * 24148844 / 31457280
 

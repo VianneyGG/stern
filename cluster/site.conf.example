@@ -1,0 +1,6 @@
+# Cluster-specific settings. Copy to cluster/site.conf (gitignored) and put the
+# real values there; a variable already set in the environment wins over both.
+STERN_LOGIN_HOST=login-node          # SLURM login node: where sbatch runs and the watcher lives
+STERN_RESULTS_HOST=node089           # host with large local disk that receives finished runs
+STERN_SOURCE_NODE=node114            # node holding the full shard corpus that seeding copies from
+STERN_FACTORIAL_NODES="node001 node002 node004 node007"   # default pool for run_factorial.sh

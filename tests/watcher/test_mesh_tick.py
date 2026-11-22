@@ -1289,21 +1289,21 @@ def test_syncing_transfers_results_to_node089_on_done(tmp_path):
         "node089",
         "mkdir",
         "-p",
-        "/Data/$USER/stern_mesh_results/RUN1",
+        "/Data/stern-user/stern_mesh_results/RUN1",
     ] in commands
     assert [
         "rsync",
         "-az",
         "--checksum",
         f"{local_dir}/",
-        "node089:/Data/$USER/stern_mesh_results/RUN1/",
+        "node089:/Data/stern-user/stern_mesh_results/RUN1/",
     ] in commands
     assert [
         "ssh",
         "node089",
         "test",
         "-s",
-        "/Data/$USER/stern_mesh_results/RUN1/master.pt",
+        "/Data/stern-user/stern_mesh_results/RUN1/master.pt",
     ] in commands
 
 

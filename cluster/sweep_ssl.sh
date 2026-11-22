@@ -2,28 +2,27 @@
 # cluster/sweep_ssl.sh
 #
 # Drives the SSL scaling + hyperparameter sweep by emitting one
-# submit_login-node.sh call per grid cell, each tagged with +run_tag=<cell> so
+# submit_to_cluster.sh call per grid cell, each tagged with +run_tag=<cell> so
 # aggregate_sweep.py can join results back to their config.
 #
-# Design: one-factor-at-a-time (OFAT) around a fixed baseline, not full
-# factorial — throughput/loss surfaces are smooth, so this grids every axis at
-# a fraction of the run count. See docs/superpowers/plans/2026-07-10-ssl-scaling-sweep.md.
+# Design: one-factor-at-a-time (OFAT) around a fixed baseline, not a full
+# factorial. Throughput and loss surfaces are smooth, so this grids every axis
+# at a fraction of the run count.
 #
 # Usage:
-#   scripts/sweep_ssl.sh [--dry-run] <phase>
+#   cluster/sweep_ssl.sh [--dry-run] <phase>
 #     <phase>      1 = throughput/scaling benchmark (short, max_steps=200)
 #                  2 = convergence quality (long, at the Phase-1 winner config)
 #     --dry-run    print the submit commands instead of running them
 #
-# Phase-2 operating point is read from env vars. Post-Phase-1b default is the
-# single-node winner (N=1/B=16 sustains ~121 samp/s, 2x the best multi-node
-# cell on this 1GbE fabric -- see build_phase2 comment):
+# The Phase-2 operating point is read from env vars. The default is the
+# single-node winner (see build_phase2):
 #   WIN_N=1 WIN_B=16 WIN_AMP=bf16 WIN_ACCUM=16 WIN_WORKERS=8
 set -euo pipefail
 
 EXPERIMENT="videomae_ssl_pretrain_voxmini"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SUBMIT="${SCRIPT_DIR}/submit_login-node.sh"
+SUBMIT="${SCRIPT_DIR}/submit_to_cluster.sh"
 
 DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then DRY_RUN=1; shift; fi
@@ -35,7 +34,7 @@ declare -a ROWS=()
 submit_row() {
   local n="$1" overrides="$2" tag="$3"
   if [[ "${DRY_RUN}" == "1" ]]; then
-    echo "submit_login-node.sh ${EXPERIMENT} ${n} ${overrides} +run_tag=${tag}"
+    echo "submit_to_cluster.sh ${EXPERIMENT} ${n} ${overrides} +run_tag=${tag}"
   else
     echo ">>> [${tag}] N=${n} ${overrides}"
     "${SUBMIT}" "${EXPERIMENT}" "${n}" ${overrides} "+run_tag=${tag}"
@@ -43,9 +42,8 @@ submit_row() {
 }
 
 build_phase1() {
-  # voxmini (VoxCeleb2 subset) frames are staged on 21 of the 23 fish nodes
-  # (all but node006), so the full fish tier is available -- node axis goes
-  # up to NB=8 as in the original plan (override with SWEEP_MAXN).
+  # voxmini (VoxCeleb2 subset) frames are staged across the fish tier, so the
+  # node axis goes up to NB=8 (override with SWEEP_MAXN).
   local NB="${SWEEP_MAXN:-8}"
   local NODES="${SWEEP_NODES:-1 2 4 8}"
   # Baseline C0: N=${NB} B=4 A=1 amp=bf16 compress=fp16 bucket=25 workers=8
@@ -91,8 +89,8 @@ build_phase1() {
   # S7: node-count curve at a FIXED effective batch (256, matching p1-accum8's
   # N=8,B=4,accum=8 cell) — S2 only ever tested accum at N=${NB}, so we don't
   # know whether fewer nodes at proportionally higher accum reaches similar
-  # throughput with a smaller crash blast-radius (the whole motivation: a
-  # single flaky node killed the entire N=8 Phase-2 job overnight). accum=64
+  # throughput with a smaller crash blast-radius (a single flaky node once
+  # killed the entire N=8 job overnight). accum=64
   # at N=1 here is a comm-free control, not a realistic operating point.
   for n in 1 2 4; do
     local a=$(( 256 / (n * 4) ))
@@ -101,15 +99,13 @@ build_phase1() {
 }
 
 build_phase2() {
-  # REDESIGNED (2026-07-12) around the Phase-1b node-scaling finding: on this
-  # 1GbE fabric a SINGLE node at B=16 sustains ~121 samp/s -- 2x the best
-  # multi-node cell (N=8/B=4/accum=8 = 60.8) and 10x the accum=1 N=8 cell that
-  # was crawling at 11.4 samp/s overnight. So Phase 2 is now N=1 per cell:
-  #   * each cell is its own 1-node job, so the 11 cells run in PARALLEL across
-  #     the fish tier instead of one N=8 job hogging 8 nodes serially;
-  #   * zero inter-node all-reduce -> zero NCCL-timeout crashes (the failure
-  #     that burned 16 retries and lost a night), and a dead node kills one
-  #     cell, not the whole sweep;
+  # Phase 2 runs N=1 per cell. On this 1GbE fabric a single node at B=16
+  # sustains ~121 samp/s, 2x the best multi-node cell (N=8/B=4/accum=8 at 60.8),
+  # so the multi-node sweep was the slower choice:
+  #   * each cell is its own 1-node job, so the cells run in parallel across
+  #     the fish tier instead of one N=8 job holding 8 nodes;
+  #   * no inter-node all-reduce, so no NCCL-timeout crashes, and a dead node
+  #     kills one cell, not the whole sweep;
   #   * B=16 measured at 3.8-4.4GB / 24GB, so accum still carries eff_batch.
   local N="${WIN_N:-1}" B="${WIN_B:-16}" AMP="${WIN_AMP:-bf16}"
   local WORKERS="${WIN_WORKERS:-8}"

@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 # cluster/pick_nodes.sh
-# Select N idle nodes from the best available tier. Run ON login-node (requires sinfo).
+# Select N idle nodes from the best available tier. Run on the login node (requires sinfo).
 #
-# Enforces three rules from the deep network protocol
-# (docs/superpowers/specs/2026-06-30-cluster-tier1-findings.md):
-#   1. Intra-subnet only — never mix nodes from different subnets (T2.3: a single
-#      cross-switch uplink caps at 0.94 Gbps total; intra-switch backplane
-#      is non-blocking at N×0.94 Gbps).
-#   2. Homogeneous GPU tier — mixing tiers inflates step time to the slowest
-#      rank (T5.3 straggler risk).
-#   3. Always exclude node114 (sits on /252 but with high-latency cross-subnet path).
-#      Also exclude login-node (login node).
+# Rules:
+#   1. Intra-subnet only. A single cross-switch uplink caps at 0.94 Gbps total,
+#      while an intra-switch backplane is non-blocking.
+#   2. Homogeneous GPU tier. Mixing tiers inflates step time to the slowest
+#      rank (stragglers).
+#   3. Always exclude the one /252 node with a high-latency cross-subnet path,
+#      and the login node.
 #
-# Tier ordering (best → worst), confirmed by T1.7 VRAM ramp + T2 subnet probes:
+# Tier ordering (best to worst), from the VRAM ramp and subnet probes:
 #   Tier 1  fish       /254  RTX 3090   25.3 GB  fwd_bwd batch=4   (primary)
 #   Tier 2  birds      /253  A5000      25.3 GB  fwd_bwd batch=4   (same VRAM, intra-/253)
 #   Tier 3  cars       /252  RTX4000Ada 21.0 GB  fwd_bwd batch=2
@@ -23,16 +21,16 @@
 # mix tiers even if they share a subnet — GPU heterogeneity causes stragglers.
 #
 # Usage:  pick_nodes.sh <N>
-# Output: comma-separated nodelist for sbatch --nodelist, e.g. "node001,node002,..."
+# Output: comma-separated nodelist for sbatch --nodelist, e.g. "node1,node2,..."
 # Exit 1 if no single tier can supply N idle nodes.
 
 set -euo pipefail
 
 N="${1:?usage: pick_nodes.sh <N>}"
 
-# Tier node lists come from cluster/tiers.tsv via tiers_lib.sh, which
-# also fixes the preference order below. That file records why the river/department
-# nodes (ain, allier, ardennes…) are absent: GPU type unconfirmed.
+# Tier node lists come from the tiers file via tiers_lib.sh, which also fixes
+# the preference order below. That file records why some nodes are absent:
+# their GPU type is unconfirmed.
 source "$(dirname "${BASH_SOURCE[0]}")/tiers_lib.sh"
 
 # Snapshot idle nodes once (avoids repeated sinfo calls per tier).

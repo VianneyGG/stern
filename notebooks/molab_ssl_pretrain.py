@@ -28,10 +28,10 @@ def _(mo):
         # molab streaming SSL pretrain
 
         Runs `stern/training/pretrain.py`'s SSL pretrain stage on this
-        molab GPU while VoxCeleb2 WDS shards stay on login-node, streamed shard-major
+        molab GPU while VoxCeleb2 WDS shards stay on the cluster login node, streamed shard-major
         over a token-gated HTTP tunnel.
 
-        **Before running this notebook:** on login-node, start
+        **Before running this notebook:** on the login node, start
         `cluster/serve_shards_public.sh <shards-dir> <manifest-csv>`
         and copy the printed `<tunnel-url>/<token>` into the field below.
 
@@ -114,8 +114,8 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    ssh_host = mo.ui.text(label="login-node SSH host/IP", value="login-node", full_width=True)
-    ssh_user = mo.ui.text(label="login-node SSH username", full_width=True)
+    ssh_host = mo.ui.text(label="Login node SSH host/IP", full_width=True)
+    ssh_user = mo.ui.text(label="Login node SSH username", full_width=True)
     # mo.ui.text is single-line and mangles pasted newlines, which corrupts
     # the OpenSSH PEM format; text_area is required for a multi-line key
     # (marimo has no password-masked multiline widget, so this is visible
@@ -206,7 +206,7 @@ def _(cfg):
 @app.cell
 def _(mo):
     pull_checkpoint = mo.ui.run_button(
-        label="Pull latest checkpoint from login-node (resume after a disconnect)"
+        label="Pull latest checkpoint from the login node (resume after a disconnect)"
     )
     pull_checkpoint
     return (pull_checkpoint,)
@@ -327,7 +327,7 @@ def _(
         remote_dir: str = ssh_remote_dir.value,
         interval_s: float = 300.0,
     ) -> threading.Thread:
-        """Best-effort periodic SFTP push of local checkpoints to login-node. A
+        """Best-effort periodic SFTP push of local checkpoints to the login node. A
         push failure must never crash training. Uses paramiko rather than the
         system `rsync`/`ssh` binaries -- neither is guaranteed present in the
         molab sandbox image (design doc open question #1; confirmed missing

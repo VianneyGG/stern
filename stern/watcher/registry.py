@@ -1,4 +1,4 @@
-"""Jobs registry: append-only record of every job submit_login-node.sh submits.
+"""Jobs registry: append-only record of every job submit_to_cluster.sh submits.
 
 Squeue-diffing alone can't detect "a job that never started" -- there's
 nothing to diff against without a record of what *should* exist. This file

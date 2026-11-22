@@ -5,7 +5,7 @@ checkpoints, for `plot_vit_internals.py` to render.
 Runs on a pool node (has both the node-local WebDataset shards and the
 shared-NFS `stern_mesh/checkpoints`), e.g.:
 
-    ssh node053 "cd ~/stern && ~/.local/bin/uv run --no-sync python -m \\
+    ssh <node> "cd ~/stern && ~/.local/bin/uv run --no-sync python -m \\
         stern.evaluation.diagnostics.export_vit_internals \\
         --shard-path /Data/$USER/voxceleb2_shards/shard-000000.tar \\
         --mesh-shared ~/stern_mesh \\

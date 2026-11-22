@@ -9,7 +9,7 @@ fallback for when `quota` itself is unavailable. Node-local /Data usage is
 per-node -- VoxCeleb2 frames and checkpoints live there (train.sbatch's
 STERN_CHECKPOINT_ROOT / VOXMINI_FRAMES_ROOT), not on the NFS home -- so it
 requires one `ssh <node>` per currently-running job's node, same pattern as
-sync_login-node.sh's Bash(ssh *) precedent.
+sync_to_cluster.sh's Bash(ssh *) precedent.
 """
 
 from __future__ import annotations

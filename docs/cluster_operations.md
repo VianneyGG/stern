@@ -1,6 +1,6 @@
 # Cluster operations
 
-Placeholders: `<login-node>` is the SLURM login host, `<storage-node>` holds
+Placeholders: `<login-node>` is the SLURM login host, `<results-host>` (`STERN_RESULTS_HOST`) holds
 finished results, `$DATA_ROOT` is node-local data storage, and `$REPO` is the
 checkout on the shared home directory.
 
@@ -89,10 +89,10 @@ connection drops, rerun the script. The server keeps running.
 
 ## Retrieving checkpoints
 
-On DONE, the watcher moves a run's results to the storage node:
+On DONE, the watcher moves a run's results to the results host:
 
 ```bash
-rsync -a <storage-node>:$DATA_ROOT/stern_mesh_results/<run_id>/master.pt ./<run_id>/
+rsync -a <results-host>:$DATA_ROOT/stern_mesh_results/<run_id>/master.pt ./<run_id>/
 ```
 
 Never run `rsync --delete` against the repo: it wiped `runs/state` and

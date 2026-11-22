@@ -1,5 +1,5 @@
 """CLI wrapper around watcher.registry.append_job_record, called from
-submit_login-node.sh's remote ssh block right after `sbatch` returns a job id.
+submit_to_cluster.sh's remote ssh block right after `sbatch` returns a job id.
 
 Usage:
   uv run python stern/watcher/append_job_registry.py \

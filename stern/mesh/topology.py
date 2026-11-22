@@ -24,7 +24,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-TIERS_PATH = Path(__file__).resolve().parents[2] / "cluster" / "tiers.tsv"
+from stern.cluster_env import tiers_path
+
+TIERS_PATH = tiers_path()
 
 
 @dataclass(frozen=True)

@@ -3,7 +3,7 @@
 #
 #   install_watcher.sh <host>   designate <host>, then converge this machine
 #   install_watcher.sh          converge this machine against the existing
-#                               designation (used by submit_login-node.sh)
+#                               designation (used by submit_to_cluster.sh)
 #
 # Converge means: install and enable the systemd --user timer if this machine is
 # the designated host, disable it otherwise. Designation itself lives in
@@ -13,8 +13,7 @@
 # it from waking up once a minute to do so.
 #
 # Why a file and not flock: fcntl.flock provides no cross-host mutual exclusion
-# on this NFSv3 export (verified 2026-08-20), so nothing prevents two enabled
-# timers from ticking simultaneously.
+# on this NFSv3 export, so nothing stops two enabled timers from ticking at once.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,11 +38,11 @@ else
 fi
 
 if [[ "${THIS_HOST}" != "${DESIGNATED}" ]]; then
-  # `stop`, never `disable`: ~/.config/systemd/user is on the same shared NFS
-  # home, so the timers.target.wants symlink `enable` creates is visible to both
-  # hosts and `disable` would delete the designated host's enablement too --
-  # whichever host converged last would win. `stop` is per-host runtime state.
-  # It does not survive a reboot there, which is fine: watch_training.py checks
+  # `stop`, never `disable`: ~/.config/systemd/user is on the shared NFS home,
+  # so the timers.target.wants symlink that `enable` creates is visible to every
+  # host. `disable` would remove the designated host's enablement too, and
+  # whichever host converged last would win. `stop` is per-host runtime state;
+  # it does not survive a reboot, which is fine because watch_training.py checks
   # the designation itself and exits without touching shared state.
   systemctl --user stop stern-watcher.timer 2>/dev/null || true
   echo "${THIS_HOST} is not the designated watcher (${DESIGNATED}); local timer stopped."
@@ -72,8 +71,8 @@ Description=Run stern-watcher.service every minute
 [Timer]
 # Wall-clock anchored, NOT OnUnitActiveSec: a monotonic-only timer
 # (OnUnitActiveSec + OnBootSec) has no anchor to re-arm from once an
-# activation is missed and the boot is long past, which silently killed
-# the watcher for 8.5h on 2026-08-13. OnCalendar always has a next elapse.
+# activation is missed and the boot is long past, and then it stops silently.
+# OnCalendar always has a next elapse.
 OnCalendar=*:*:00
 Persistent=true
 AccuracySec=5s

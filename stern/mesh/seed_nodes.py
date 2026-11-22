@@ -34,12 +34,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+from stern.cluster_env import data_root
 from stern.mesh.placement import InsufficientCapacityError, plan_placement
 from stern.mesh.scoring import NodeInfo
 from stern.mesh.shard_map import Holder, save_shard_map
 from stern.mesh.topology import NODE_GROUPS, NODE_SUBNETS
 
-MESH_DIR = "/Data/$USER/mesh"
+MESH_DIR = str(data_root() / "mesh")
 
 # Shared-home quota constraint: N x 172 MB (bf16 ViT-B checkpoint) + master +
 # momentum buffer must fit. This caps how many nodes may PUSH checkpoints to

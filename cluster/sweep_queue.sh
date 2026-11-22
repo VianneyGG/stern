@@ -2,7 +2,7 @@
 # cluster/sweep_queue.sh
 # Drain one tier's DiLoCo sweep queue unattended: as soon as the watcher marks
 # the in-flight run DONE, launch the next queued config (within one poll).
-# Run under nohup on login-node, one instance per tier.
+# Run under nohup on the designated watcher host, one instance per tier.
 #
 # Usage: sweep_queue.sh <fish|birds|cars>
 #
@@ -59,8 +59,8 @@ QUORUM=13  # of 16 pool nodes: both the reseed threshold and the abort-round quo
 
 # sweep_queue.sh and watch_training.py both read-modify-write
 # mesh_run_configs.json, and fcntl.flock provides no cross-host mutual
-# exclusion on this NFSv3 home (verified 2026-08-20) -- so they must run on the
-# same machine. runs/state/watcher_host names it.
+# exclusion on this NFS home, so they must run on the same machine.
+# runs/state/watcher_host names it.
 HOST_FILE="${STATE_DIR}/watcher_host"
 [[ -f "${HOST_FILE}" ]] || { echo "ERROR: no ${HOST_FILE}; run install_watcher.sh <host> to designate one" >&2; exit 1; }
 DESIGNATED="$(tr -d '[:space:]' < "${HOST_FILE}")"; DESIGNATED="${DESIGNATED%%.*}"
@@ -82,21 +82,12 @@ log() {
 
 active_nodes() { tr ',' '\n' < "${ACTIVE_FILE}" | awk 'NF'; }
 
-# Node -> "still busy" for nodes carrying one of our own SLURM jobs. A "mine"
-# job is only safe to overlap with (the previous queue item's own workers
-# tearing down, or any job this module doesn't track as a mesh run at all) --
-# a DIFFERENT TRACKED mesh run actively occupying the node (e.g. a
-# concurrently-launched run this sweep doesn't manage) must NOT be treated as
-# available just because the job happens to belong to this user. Matches on
-# job id (recycled after the 2026-08-22 cluster rebuild, so the MOST RECENT
-# jobs_registry.json record for that id is the one that's actually live --
-# same disambiguation as chunk_relaunch.py) then looks up that job's run_tag
-# in watcher_state.json: unless the run reads back DONE, the node is busy. A
-# job with no registry record, or a registry record with no run_tag, is left
-# available -- unrelated to the mesh entirely, same as before this fix.
-# Observed 2026-09-07: lev-window-200 register-launched straight onto
-# lev-fix16c's still-RUNNING nodes because the old check only asked
-# "is this my job", not "is this job's (tracked) run actually done".
+# Node -> "still busy" for nodes carrying one of our own SLURM jobs. Owning the
+# job is not enough: a job that belongs to a tracked mesh run which has not
+# reached DONE keeps its node busy. Job ids can be recycled, so the most recent
+# jobs_registry.json record for an id is the live one (as in chunk_relaunch.py).
+# Its run_tag is then looked up in watcher_state.json. A job with no registry
+# record, or no run_tag, is left available.
 busy_nodes() {
   local mine_raw="$1" tmp
   tmp=$(mktemp)

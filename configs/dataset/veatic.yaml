@@ -7,10 +7,10 @@ role: probe            # 124 Hollywood/documentary/home-video clips, continuous 
 # since any non-empty string is truthy).
 #
 # Locality, re-verified 2026-08-28: the copy this comment used to name
-# (login-node:/Data/$USER/veatic, built 2026-07-07) is GONE, almost
+# (the login node:/Data/$USER/veatic, built 2026-07-07) is GONE, almost
 # certainly wiped by the 2026-08-22 SallesInfo rebuild. That directory now holds
 # only `uv-cache/` and `voxceleb2/`, and nothing matching *veatic* exists under
-# /Data or $HOME on login-node. Rebuilt at `.data/veatic` on the workstation via
+# /Data or $HOME on the login node. Rebuilt at `.data/veatic` on the workstation via
 # fetch_veatic.py. VEATIC.zip has no scriptable download URL, so any other node
 # needs the extracted tree copied to it -- there is no re-fetch step to automate.
 # Check `$VEATIC_ROOT/manifest.csv` exists on a host before flipping the flag

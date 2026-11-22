@@ -3,7 +3,7 @@
 #
 # Launches the mask_type x target_mode factorial: four solo SSL runs that test
 # why the mesh runs learned so little (train_loss 0.308 -> 0.256 over 110
-# rounds on pool-cars-best-120r).
+# rounds on the cars pool).
 #
 #   H1  the reconstruction target is time-averaged (mae.py's .mean(dim=3)),
 #       so motion is erased before the loss ever sees it   -> target_mode
@@ -15,14 +15,14 @@
 #
 # Three things this deliberately does NOT do:
 #
-#   1. It never calls sync_login-node.sh and never writes to ~/stern. Code is
+#   1. It never calls sync_to_cluster.sh and never writes to ~/stern. Code is
 #      deployed to a separate ~/stern_factorial checkout, so the live sweep and
 #      its watcher keep running against the code they were launched with. The
 #      local tree cannot load the cluster's checkpoints anyway (the ViT
 #      refactor renamed 128 parameters), which is exactly why overwriting
 #      ~/stern would break the running jobs.
 #   2. It never writes to NFS home. MESH_ROOT and MESH_SHARED both point into
-#      node-local /Data, so the ~7.7 GB of remaining home quota is untouched --
+#      node-local /Data, so the small NFS home quota is untouched --
 #      4 arms x 12 rounds x 183 MB of checkpoint pushes would otherwise blow
 #      straight through it.
 #   3. It does not merge. Each arm is a solo node with mesh.merge=false (the
@@ -44,16 +44,19 @@
 #
 set -euo pipefail
 
-REMOTE_HOST="${REMOTE_HOST:-login-node}"
+source "$(dirname "${BASH_SOURCE[0]}")/cluster_env.sh"
+
+REMOTE_HOST="${REMOTE_HOST:-${STERN_LOGIN_HOST}}"
 REMOTE_DIR="${REMOTE_DIR:-\$HOME/stern_factorial}"
-# node001 holds the full 260-shard VoxCeleb2 set plus manifest.json and val/;
-# the other three hold only their own mesh subsets, which is why the subset is
-# copied from node001 rather than reusing whatever each node happens to have.
-SOURCE_NODE="${SOURCE_NODE:-node114}"  # 8fps corpus holder, default since 2026-09-19
+# The dataset source node holds the full 260-shard VoxCeleb2 set plus
+# manifest.json and val/. The other nodes hold only their own mesh subsets, so
+# the subset is copied from the source node rather than reusing whatever each
+# node happens to have.
+SOURCE_NODE="${SOURCE_NODE:-${STERN_SOURCE_NODE}}"  # 8fps corpus holder
 SOURCE_DATA="/Data/voxceleb2_shards_8fps"
-NODES="${NODES:-node001 node002 node004 node007}"
-DATA_ROOT="/Data/$USER/factorial"
-SHARED_ROOT="/Data/$USER/factorial_shared"
+NODES="${NODES:-${STERN_FACTORIAL_NODES}}"
+DATA_ROOT="${STERN_DATA_ROOT}/factorial"
+SHARED_ROOT="${STERN_DATA_ROOT}/factorial_shared"
 EXPERIMENT="${EXPERIMENT:-videomae_mesh_diloco}"
 
 # 12 shards ~= 50k windows per pass, comfortably more than the 32000
@@ -113,7 +116,7 @@ if [[ "${ACTION}" == "stage" || "${ACTION}" == "all" ]]; then
   echo "--- 2. stage an identical shard subset on each node ---"
   for node in ${NODES}; do
     echo "  [${node}]"
-    # Copies straight from node001 node-to-node rather than through NFS home.
+    # Copies straight from the source node to each node, not through NFS home.
     run ssh "${REMOTE_HOST}" "timeout 3600 ssh -o StrictHostKeyChecking=no ${node} '
       set -e
       mkdir -p ${DATA_ROOT} ${SHARED_ROOT}/metadata
@@ -122,7 +125,7 @@ if [[ "${ACTION}" == "stage" || "${ACTION}" == "all" ]]; then
       for s in ${SHARDS}; do
         [ -f ${DATA_ROOT}/\$s ] || rsync -a \${SRC}${SOURCE_DATA}/\$s ${DATA_ROOT}/
       done
-      # val/ is replicated in full to every node, matching seed_mesh.py, so
+      # val/ is replicated in full to every node, matching seed_nodes, so
       # val_loss is computed on identical data across all four arms.
       mkdir -p ${DATA_ROOT}/val
       rsync -a \${SRC}${SOURCE_DATA}/val/ ${DATA_ROOT}/val/

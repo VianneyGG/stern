@@ -1,6 +1,6 @@
 name: afewva
 role: probe            # labelled VA set for end-to-end fine-tuning; film-acted -> report separately (REPO_SETUP §2)
-present: ${oc.decode:${oc.env:AFEWVA_PRESENT,false}}  # staged on login-node at
+present: ${oc.decode:${oc.env:AFEWVA_PRESENT,false}}  # staged on the login node at
                        # /Data/$USER/afewva/raw (2026-09-10); export
                        # AFEWVA_PRESENT=true on checkouts where it's mounted
 va_range: [-1.0, 1.0]  # build_afewva_manifest.py pre-scales native [-10,10] into [-1,1]

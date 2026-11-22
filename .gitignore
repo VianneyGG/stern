@@ -21,7 +21,7 @@ outputs/
 
 # Live mesh/watcher state and experiment results (runs/state, runs/results).
 # Gitignored because state churns every watcher tick, not because it's
-# disposable -- it's backed up via sync_login-node.sh's pull-before-push rsync.
+# disposable -- it's backed up via sync_to_cluster.sh's pull-before-push rsync.
 # Deliberately NOT under .claude/: that dir is Claude Code tooling state and
 # a stray `rm -rf .claude` must never take production data with it.
 runs/
@@ -42,3 +42,7 @@ CLAUDE.md
 # Worktrees (superpowers:using-git-worktrees)
 .worktrees/
 scratchpad/
+
+# Cluster-specific values (see cluster/*.example)
+cluster/site.conf
+cluster/tiers.tsv

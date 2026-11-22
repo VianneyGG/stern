@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Verify a mesh pool's on-disk shard payload against the golden reference.
 
-Exit 0 means every node's seeded payload matches `node001`'s reference set by
+Exit 0 means every node's seeded payload matches the source node's reference set by
 name and byte size, val/ is complete, and both manifest.json files are
 present. Exit 1 means something is wrong and no run should be launched.
 
@@ -28,11 +28,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from stern.cluster_env import setting
 from stern.mesh.seeding import holdings_from_scan, validate
 from stern.mesh.topology import tier_nodes
 from stern.mesh.seed_nodes import MESH_DIR, _VAL_SUBDIR
 
-GOLDEN_HOST = "node114"
+GOLDEN_HOST = setting("STERN_SOURCE_NODE")
 GOLDEN_DIR = "/Data/voxceleb2_shards_8fps"  # 8fps corpus, default since 2026-09-19
 DEFAULT_METADATA_DIR = Path.home() / "stern_mesh" / "metadata"
 

@@ -1,9 +1,9 @@
 # Config registry
 
-Living index of every Hydra config file under `conf/`. Update this table
-whenever a config is added, its status changes, or it's deprecated.
+Index of every Hydra config file under `configs/`. Update this table whenever
+a config is added, changes status, or is deprecated.
 
-## Composition order (`conf/config.yaml`)
+## Composition order (`configs/config.yaml`)
 
 ```
 defaults:
@@ -21,7 +21,7 @@ selection, and Hydra composes top-to-bottom.
 
 ## Experiment pattern
 
-`conf/experiment/*.yaml` are self-contained, not name-only stubs. Each one
+`configs/experiment/*.yaml` files are self-contained, not name-only stubs. Each one
 uses Hydra's `# @package _global_` + `defaults: [override /group: x]`
 pattern:
 
@@ -33,7 +33,7 @@ defaults:
 experiment:
   name: <must equal the file stem>
   description: "..."
-  stage: pretrain | va_finetune   # routes scripts/run_experiment.sh
+  stage: pretrain | va_finetune   # routes cluster/run_experiment.sh
 
 model:
   drop_path_rate: 0.2   # only if this experiment needs an architecture delta
@@ -44,13 +44,13 @@ train:
 ```
 
 `model:`/`train:`/`dataset:` blocks are **deltas only** — they override
-specific fields on top of `conf/model/videomae_base.yaml` and
-`conf/train/{default,ssl}.yaml`, which remain the source of truth for the
+specific fields on top of `configs/model/videomae_base.yaml` and
+`configs/train/{default,ssl}.yaml`, which remain the source of truth for the
 full recipe. Comment every override with the rationale, not just the value.
 
-`override /dataset: x` / `override /train: x` replace shell-level CLI flags
-(`scripts/run_experiment.sh` no longer hardcodes `dataset=voxmini train=ssl`
-for pretrain-stage runs — see the experiment file itself).
+`override /dataset: x` and `override /train: x` replace shell-level CLI flags.
+`cluster/run_experiment.sh` passes no dataset or train group for pretrain-stage
+runs; the experiment file selects them.
 
 Naming convention (unchanged): `<encoder>_<strategy>[_<variant>]_<dataset>.yaml`,
 `name:` inside the file MUST equal the file stem (checkpoints/result JSONs key
@@ -67,7 +67,7 @@ Two unrelated architectures, selected via `override /model: <name>`:
 - `levjepa_base` — a second, independent Stage 1 SSL objective
   (`LeVJEPAEncoder` + SIGReg/invariance losses, `stern/models/
   levjepa/`), not a delta on `videomae_base`. Selected, as its
-  `levjepa_lean` variant, by `conf/experiment/levjepa_mesh_ssl.yaml`; its own `encoder:
+  `levjepa_lean` variant, by `configs/experiment/levjepa_mesh_ssl.yaml`; its own `encoder:
   levjepa` field is what `training/diloco/mesh_round.py`'s
   `_build_pretrain_model` dispatches on for mesh runs.
 
@@ -105,7 +105,7 @@ registry rewrite.
 
 | Name | Role | Present | Notes |
 |---|---|---|---|
-| `afewva` | probe | `false` | Flip to `true` after the ibug EULA download + `scripts/build_afewva_manifest.py` |
+| `afewva` | probe | `false` | Flip to `true` after the EULA download and manifest build |
 | `veatic` | probe | env-gated (`VEATIC_PRESENT`) | Never hardcode `true` in-repo — cluster-only |
 | `voxmini` | ssl | env-gated (`VOXMINI_PRESENT`) | Never hardcode `true` in-repo — cluster-only |
 | `affwild2` | probe | `false` | Blocked on signed academic application |
@@ -124,33 +124,27 @@ registry rewrite.
 
 ## Training watcher (systemd --user timer)
 
-`scripts/cron/poll_squeue.sh` / `scripts/cron/aggregate_results.sh` were never
-installed. The watcher itself is a single script,
-`stern/watcher/watch_training.py`
-(docs/superpowers/specs/2026-07-15-slurm-training-watcher-design.md), but as
-of 2026-08-12 it is no longer installed via cron — the cron spool was found
-wiped 5 separate times with no confirmed root cause. It now runs as a
-systemd `--user` timer, converged onto exactly one designated host via
-`cluster/install_watcher.sh`:
+The watcher is a single script, `stern/watcher/watch_training.py`. It does not
+run from cron: the cron spool was repeatedly wiped with no confirmed root
+cause. It runs as a systemd `--user` timer, converged onto exactly one
+designated host via `cluster/install_watcher.sh`:
 
     cluster/install_watcher.sh <host>   # designate <host>, converge this machine
     cluster/install_watcher.sh          # converge this machine against the existing designation
 
 Designation lives in `runs/state/watcher_host` (shared NFS home) and is read
 by `watch_training.py` on every tick, so a host whose timer survives a
-decommission still refuses to touch shared state. `submit_login-node.sh` calls
-the no-arg form on every job submission, but only against `login-node` itself
-(its ssh heredoc runs there) — it converges login-node to `stop` when login-node
-isn't the designated host, and does **not** reach out to re-converge the
-designated host if that host's timer dies. There is currently no automated
-self-healing for the designated host's own timer going down (confirmed gap,
-2026-09-03) — if `systemctl --user status stern-watcher.timer` on the
-designated host shows anything other than `enabled`/`active (waiting)`,
-re-run `install_watcher.sh` there manually.
+decommission still refuses to touch shared state. `submit_to_cluster.sh` calls
+the no-arg form on every job submission, but only against the login node itself
+(its ssh heredoc runs there). It stops the login node's timer when that node is
+not the designated host. It does **not** re-converge the designated host if that
+host's timer dies, so there is no automated self-healing for it. If
+`systemctl --user status stern-watcher.timer` on the designated host shows
+anything other than `enabled` or `active (waiting)`, re-run `install_watcher.sh`
+there manually.
 
-Do not reinstall the old cron line from pre-2026-08-12 history — it will
-work briefly but gets no ongoing supervision and nothing will notice if it
-silently stops ticking again.
+Do not reinstall the old cron line. It works briefly, gets no ongoing
+supervision, and nothing notices when it silently stops ticking.
 
 State lives in `runs/state/` (`jobs_registry.json`, `watcher_state.json`,
 `squeue.json`, `watcher.log`, `watcher_systemd.log`, `watcher_host`,
@@ -167,11 +161,11 @@ check_watcher_health.sh` closes that gap: it checks `systemctl --user is-active
 stern-watcher.timer` on the designated host and re-runs `install_watcher.sh` if
 it isn't active. It must run from system cron, not another systemd `--user`
 unit, to be an independent failure domain from the thing it's checking.
-Install on the designated host only (currently node089) via `crontab -e`:
+Install on the designated host only (currently the results host) via `crontab -e`:
 
     */15 * * * * XDG_RUNTIME_DIR=/run/user/$(id -u) $HOME/stern/cluster/check_watcher_health.sh >> $HOME/stern/runs/state/watcher_health_cron.log 2>&1
 
-Requires `loginctl enable-linger $USER` (already on) so `XDG_RUNTIME_DIR`
+Requires `loginctl enable-linger $USER` so `XDG_RUNTIME_DIR`
 exists outside a login session. This is a mitigation, not a full fix — it
 narrows outage windows to ≤15 minutes instead of indefinite, and it does not
 itself have a supervisor; deliberately not adding one, since chaining another

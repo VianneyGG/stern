@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # cluster/tiers_lib.sh
-# Shell-side reader for cluster/tiers.tsv -- the single source of
-# truth for cluster node topology, shared with stern/mesh/topology.py.
+# Shell-side reader for the tiers file, the single source of truth for cluster
+# node topology. stern/mesh/topology.py reads the same file.
 #
 # Source it, don't execute it:
 #   source "$(dirname "${BASH_SOURCE[0]}")/tiers_lib.sh"
 #
-# The roster used to be pasted verbatim into pick_nodes.sh, seed_mesh.py,
-# clean_tier_data.sh and launch_mesh_pool.sh. Adding a node to one and not the
-# others desynced SLURM node picking from mesh seeding, so a job could be placed
-# on a node that had no seeded shard payload.
+# Keep the roster in one place. A copy pasted into several scripts drifts: a
+# node added to one and not the others could get a SLURM job with no seeded
+# shard payload.
 #
 # Deliberately parses the TSV with awk rather than calling Python: pick_nodes.sh
 # runs on the login node where no venv is guaranteed active.
 
-_TIERS_TSV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tiers.tsv"
+source "$(dirname "${BASH_SOURCE[0]}")/cluster_env.sh"
+_TIERS_TSV="${STERN_TIERS_FILE}"
 
 if [[ ! -f "${_TIERS_TSV}" ]]; then
   echo "ERROR: tiers_lib.sh: roster not found at ${_TIERS_TSV}" >&2

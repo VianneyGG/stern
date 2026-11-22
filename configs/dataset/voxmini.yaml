@@ -1,9 +1,7 @@
 name: voxmini
 role: ssl  # unlabelled SSL-adaptation set, never touches VA labels
-# `present: true` hardcoded here would be a lie for any checkout except the
-# 4 fish nodes (node001/node002/node003/node004) staged 2026-07-08 -- see
-# veatic.yaml for the same env-driven convention. Set VOXMINI_PRESENT=true
-# on those nodes before running.
+# Present only on the nodes where the subset was staged, so presence comes from
+# the environment (same convention as veatic.yaml): set VOXMINI_PRESENT=true there.
 present: ${oc.decode:${oc.env:VOXMINI_PRESENT,false}}
 path: ${oc.env:VOXMINI_ROOT,???}
 manifest_path: ${.path}/manifest.csv
