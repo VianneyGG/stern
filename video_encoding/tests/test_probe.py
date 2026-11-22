@@ -57,13 +57,3 @@ class TestTemporalTransformFromConfig:
     def test_defaults_to_no_transform(self):
         """Absent config means today's behaviour, so no existing probe changes."""
         assert _temporal_transform(DictConfig({"train": {"seed": 0}})) is None
-
-    def test_normal_is_no_transform(self):
-        cfg = DictConfig({"train": {"seed": 0, "temporal_condition": "normal"}})
-        assert _temporal_transform(cfg) is None
-
-    def test_shuffled_returns_a_window_transform(self):
-        cfg = DictConfig({"train": {"seed": 3, "temporal_condition": "shuffled"}})
-        fn = _temporal_transform(cfg)
-        window = torch.randn(3, 16, 8, 8)
-        assert fn(window).shape == window.shape

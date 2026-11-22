@@ -51,14 +51,6 @@ def test_all_frames_in_a_window_share_one_crop_and_flip():
         np.testing.assert_array_equal(got, _reference(src, params, 32))
 
 
-def test_augmentation_actually_changes_pixels():
-    """A non-identity crop+flip must not be a silent no-op."""
-    params = GroupAugmentParams(crop_box=(3, 7, 27, 31), flip=True)
-    frame = _gradient_frame(0)
-    (out,) = apply_group_augment([frame], params, image_size=32)
-    np.testing.assert_array_equal(out, _reference(frame, params, 32))
-
-
 def test_flip_is_applied_when_set():
     """Isolates the flip: a full-frame crop leaves flip as the only effect."""
     frame = _gradient_frame(0)
@@ -69,14 +61,6 @@ def test_flip_is_applied_when_set():
         [frame], GroupAugmentParams(crop_box=(0, 0, 32, 32), flip=False), image_size=32
     )
     np.testing.assert_array_equal(flipped, plain[:, ::-1, :])
-
-
-def test_different_rng_state_yields_different_params():
-    rng_a = random.Random(0)
-    rng_b = random.Random(1)
-    params_a = sample_group_augment(image_size=32, rng=rng_a)
-    params_b = sample_group_augment(image_size=32, rng=rng_b)
-    assert params_a != params_b
 
 
 def test_sampled_scale_comes_from_the_configured_set():

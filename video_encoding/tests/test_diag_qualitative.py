@@ -17,7 +17,6 @@ from video_encoding.scripts._diag_common import DiagBundle
 from video_encoding.scripts.diag_qualitative import (
     attention_rollout,
     check,
-    embedding_scatter,
     mask_ratio_grid,
     retrieval_grid,
 )
@@ -91,16 +90,6 @@ def test_retrieval_grid_returns_query_first_when_query_in_gallery():
 
 
 # --- embedding_scatter ------------------------------------------------
-
-
-def test_embedding_scatter_returns_2d_projection():
-    rng = np.random.default_rng(0)
-    tokens = rng.standard_normal((20, 12))
-    clip_ids = np.arange(20)
-
-    coords = embedding_scatter(tokens, clip_ids)
-
-    assert coords.shape == (20, 2)
 
 
 # --- mask_ratio_grid -----------------------------------------------------

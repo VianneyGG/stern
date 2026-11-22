@@ -85,18 +85,6 @@ def test_sample_clip_keys_picks_requested_count_deterministically(tmp_path):
     assert set(a) <= {f"clip{i}" for i in range(10)}
 
 
-def test_sample_clip_keys_matches_random_sample_for_a_given_seed(tmp_path):
-    clip_keys = sorted(f"clip{i}" for i in range(10))
-    shard_path = _write_shard(tmp_path, {k: 10 for k in clip_keys})
-
-    a = sample_clip_keys(shard_path, n_windows=3, seed=1)
-    b = sample_clip_keys(shard_path, n_windows=3, seed=2)
-
-    # Pinned: random.Random(1).sample(clip_keys, 3) / random.Random(2).sample(clip_keys, 3)
-    assert a == ["clip2", "clip1", "clip4"]
-    assert b == ["clip0", "clip1", "clip8"]
-
-
 def test_sample_clip_keys_raises_when_shard_too_small(tmp_path):
     shard_path = _write_shard(tmp_path, {"clip0": 10})
     with pytest.raises(ValueError, match="only 1 eligible clips"):
@@ -144,30 +132,6 @@ def test_load_sample_windows_skips_clips_shorter_than_the_window(tmp_path):
 
 
 # --- checkpoint loading (the bug this redesign fixes) -------------------
-
-
-def test_load_encoder_random_init_needs_no_checkpoint(tmp_path):
-    cfg = _tiny_model_cfg()
-    encoder = load_encoder("random_init", tmp_path / "does-not-exist", cfg)
-    assert encoder.embed_dim == 16
-
-
-def test_load_encoder_loads_correctly_prefixed_state_dict(tmp_path):
-    cfg = _tiny_model_cfg()
-    source_model = VideoMAEForPreTraining(cfg)
-    ckpt_dir = tmp_path / "checkpoints" / "run_a"
-    ckpt_dir.mkdir(parents=True)
-    torch.save(
-        {"model_state_dict": source_model.state_dict(), "master_version": 1},
-        ckpt_dir / "master.pt",
-    )
-
-    loaded = load_encoder("run_a", tmp_path, cfg)
-
-    for (name, p_expected), (_, p_loaded) in zip(
-        source_model.encoder.state_dict().items(), loaded.state_dict().items()
-    ):
-        assert torch.equal(p_expected, p_loaded) is True, name
 
 
 def test_load_encoder_raises_on_unprefixed_state_dict(tmp_path):

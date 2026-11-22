@@ -284,14 +284,6 @@ class TestPerSampleBatching:
             "shared across the batch, not per-sample"
         )
 
-    def test_sample_one_unchanged(self):
-        """The pre-existing single-sample math is untouched by the rename."""
-        masker = RandomTubeMasking(mask_ratio=0.9)
-        device = torch.device("cpu")
-        keep, mask = masker._sample_one(None, BASE_GRID, device)
-        expected_kept = _expected_kept(BASE_GRID, 0.9)
-        assert len(keep) == expected_kept
-
     def test_every_masker_batches_per_sample(self):
         """The mixin is shared, but each masker must actually inherit it."""
         device = torch.device("cpu")

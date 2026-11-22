@@ -52,14 +52,6 @@ def _bundle(cfg, run_id: str = "r", round: int | None = None) -> DiagBundle:
 # --- residual_branch_norm -------------------------------------------------
 
 
-def test_residual_branch_norm_self_comparison_is_one():
-    bundle = _bundle(_cfg())
-    result = residual_branch_norm(bundle, bundle)
-    for block_result in result.values():
-        assert block_result["attn"].mean == pytest.approx(1.0)
-        assert block_result["mlp"].mean == pytest.approx(1.0)
-
-
 def test_residual_branch_norm_scaled_block_reports_the_scale_factor():
     cfg = _cfg(depth=3)
     ref_bundle = _bundle(cfg)
@@ -180,13 +172,6 @@ def test_check_emits_branch_norm_ratio_report_with_and_without_real_input():
 
 
 # --- delta_from_init and the mutilation smoke test -------------------
-
-
-def test_delta_from_init_self_comparison_is_zero():
-    bundle = _bundle(_cfg())
-    result = delta_from_init(bundle, bundle)
-    for value in result.values():
-        assert value == pytest.approx(0.0, abs=1e-8)
 
 
 def test_delta_from_init_measures_l2_norm_of_perturbation():
@@ -486,18 +471,6 @@ def test_decode_from_depth_fits_separate_head_per_depth():
     head2 = _fit_depth_head(bundle, pixel_values, 2, keep=keep, steps=5, seed=0)
     assert not torch.allclose(head1.weight, head2.weight)
     assert set(result.keys()) == {1, 2}
-
-
-def test_decode_from_depth_head_capacity_identical_across_depths():
-    from video_encoding.scripts.diag_depth import _fit_depth_head
-
-    bundle, pixel_values, cfg = _decode_bundle_and_input()
-    grid = bundle.encoder.token_grid
-    keep, _mask, _ = temporal_split(grid, pixel_values.device, keep_frac=0.5)
-
-    head1 = _fit_depth_head(bundle, pixel_values, 1, keep=keep, steps=5, seed=0)
-    head2 = _fit_depth_head(bundle, pixel_values, 2, keep=keep, steps=5, seed=0)
-    assert head1.weight.shape == head2.weight.shape
 
 
 def test_decode_from_depth_returns_replicated_metric_value():

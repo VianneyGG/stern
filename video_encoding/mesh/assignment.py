@@ -21,74 +21,7 @@ the latter survives only for its own tests.
 from __future__ import annotations
 
 import json
-from collections import deque
 from pathlib import Path
-
-
-def assign_locality_first(
-    shard_counts: dict[str, int],
-    placement: dict[str, list[str]],
-    all_shards: list[str],
-) -> dict[str, list[str]]:
-    """Decide which specific shards each node trains this round.
-
-    Two-phase, deterministic (nodes and the remainder pool are both walked
-    in a fixed order so the same inputs always produce the same output):
-
-    1. Each node takes shards from its own `placement` holdings first, up
-       to its `shard_counts` budget, skipping any shard another node has
-       already claimed (this is how an overlapping holding -- the same
-       shard held by two nodes that both want it -- resolves: first node
-       in the fixed order wins, no shard is ever double-assigned).
-    2. Any node still short of its budget after phase 1 fills the rest from
-       the pool of shards nobody claimed in phase 1, walked in
-       `all_shards` order.
-
-    Requires `sum(shard_counts.values()) == len(all_shards)` -- the two
-    invariants this function promises ("every shard assigned exactly
-    once" and "every count honoured exactly") are only simultaneously
-    satisfiable when the totals match by construction.
-    """
-    if len(set(all_shards)) != len(all_shards):
-        raise ValueError("assign_locality_first: all_shards contains duplicates")
-
-    total_shards = len(all_shards)
-    total_counts = sum(shard_counts.values())
-    if total_counts != total_shards:
-        raise ValueError(
-            f"assign_locality_first: sum(shard_counts.values())={total_counts} "
-            f"!= len(all_shards)={total_shards}; every shard must be assigned "
-            "exactly once and every count honoured exactly"
-        )
-
-    all_shards_set = set(all_shards)
-    nodes = sorted(shard_counts)
-    assigned: dict[str, list[str]] = {h: [] for h in nodes}
-    taken: set[str] = set()
-
-    # Phase 1: locality -- each node claims its own holdings first.
-    for h in nodes:
-        need = shard_counts[h]
-        for shard in placement.get(h, []):
-            if len(assigned[h]) >= need:
-                break
-            if shard in taken or shard not in all_shards_set:
-                continue
-            assigned[h].append(shard)
-            taken.add(shard)
-
-    # Phase 2: fill remaining budget from the shards nobody claimed.
-    remainder = deque(shard for shard in all_shards if shard not in taken)
-    for h in nodes:
-        need = shard_counts[h]
-        while len(assigned[h]) < need:
-            # total_counts == total_shards guarantees the pool never runs
-            # out before every node's budget is filled.
-            shard = remainder.popleft()
-            assigned[h].append(shard)
-            taken.add(shard)
-
-    return assigned
 
 
 def reassign_failed(

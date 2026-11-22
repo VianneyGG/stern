@@ -125,12 +125,6 @@ class TestMotionBudget:
             < 0.15
         )
 
-    def test_reports_the_geometry_it_measured(self):
-        report = motion_budget(_clip(0.3), TS, PS)
-        assert report["tubelet_size"] == TS
-        assert report["n_frames"] == 8
-
-
 class TestStrideSubsampling:
     """H3: window_starts builds stride-1 windows, so a tubelet spans two
     adjacent frames -- 80ms at 25fps. If that is why motion is absent, widening

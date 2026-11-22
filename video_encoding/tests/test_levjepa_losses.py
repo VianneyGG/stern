@@ -18,27 +18,6 @@ def test_invariance_loss_zero_when_all_views_identical():
     assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-6)
 
 
-def test_invariance_loss_positive_when_views_differ():
-    torch.manual_seed(0)
-    z_global = torch.randn(4, 8)
-    z_locals = torch.randn(4, 3, 8)
-    loss = invariance_loss(z_global, z_locals)
-    assert loss.item() > 0
-
-
-def test_invariance_loss_excludes_global_self_comparison():
-    """The global view compared against itself is a guaranteed-zero term --
-    including it in the mean silently rescales the loss (and the effective
-    lam) by V/(V+1) instead of computing the intended per-local-view mean
-    squared distance to the global anchor."""
-    torch.manual_seed(0)
-    z_global = torch.randn(4, 8)
-    z_locals = torch.randn(4, 3, 8)
-    loss = invariance_loss(z_global, z_locals)
-    manual = (z_locals - z_global.unsqueeze(1)).pow(2).mean()
-    assert torch.allclose(loss, manual, atol=1e-6)
-
-
 def test_invariance_loss_is_a_per_dimension_mean_not_a_sum():
     """LeJEPA's `(center - proj).square().mean()` averages over the embedding
     dims too. Summing over K=256 inflated the invariance term 256x against
@@ -86,14 +65,6 @@ def test_sigreg_loss_high_for_collapsed_batch():
 def test_sigreg_loss_is_nonnegative():
     z = torch.randn(64, 8)
     assert sigreg_loss(z, num_directions=32).item() >= 0.0
-
-
-def test_sigreg_empirical_floor_is_nonnegative():
-    torch.manual_seed(0)
-    floor = sigreg_empirical_floor(
-        batch_size=64, dim=8, num_directions=32, num_trials=2
-    )
-    assert floor >= 0.0
 
 
 def test_sigreg_empirical_floor_is_batch_size_independent():

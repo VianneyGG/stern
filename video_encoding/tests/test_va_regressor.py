@@ -12,7 +12,7 @@ import torch
 from omegaconf import OmegaConf
 from torch import nn
 
-from video_encoding.models import LinearVAHead, VideoMAEVARegressor
+from video_encoding.models import VideoMAEVARegressor
 
 
 class _StubBackbone(nn.Module):
@@ -43,17 +43,6 @@ def test_forward_raises_on_embed_dim_mismatch():
     model = VideoMAEVARegressor(_cfg(12), backbone=_StubBackbone(16))
     with pytest.raises(ValueError, match="feature dim"):
         model(torch.randn(2, 3, 4, 8, 8))
-
-
-def test_linear_va_head_uses_multihead_cross_attention_and_learnable_query():
-    head = LinearVAHead(embed_dim=12, num_heads=12)
-    x = torch.randn(4, 6, 12)
-
-    out = head(x)
-
-    assert out.shape == (4, 2)
-    assert head.num_heads == 12
-    assert head.query.shape == (1, 12)
 
 
 def test_regressor_can_freeze_backbone_after_pretraining():

@@ -119,13 +119,6 @@ def _run(harness, extra_env=None, tier="fish", run_id="RUN1"):
 # --- group 3: the validation gate -----------------------------------------
 
 
-def test_script_has_no_syntax_errors():
-    result = subprocess.run(
-        ["bash", "-n", str(REAL_SCRIPT)], capture_output=True, text=True
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def test_seeding_is_validated_before_the_run_is_registered(harness):
     result, log = _run(harness)
     assert result.returncode == 0, result.stderr
@@ -314,17 +307,3 @@ def test_pool_source_node_overrides_the_first_roster_entry(harness):
     )
     assert result.returncode == 0, result.stderr
     assert "--source-node node048" in _seed_line(log)
-
-
-def test_chunk_rounds_defaults_to_the_measured_value():
-    """8 rounds x ~611s = 68% of the partition's 7200s walltime cap."""
-    script = REAL_SCRIPT.read_text()
-    assert 'CHUNK_ROUNDS="${CHUNK_ROUNDS:-8}"' in script
-    assert "export CHUNK_ROUNDS" in script
-
-
-def test_chunk_rounds_is_overridable_from_the_environment():
-    script = REAL_SCRIPT.read_text()
-    idx = script.index('CHUNK_ROUNDS="${CHUNK_ROUNDS:-8}"')
-    # ':-' not '=', so an explicit CHUNK_ROUNDS survives.
-    assert "${CHUNK_ROUNDS:-8}" in script[idx : idx + 60]

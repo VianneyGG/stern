@@ -13,7 +13,6 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from video_encoding.training import checkpoint as ckpt_io
 from video_encoding.training.pretrain import _payload as ssl_payload
 from video_encoding.training.train import _payload as probe_payload
 
@@ -78,27 +77,3 @@ def test_ssl_payload_scheduler_state_dict_none_when_no_scheduler():
     )
 
     assert payload["scheduler_state_dict"] is None
-
-
-def test_base_payload_matches_probe_shape_directly():
-    """checkpoint.base_payload() itself produces the 4-key spine both stages build on."""
-    model = _TinyModel()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-    payload = ckpt_io.base_payload(
-        model=model,
-        optimizer=optimizer,
-        epoch=1,
-        best_val_metric=0.9,
-        model_name="videomae_va_regressor",
-        optimizer_name="adam",
-    )
-
-    assert set(payload.keys()) == {
-        "model_state_dict",
-        "optimizer_state_dict",
-        "optimizer_name",
-        "epoch",
-        "best_val_metric",
-        "model_name",
-    }

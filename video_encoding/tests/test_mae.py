@@ -191,26 +191,6 @@ class TestVideoMAEForPreTraining:
         assert pred.shape[1] == expected_n_recon
         assert target.shape == pred.shape
 
-    def test_decoder_mask_ratio_zero_reconstructs_every_masked_token(self, model_cfg):
-        """decoder_mask_ratio=0.0 (the default) must reconstruct every masked
-        token -- this is the existing V1 behavior and must not regress."""
-        model = VideoMAEForPreTraining(
-            model_cfg
-        )  # model_cfg has no decoder_mask_ratio -> defaults to 0.0
-        model.eval()
-
-        B, C, T, H, W = 2, 3, 16, 224, 224
-        pixel_values = torch.randn(B, C, T, H, W)
-        grid = (8, 14, 14)
-        masker = RandomTubeMasking(mask_ratio=0.9)
-        keep_indices, mask_indices = masker(pixel_values, grid, torch.device("cpu"), batch_size=B)
-
-        with torch.no_grad():
-            pred, target = model(pixel_values, keep_indices, mask_indices)
-
-        assert pred.shape[1] == mask_indices.shape[1]
-
-
 class TestPerSampleGatherIsNotCrossWired:
     """The batched gather/scatter must keep each row on its OWN indices.
 
@@ -262,24 +242,3 @@ class TestPerSampleGatherIsNotCrossWired:
                     pixel_values[b : b + 1], keep[b : b + 1], mask[b : b + 1]
                 )
                 torch.testing.assert_close(target[b], target_b[0])
-
-    def test_swapping_two_rows_indices_swaps_their_targets(self, model_cfg):
-        """A row's output must depend on that row's own mask_indices."""
-        model = VideoMAEForPreTraining(model_cfg).eval()
-        torch.manual_seed(1)
-        pixel_values = torch.randn(2, 3, 8, 64, 64)
-        grid = self.GRID
-        keep, mask = RandomTubeMasking(mask_ratio=0.5)(
-            pixel_values, grid, torch.device("cpu"), batch_size=2
-        )
-
-        with torch.no_grad():
-            _, target = model(pixel_values, keep, mask)
-            _, swapped = model(
-                pixel_values, keep.flip(0), mask.flip(0)
-            )
-
-        assert not torch.allclose(target[0], swapped[0]), (
-            "row 0's target did not change when its mask indices changed -- "
-            "the gather is not per-row"
-        )

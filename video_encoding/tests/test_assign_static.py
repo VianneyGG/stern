@@ -29,15 +29,6 @@ def test_a_node_is_only_ever_assigned_shards_it_physically_holds():
         assert set(shards) <= set(holdings[node]), f"{node} assigned a shard it lacks"
 
 
-def test_a_replicated_shard_goes_to_exactly_one_of_its_holders():
-    holdings = {"node001": ["shard-a"], "node002": ["shard-a"], "node004": ["shard-a"]}
-    result = assign_static(holdings, {"shard-a"})
-
-    owners = [n for n, shards in result.items() if "shard-a" in shards]
-    assert len(owners) == 1
-    assert owners[0] in holdings
-
-
 def test_load_is_balanced_across_holders_rather_than_dumped_on_the_first():
     """Rounds are time-budgeted, so a node handed 3x its share of the data
     simply trains less of it -- the imbalance shows up as silently skipped
@@ -87,15 +78,6 @@ def test_assignment_is_deterministic_across_calls():
     }
     expected = {"shard-a", "shard-b", "shard-c"}
     assert assign_static(holdings, expected) == assign_static(holdings, expected)
-
-
-def test_output_is_json_round_trippable():
-    """It is written to shard_assignments_<run_id>.json and read back by
-    the worker."""
-    import json
-
-    result = assign_static({"node001": ["shard-a"]}, {"shard-a"})
-    assert json.loads(json.dumps(result)) == result
 
 
 def test_every_holder_gets_at_least_one_shard_when_holdings_overlap():

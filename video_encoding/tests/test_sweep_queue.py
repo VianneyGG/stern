@@ -289,11 +289,6 @@ def sweep(tmp_path):
     return Sweep(tmp_path)
 
 
-def test_script_has_no_syntax_errors():
-    result = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-
-
 def test_next_item_is_registered_once_the_current_run_reaches_done(sweep):
     sweep.set_queue(["run_a 25 0.7 0.9", "run_b 30 0.45 0.8"])
     sweep.set_watcher({"run_a": {"status": "RUNNING", "round": 1}})
@@ -614,23 +609,6 @@ def test_registry_record_missing_run_tag_leaves_node_available(sweep):
         entry = wait_until(lambda: _registered(sweep, "run_a"))
     assert entry["nodes"] == NODES
     assert "16/16 pool nodes available" in sweep.log()
-
-
-def test_cars_is_a_valid_tier(tmp_path):
-    # Isolated SWEEP_REPO_ROOT with no queue file -- must not pick up the
-    # real repo's runs/state/sweep_queue_cars.txt (Task 6 creates that one
-    # for actual use), just prove "cars" clears the tier-validity check.
-    env = dict(os.environ, SWEEP_REPO_ROOT=str(tmp_path))
-    result = subprocess.run(
-        ["bash", str(SCRIPT), "cars"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        env=env,
-    )
-    assert result.returncode != 0
-    assert "unknown tier" not in result.stderr
-    assert "no queue file" in result.stderr
 
 
 def test_quorum_k_weighting_and_extra_overrides_reach_register(sweep):

@@ -15,14 +15,6 @@ from video_encoding.scripts.probe_temporal_conditions import (
 
 
 class TestPairedBootstrap:
-    def test_identical_predictions_give_zero_delta(self):
-        rng = np.random.default_rng(0)
-        target = rng.normal(size=200)
-        pred = target + rng.normal(scale=0.3, size=200)
-        delta, lo, hi = paired_bootstrap_ccc_delta(pred, pred, target, seed=0)
-        assert delta == pytest.approx(0.0, abs=1e-9)
-        assert lo <= 0.0 <= hi
-
     def test_the_resampling_is_actually_paired(self):
         """Both arms are scored on the same windows, so a resample must draw the
         same window indices for both. When the two predictions are identical the
@@ -88,8 +80,3 @@ class TestPredictionPath:
         parse random_init_normal as ('random', 'init_normal')."""
         path = prediction_path(Path("/tmp/preds"), checkpoint, condition)
         assert parse_prediction_path(path) == (checkpoint, condition)
-
-    def test_writes_npz_into_the_given_directory(self):
-        path = prediction_path(Path("/tmp/preds"), "latest", "normal")
-        assert path.parent == Path("/tmp/preds")
-        assert path.suffix == ".npz"

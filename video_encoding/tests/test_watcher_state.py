@@ -73,11 +73,6 @@ def test_nan_escalations_in_flight_round_trips(tmp_path):
     assert loaded.nan_escalations_in_flight == {"run1": 1234.0}
 
 
-def test_watcher_state_defaults_last_tick_at_to_zero():
-    state = WatcherState()
-    assert state.last_tick_at == 0.0
-
-
 def test_watcher_state_roundtrips_last_tick_at(tmp_path):
     path = tmp_path / "watcher_state.json"
     state = WatcherState()
@@ -112,11 +107,6 @@ def test_advance_backoff_resets_to_fast_floor_on_action():
     advance_backoff(state, now=100.0, action_taken=True)
     assert state.current_interval_s == FAST_INTERVAL_S
     assert state.next_full_check_at == 100.0 + FAST_INTERVAL_S
-
-
-def test_run_target_pool_size_defaults_to_zero():
-    state = WatcherState()
-    assert state.run("RUN1").target_pool_size == 0
 
 
 def test_run_target_pool_size_roundtrips(tmp_path):

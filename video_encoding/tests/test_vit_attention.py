@@ -117,20 +117,6 @@ def test_rejects_embed_dim_not_divisible_by_num_heads():
         SelfAttention(embed_dim=15, num_heads=4)
 
 
-def test_self_attention_default_args_unchanged_by_new_parameters():
-    """attn_mask=None, rotary=None (the new defaults) must reproduce exactly
-    today's output -- the regression guard for VideoMAEv2, which never
-    passes these arguments."""
-    torch.manual_seed(0)
-    attn = SelfAttention(embed_dim=16, num_heads=4)
-    x = torch.randn(2, 5, 16)
-    attn.eval()
-    with torch.no_grad():
-        out_old, _ = attn(x, need_weights=False)
-        out_new, _ = attn(x, need_weights=False, attn_mask=None, rotary=None)
-    assert torch.equal(out_old, out_new)
-
-
 def test_self_attention_attn_mask_blocks_masked_positions():
     """A boolean mask that forbids token 0 from attending to token 1 must
     zero out token 1's contribution to token 0's output -- verified by

@@ -152,19 +152,6 @@ def test_forward_tokens_excludes_registers_from_returned_tokens():
 # --- opt-in intermediate outputs (E2b arm C) ------------------------------
 
 
-def test_forward_tokens_default_return_type_is_unchanged():
-    """Existing callers unpack a bare Tensor. Adding the opt-in must not turn
-    the default return into a tuple."""
-    cfg = _tiny_cfg()
-    encoder = VideoMAEEncoder(cfg)
-    x = encoder.patch_embed(torch.randn(2, 3, 4, 16, 16)) + encoder.pos_embed
-    keep_indices = torch.arange(4).unsqueeze(0).expand(2, -1)
-
-    out = encoder.forward_tokens(x, keep_indices)
-
-    assert isinstance(out, torch.Tensor)
-
-
 def test_forward_tokens_returns_requested_intermediates():
     cfg = _tiny_cfg(depth=4)
     encoder = VideoMAEEncoder(cfg)

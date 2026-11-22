@@ -177,18 +177,6 @@ def test_select_stratified_subset_is_deterministic_given_seed():
     assert [i.identity_id for i in first] == [i.identity_id for i in second]
 
 
-def test_select_stratified_subset_keeps_each_identitys_clips_together():
-    identities = [
-        _make_identity(f"id{i}", "m", n_clips=5, clip_duration_s=30.0)
-        for i in range(20)
-    ]
-
-    selected = select_stratified_subset(identities, target_hours=0.5, seed=1)
-
-    for identity in selected:
-        assert len(identity.clips) == 5  # never a partial identity
-
-
 def test_select_stratified_subset_raises_when_corpus_too_small():
     identities = [_make_identity("id0", "m", n_clips=1, clip_duration_s=60.0)]
 

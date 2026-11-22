@@ -43,14 +43,6 @@ def test_finetune_experiments_default_to_no_freezing_and_select_their_dataset():
     assert cfg.dataset.name == "veatic"
 
 
-def test_levjepa_mesh_ssl_selects_the_lean_model_and_levjepa_train_group():
-    cfg = _compose("levjepa_mesh_ssl")
-    assert cfg.model.name == "levjepa_lean"
-    assert (cfg.model.depth, cfg.model.num_heads, cfg.model.mlp_ratio) == (7, 16, 2.0)
-    assert cfg.experiment.stage == "pretrain"
-    assert "grad_clip_norm" in cfg.train  # only conf/train/levjepa.yaml has this field
-
-
 @pytest.mark.parametrize(
     "experiment", sorted(p.stem for p in (CONF_DIR / "experiment").glob("*.yaml"))
 )

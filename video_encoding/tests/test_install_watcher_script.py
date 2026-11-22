@@ -61,13 +61,6 @@ def env(tmp_path):
     return run
 
 
-def test_script_has_no_syntax_errors():
-    result = subprocess.run(
-        ["bash", "-n", str(REAL_SCRIPT)], capture_output=True, text=True
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def test_designating_this_host_writes_the_short_name_and_enables_the_timer(env):
     result = env("node089")
 

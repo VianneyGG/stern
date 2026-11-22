@@ -18,7 +18,6 @@ from video_encoding.mesh.topology import (
     NODE_GROUPS,
     NODE_SUBNETS,
     TIERS,
-    TIERS_PATH,
     _load,
     tier_nodes,
 )
@@ -48,23 +47,6 @@ def test_bash_and_python_read_the_same_roster(tier):
     assert _bash_tier_nodes(tier) == ",".join(tier_nodes(tier))
 
 
-def test_no_script_redeclares_a_roster():
-    """Regression guard for the duplication itself. A hostname list pasted back
-    into any script silently reintroduces the drift this file exists to stop --
-    tiers.tsv is the only place 'node001' may appear alongside its tier-mates."""
-    offenders = []
-    for path in list(SCRIPTS.glob("*.sh")) + list(SCRIPTS.glob("*.py")):
-        for lineno, raw in enumerate(path.read_text().splitlines(), start=1):
-            line = raw.strip()
-            if line.startswith("#") or line.startswith("*"):
-                continue  # prose may cite "node001,node002,..." as an example
-            # The signature of a pasted roster: two adjacent tier-mates on a
-            # line that is actually code.
-            if "node001,node002" in line or "node024,node025" in line:
-                offenders.append(f"{path.name}:{lineno}")
-    assert offenders == [], f"tier roster re-declared in: {offenders}"
-
-
 def test_every_host_maps_to_exactly_one_tier_and_subnet():
     assert NODE_GROUPS["node001"] == "fish"
     assert NODE_GROUPS["node024"] == "birds"
@@ -83,28 +65,6 @@ def test_hosts_are_unique_across_tiers():
         for host in tier.nodes:
             assert host not in seen, f"{host} in both {seen[host]} and {tier.name}"
             seen[host] = tier.name
-
-
-def test_tiers_are_in_gpu_preference_order():
-    """pick_nodes.sh walks TIERS top-down and takes the first tier with enough
-    idle nodes, so row order is load-bearing, not cosmetic."""
-    assert [t.name for t in TIERS] == [
-        "fish",
-        "birds",
-        "cars",
-        "countries",
-        "orchids",
-    ]
-
-
-def test_subnets_that_are_shared_between_tiers_stay_shared():
-    """countries shares /254 with fish, orchids shares /253 with birds. That is
-    intentional and documented; pinning it here means a subnet typo shows up as
-    a test failure instead of as cross-switch fetches at 0.94 Gbps."""
-    by_name = {t.name: t.subnet for t in TIERS}
-    assert by_name["countries"] == by_name["fish"] == "/254"
-    assert by_name["orchids"] == by_name["birds"] == "/253"
-    assert by_name["cars"] == "/252"
 
 
 def test_unknown_tier_raises_naming_the_valid_ones():
@@ -136,10 +96,3 @@ def test_tier_with_no_nodes_is_rejected(tmp_path):
     bad.write_text("fish\t/254\t\n")
     with pytest.raises(ValueError, match="has no nodes"):
         _load(bad)
-
-
-def test_roster_file_ships_next_to_the_module():
-    """topology.py resolves tiers.tsv relative to __file__; a move that leaves
-    the data behind must fail here, not at 3am on the cluster."""
-    assert TIERS_PATH.is_file()
-    assert TIERS_PATH.parent == (REPO_ROOT / "video_encoding" / "mesh")

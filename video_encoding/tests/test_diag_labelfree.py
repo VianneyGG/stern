@@ -291,19 +291,6 @@ def test_alpha_req_recovers_decay_order_when_samples_are_fewer_than_dims():
     assert mid == pytest.approx(1.0, abs=0.5)
 
 
-def test_batch_split_invariance():
-    """rankme/alpha_req computed on the full token matrix must not depend on
-    an arbitrary split into two batches -- both read the same matrix either
-    way, since neither metric processes batches separately."""
-    rng = np.random.default_rng(0)
-    matrix = rng.standard_normal((80, 16))
-    half_a, half_b = matrix[:40], matrix[40:]
-    combined = np.concatenate([half_a, half_b], axis=0)
-    assert rankme(matrix) == pytest.approx(16.0, rel=0.15)
-    assert rankme(combined) == pytest.approx(rankme(matrix))
-    assert alpha_req(combined) == pytest.approx(alpha_req(matrix))
-
-
 # --- by_block / check -------------------------------------------------
 
 

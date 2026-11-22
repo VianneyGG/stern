@@ -1,5 +1,0 @@
-name: talkingcelebs
-role: ssl  # unlabelled SSL-adaptation set, no VA labels
-present: false  # flip to true after download_talkingcelebs.py + ingest_talkingcelebs.py
-path: ${oc.env:TALKINGCELEBS_ROOT,???}
-manifest_path: ${.path}/manifest.csv

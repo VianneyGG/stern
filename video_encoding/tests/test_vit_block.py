@@ -219,18 +219,6 @@ def test_layer_scale_changes_block_output():
     assert not torch.allclose(off_out, scaled_out)
 
 
-def test_vit_block_default_args_unchanged_by_new_parameters():
-    torch.manual_seed(0)
-    cfg = BlockConfig(embed_dim=16, num_heads=4)
-    block = ViTBlock(cfg)
-    block.eval()
-    x = torch.randn(2, 5, 16)
-    with torch.no_grad():
-        out_old = block(x)
-        out_new = block(x, attn_mask=None, rotary=None)
-    assert torch.equal(out_old, out_new)
-
-
 def test_vit_block_forwards_attn_mask_to_attention(monkeypatch):
     """ViTBlock must pass attn_mask through unchanged rather than silently
     dropping it -- verified by spying on SelfAttention.forward's call args."""

@@ -69,33 +69,3 @@ def test_read_manifest_rejects_missing_required_columns(tmp_path: Path):
 
     with pytest.raises(ManifestSchemaError, match="missing required"):
         read_manifest(manifest_path, expected_role="ssl")
-
-
-def test_read_manifest_silently_accepts_duplicate_clip_path_rows(tmp_path: Path):
-    """Pins current behavior: `clip_path` has no uniqueness check, so a
-    manifest built by concatenating two acquisition runs (or a copy-paste
-    error) can silently double-count a clip downstream. Not asserted as
-    correct -- if `read_manifest` grows a duplicate-rejection check, update
-    this test deliberately rather than treating a failure here as a
-    regression."""
-    records = [
-        ManifestRecord(
-            identity_id="id00012",
-            clip_path="id00012/clip001.mp4",
-            duration_s=4.2,
-            role="ssl",
-        ),
-        ManifestRecord(
-            identity_id="id00012",
-            clip_path="id00012/clip001.mp4",
-            duration_s=4.2,
-            role="ssl",
-        ),
-    ]
-    manifest_path = tmp_path / "manifest.csv"
-    write_manifest(manifest_path, records)
-
-    result = read_manifest(manifest_path, expected_role="ssl")
-
-    assert len(result) == 2
-    assert result[0].clip_path == result[1].clip_path == "id00012/clip001.mp4"

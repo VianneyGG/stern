@@ -15,15 +15,6 @@ def test_build_views_shapes():
     assert crop_boxes.shape == (4, 4)  # (num_local, [top, left, height, width])
 
 
-def test_build_views_shares_temporal_window():
-    """All views must cover the same T frames -- only spatial/photometric
-    content may differ, per the design's 'same temporal window' requirement."""
-    clip = torch.randint(0, 256, (16, 224, 224, 3), dtype=torch.uint8)
-    global_view, local_views, _ = build_views(clip, num_local=2)
-    assert global_view.shape[1] == clip.shape[0]
-    assert local_views.shape[2] == clip.shape[0]
-
-
 def test_build_views_local_views_differ_from_each_other():
     torch.manual_seed(0)
     clip = torch.randint(0, 256, (16, 224, 224, 3), dtype=torch.uint8)

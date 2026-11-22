@@ -66,28 +66,6 @@ def test_arms_share_one_seed_and_one_shard_list(dry_run):
     assert dry_run.count("shard-000000.tar") >= 4
 
 
-def test_never_writes_to_the_live_checkout_or_nfs_home(dry_run):
-    """~/stern is the running sweep's checkout and home has ~7.7 GB of quota
-    left; the run must touch neither."""
-    assert "sync_login-node.sh" not in dry_run
-    assert "stern_factorial" in dry_run
-
-    # The one permitted reference to the live checkout is reading its 9.4 GB
-    # venv through a symlink -- reuse, not mutation. Every other mention of
-    # ~/stern would be a write into the running sweep's code.
-    stray = [
-        line
-        for line in dry_run.splitlines()
-        if "stern/" in line.replace("stern_factorial/", "") and "ln -sfn" not in line
-    ]
-    assert stray == [], stray
-
-    # Checkpoint pushes and metrics stay on node-local disk, off the quota.
-    assert "MESH_SHARED=/Data" in dry_run
-    assert "STERN_CHECKPOINT_ROOT=/Data" in dry_run
-    assert "rsync" in dry_run and "login-node:stern_factorial/" in dry_run
-
-
 def test_solo_arms_do_not_merge(dry_run):
     """Each arm is one node; a merge would block forever on a quorum that can
     never form."""

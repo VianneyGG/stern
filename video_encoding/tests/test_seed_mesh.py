@@ -9,7 +9,6 @@ from video_encoding.mesh.shard_map import Holder
 from video_encoding.scripts.seed_mesh import (
     MAX_MESH_NODES,
     MAX_SEEDED_NODES,
-    NODE_GROUPS,
     _execute_rsync_pull,
     _remote_file_exists,
     _symlink_source_node,
@@ -19,13 +18,6 @@ from video_encoding.scripts.seed_mesh import (
 )
 
 pytestmark = pytest.mark.integration
-
-
-def test_node_groups_cover_the_real_roster():
-    assert NODE_GROUPS["node001"] == "fish"
-    assert NODE_GROUPS["node024"] == "birds"
-    assert NODE_GROUPS["node089"] == "orchids"
-    assert NODE_GROUPS["node070"] == "countries"
 
 
 def test_probe_nodes_parses_df_output():

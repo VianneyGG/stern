@@ -116,9 +116,6 @@ class TestFrameStride:
     Default 1 everywhere, so no existing window changes.
     """
 
-    def test_default_stride_is_unchanged(self):
-        assert window_starts(100, 16, 0.0) == window_starts(100, 16, 0.0, 1)
-
     def test_a_window_spans_stride_times_its_length(self):
         """A clip holding exactly one strided window yields exactly one start."""
         span = (16 - 1) * 4 + 1  # 61

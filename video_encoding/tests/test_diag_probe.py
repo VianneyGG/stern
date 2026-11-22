@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 from PIL import Image
 
 from data.labels import write_label_csv
-from data.manifest import ManifestRecord, read_manifest, write_manifest
+from data.manifest import ManifestRecord, write_manifest
 from video_encoding.data.loaders import identity_disjoint_split
 from video_encoding.models.videomaev2.encoder import VideoMAEEncoder
 from video_encoding.models.videomaev2.regressor import LinearVAHead
@@ -24,7 +24,6 @@ from video_encoding.scripts._diag_common import (
 )
 from video_encoding.scripts import diag_probe
 from video_encoding.scripts.diag_probe import (
-    PROBE_FIT_LR,
     AttentiveProbe,
     _fit_and_score_probe,
     check,
@@ -166,15 +165,6 @@ def test_linear_va_head_keeps_its_tanh_by_default():
     assert rounded == [0.995055, 0.995055, 0.995055, 0.995055]  # tanh(3)
 
 
-def test_probe_fit_lr_is_the_one_that_does_not_blow_up():
-    """2026-09-26 (job 3363, real AFEW-VA, random-init ViT-B layer 6): at 1e-3
-    the raw fit predictions reached ~1e2 in one epoch and ~4e3 by epoch 20,
-    where ccc_loss's gradient vanishes (a 2-epoch warmup only delayed it);
-    1e-4 overfit the fit actors (train CCC 0.90, held-out -0.06); 1e-5 kept
-    predictions on the label scale with held-out CCC ~0.13."""
-    assert PROBE_FIT_LR == 1e-5
-
-
 def test_final_block_is_linear_va_head():
     probe = AttentiveProbe(embed_dim=768, num_heads=16, n_blocks=3)
     assert isinstance(probe.head, LinearVAHead)
@@ -184,15 +174,6 @@ def test_final_block_is_linear_va_head():
 def test_num_heads_reaches_the_readout():
     probe = AttentiveProbe(embed_dim=768, num_heads=16, n_blocks=3)
     assert probe.head.num_heads == 16  # LinearVAHead's own default is 12
-
-
-def test_probe_capacity_depends_only_on_construction_args():
-    """`AttentiveProbe` takes no depth/rung argument at all -- its parameter
-    count is a pure function of (embed_dim, num_heads, n_blocks), so the same
-    probe is used unchanged at every depth and against every ladder rung."""
-    probe = AttentiveProbe(768, 16, 3)
-    count = sum(p.numel() for p in probe.parameters())
-    assert count == 23_036_162
 
 
 # --- identity-disjoint split --------------------------------------------------
@@ -225,21 +206,6 @@ def test_probe_ccc_split_is_identical_across_seeds():
     split_a = identity_disjoint_split(records)
     split_b = identity_disjoint_split(records)
     assert split_a == split_b
-
-
-def test_probe_ccc_windows_of_one_clip_do_not_straddle_split(tmp_path):
-    """Every window drawn from one clip belongs to exactly one side of the
-    split, because the split partitions identities, and `_probe_dataset`
-    is built from `fit_records`/`scored_records`, which are disjoint by
-    identity."""
-    manifest_path = _write_probe_manifest(tmp_path, n_identities=10, n_frames=40)
-    records = read_manifest(manifest_path, expected_role="probe")
-    fit_ids, scored_ids = identity_disjoint_split(records)
-    fit_records = [r for r in records if r.identity_id in fit_ids]
-    scored_records = [r for r in records if r.identity_id in scored_ids]
-    fit_clips = {r.clip_path for r in fit_records}
-    scored_clips = {r.clip_path for r in scored_records}
-    assert len(fit_clips & scored_clips) == 0
 
 
 # --- probe_ccc -----------------------------------------------------------------

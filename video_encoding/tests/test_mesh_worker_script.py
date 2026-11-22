@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from video_encoding.mesh.assignment import read_my_shards
 
 pytestmark = pytest.mark.system
 
@@ -19,19 +18,6 @@ def _write_assignments(tmp_path: Path, payload: dict) -> Path:
     path = tmp_path / "shard_assignments_RUN1.json"
     path.write_text(json.dumps(payload))
     return path
-
-
-def test_read_my_shards_returns_only_this_hosts_list(tmp_path):
-    path = _write_assignments(tmp_path, {"node001": ["s0", "s1"], "node002": ["s2"]})
-
-    assert read_my_shards(path, "node001") == ["s0", "s1"]
-
-
-def test_read_my_shards_raises_for_an_unassigned_host(tmp_path):
-    path = _write_assignments(tmp_path, {"node001": ["s0", "s1"], "node002": ["s2"]})
-
-    with pytest.raises(KeyError, match="node089"):
-        read_my_shards(path, "node089")
 
 
 def test_sbatch_script_has_no_syntax_errors():

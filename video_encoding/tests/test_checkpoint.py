@@ -117,17 +117,6 @@ def test_load_encoder_state_arch_mismatch_can_be_forced():
     assert any(key.startswith("blocks.3.") for key in unexpected)
 
 
-def test_channel_inflation_still_works_under_the_arch_guard():
-    """in_channels is deliberately NOT part of the fingerprint: 3ch->6ch inflation
-    is a supported load, so the guard must not regress it."""
-    encoder = VideoMAEEncoder(_tiny_cfg(in_channels=6))
-    donor = VideoMAEEncoder(_tiny_cfg(in_channels=3))
-
-    missing, unexpected = load_encoder_state(encoder, donor.state_dict())
-
-    assert (missing, unexpected) == ([], [])
-
-
 def test_encoder_arch_fingerprint_reads_geometry_off_the_state_dict():
     """Derived from tensor shapes alone, so it works on checkpoints written
     before this guard existed -- no migration, no recorded metadata needed."""

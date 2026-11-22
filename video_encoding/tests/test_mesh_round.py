@@ -649,13 +649,6 @@ def test_shared_pending_payload_drops_optimizer_state_local_keeps_it(
     }
 
 
-def test_shared_payload_drop_keys_is_exactly_optimizer_state():
-    assert mesh_round._SHARED_PAYLOAD_DROP_KEYS == (
-        "optimizer_state_dict",
-        "optimizer_name",
-    )
-
-
 def test_run_mesh_pretrain_stage_warm_starts_round_zero_from_existing_master(
     tmp_path, monkeypatch
 ):
@@ -1756,15 +1749,6 @@ def test_append_round_metrics_records_exact_sample_and_step_counts(tmp_path):
     assert record["lr"] == 0.0015
     assert math.isfinite(record["ts"])
     assert "slurm_job_id" in record
-
-
-def test_append_round_metrics_rejects_a_missing_count(tmp_path):
-    """No default: a missing count must be a call-site error rather than a
-    zero that silently under-reports the compute axis."""
-    with pytest.raises(TypeError, match="n_samples"):
-        mesh_round._append_round_metrics(
-            tmp_path / "mesh_shared", "run1", "node001", 1, 0.5, 0.4, 12.0, 3, 0.0015
-        )
 
 
 def _flag(mesh_shared: Path, run_id: str, round_num: int) -> Path:

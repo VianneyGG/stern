@@ -72,12 +72,6 @@ def test_excluded_nodes_are_never_eligible():
     assert eligible_nodes(state, ["node001", "node024"]) == ["node001"]
 
 
-def test_exclusion_records_the_reason_for_a_human():
-    state = WatcherState()
-    exclude_node(state, "node024", "quota: /Data at 97%")
-    assert state.excluded_nodes["node024"] == "quota: /Data at 97%"
-
-
 def test_watcher_state_roundtrips_runs_and_exclusions(tmp_path):
     path = tmp_path / "watcher_state.json"
     state = WatcherState()

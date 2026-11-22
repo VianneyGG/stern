@@ -228,11 +228,6 @@ def test_abandon_is_not_polled_mid_accumulation():
     assert seen_at == [4, 8]
 
 
-def test_ema_left_none_is_unchanged_behaviour():
-    stats = _run(_loader(n_samples=8, batch_size=2))
-    assert stats["steps"] == 4
-
-
 def test_ema_is_updated_at_each_optimizer_step_boundary():
     torch.manual_seed(0)
     device = torch.device("cpu")

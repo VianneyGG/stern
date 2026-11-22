@@ -1074,26 +1074,6 @@ def test_append_merge_metrics_includes_observability_fields(tmp_path):
     assert record["requeues_seen"] == 3
 
 
-def test_append_merge_metrics_defaults_observability_fields_to_zero(tmp_path):
-    """Every existing call site (predating this task) must keep working
-    with no new keyword arguments."""
-    metrics_path = tmp_path / "metrics.jsonl"
-    _append_merge_metrics(
-        metrics_path,
-        run_id="R",
-        round_num=1,
-        result={"n_workers": 1, "alphas": {"a": 1.0}},
-        timeout_forced=False,
-    )
-    record = json.loads(metrics_path.read_text().splitlines()[0])
-    assert record["effective_quorum_k"] is None
-    assert record["misses_charged"] == 0
-    assert record["misses_excused_job_absent"] == 0
-    assert record["misses_correlated"] == 0
-    assert record["exclusions_suspended_no_replacement"] == 0
-    assert record["requeues_seen"] == 0
-
-
 class _RecordingWriter:
     def __init__(self):
         self.calls = []

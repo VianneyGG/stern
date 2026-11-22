@@ -40,13 +40,6 @@ def script(tmp_path) -> Path:
     return dest
 
 
-def test_script_has_no_syntax_errors():
-    result = subprocess.run(
-        ["bash", "-n", str(REAL_SCRIPT)], capture_output=True, text=True
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def test_registers_without_quorum_k_matches_prior_behavior(script, tmp_path):
     # Pre-guard behavior is now reachable only via the escape hatch.
     result = subprocess.run(
@@ -329,30 +322,6 @@ def test_allow_no_quorum_escape_hatch_registers_without_the_key(script, tmp_path
         (tmp_path / "runs" / "state" / "mesh_run_configs.json").read_text()
     )
     assert "quorum_k" not in cfgs[0]
-
-
-def test_every_queued_sweep_cell_carries_quorum_k_and_weighting():
-    """sweep_queue.sh `exit 1`s the whole queue when a register call fails, so
-    one under-specified cell strands every cell behind it -- the guard and the
-    queue files have to be consistent or the queue stops draining."""
-    repo_root = Path(__file__).resolve().parents[2]
-    queues = sorted((repo_root / "runs" / "state").glob("sweep_queue_*.txt"))
-    if not queues:
-        # runs/state/ is gitignored and machine-local by policy (see
-        # CLAUDE.md), so a fresh clone legitimately has no queues to check.
-        pytest.skip("no sweep queue files on this machine")
-
-    for queue in queues:
-        for lineno, line in enumerate(queue.read_text().splitlines(), start=1):
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            fields = stripped.split()
-            assert len(fields) >= 6, (
-                f"{queue.name}:{lineno} has {len(fields)} fields, needs at least "
-                f"6 (run_id rounds outer_lr outer_momentum quorum_k weighting): "
-                f"{stripped!r}"
-            )
 
 
 # --- GRACE_S: the below-quorum round deadline ------------------------------

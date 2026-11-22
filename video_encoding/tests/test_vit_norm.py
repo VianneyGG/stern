@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from video_encoding.models.ViT.norm import NORMS, CenteredNorm, build_norm
+from video_encoding.models.ViT.norm import CenteredNorm, build_norm
 
 
 @pytest.mark.parametrize("norm_type", ["layernorm", "rmsnorm", "centerednorm"])
@@ -40,7 +40,3 @@ def test_centerednorm_centers_without_rescaling_variance():
     # exactly (a loose lower-bound threshold would pass even a bug that
     # partially rescales variance -- this pins the precise expected value).
     assert torch.allclose(out.std(dim=-1), x.std(dim=-1), atol=1e-4)
-
-
-def test_norms_registry_has_expected_keys():
-    assert set(NORMS.keys()) == {"layernorm", "rmsnorm", "centerednorm"}

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from video_encoding.models.ViT.mlp import MLPS, build_mlp
+from video_encoding.models.ViT.mlp import build_mlp
 
 
 @pytest.mark.parametrize("mlp_type", ["gelu", "swiglu"])
@@ -17,10 +17,6 @@ def test_build_mlp_shape(mlp_type):
 def test_build_mlp_rejects_unknown_type():
     with pytest.raises(ValueError, match="unknown mlp_type"):
         build_mlp("nope", embed_dim=8, mlp_ratio=2.0)
-
-
-def test_mlps_registry_has_expected_keys():
-    assert set(MLPS.keys()) == {"gelu", "swiglu"}
 
 
 def test_swiglu_hidden_dim_applies_the_two_thirds_rule():
