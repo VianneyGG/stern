@@ -1,0 +1,369 @@
+run,round,val_loss_mean,n_nodes
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",1,0.61543,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",2,0.58192,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",3,0.57584,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",4,0.57068,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",5,0.5648,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",6,0.55783,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",7,0.54357,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",8,0.5323,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",9,0.52174,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",10,0.51703,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",11,0.512,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",12,0.50675,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",13,0.50304,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",14,0.49918,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",15,0.49396,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",16,0.48968,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",17,0.48111,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",18,0.47353,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",19,0.46677,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",20,0.46064,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",21,0.45332,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",22,0.44869,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",23,0.44413,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",24,0.43946,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",25,0.43584,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",26,0.43116,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",27,0.42696,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",28,0.42466,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",29,0.42074,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",30,0.41663,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",31,0.41493,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",32,0.41221,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",33,0.40936,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",34,0.40782,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",35,0.40459,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",36,0.40368,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",37,0.40225,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",38,0.39948,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",39,0.3975,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",40,0.39505,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",41,0.39406,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",42,0.39284,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",43,0.39031,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",44,0.38924,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",45,0.38908,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",46,0.38727,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",47,0.3852,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",48,0.38494,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",49,0.38315,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",50,0.38196,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",51,0.38078,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",52,0.37944,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",53,0.37831,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",54,0.37761,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",55,0.37676,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",56,0.37738,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",57,0.37456,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",58,0.37382,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",59,0.37414,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",60,0.37152,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",61,0.37163,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",62,0.36972,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",63,0.3688,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",64,0.36853,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",65,0.36847,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",66,0.36665,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",67,0.36628,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",68,0.36492,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",69,0.36419,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",70,0.3639,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",71,0.36382,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",72,0.36248,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",73,0.36171,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",74,0.36182,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",75,0.36003,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",76,0.35973,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",77,0.3586,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",78,0.35751,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",79,0.35694,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",80,0.35657,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",81,0.35483,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",82,0.3545,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",83,0.353,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",84,0.35158,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",85,0.35041,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",86,0.34856,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",87,0.34801,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",88,0.34651,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",89,0.34466,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",90,0.34306,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",91,0.34011,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",92,0.33834,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",93,0.3377,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",94,0.33622,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",95,0.33265,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",96,0.33163,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",97,0.32896,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",98,0.32751,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",99,0.3251,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",100,0.32397,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",101,0.32221,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",102,0.32045,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",103,0.31871,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",104,0.31779,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",105,0.31558,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",106,0.31504,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",107,0.31378,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",108,0.31259,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",109,0.31175,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",110,0.30981,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",111,0.30878,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",112,0.30658,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",113,0.30647,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",114,0.3054,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",115,0.30467,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",116,0.3025,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",117,0.30226,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",118,0.30102,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",119,0.30032,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",120,0.29888,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",121,0.29584,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",122,0.29636,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",123,0.29603,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",124,0.29597,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",125,0.29358,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",126,0.29267,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",127,0.29234,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",128,0.29142,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",129,0.29105,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",130,0.28982,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",131,0.28794,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",132,0.28792,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",133,0.28736,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",134,0.28704,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",135,0.28612,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",136,0.28605,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",137,0.28435,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",138,0.28429,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",139,0.28287,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",140,0.28236,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",141,0.28239,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",142,0.28173,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",143,0.28035,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",144,0.28047,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",145,0.27948,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",146,0.27912,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",147,0.27892,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",148,0.27792,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",149,0.27707,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",150,0.27727,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",151,0.2761,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",152,0.27562,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",153,0.27562,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",154,0.2749,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",155,0.27365,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",156,0.27441,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",157,0.27318,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",158,0.2731,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",159,0.27254,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",160,0.27232,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",161,0.27118,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",162,0.27119,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",163,0.2709,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",164,0.26985,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",165,0.27024,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",166,0.26916,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",167,0.26883,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",168,0.26875,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",169,0.26869,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",170,0.26772,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",171,0.26795,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",172,0.26686,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",173,0.26624,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",174,0.26593,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",175,0.26619,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",176,0.26563,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",177,0.26506,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",178,0.26517,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",179,0.2646,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",180,0.26398,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",181,0.26386,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",182,0.26349,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",183,0.26346,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",184,0.26244,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",185,0.26257,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",186,0.26266,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",187,0.26188,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",188,0.26216,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",189,0.26152,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",190,0.26111,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",191,0.26072,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",192,0.26032,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",193,0.25992,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",194,0.26012,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",195,0.25994,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",196,0.2593,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",197,0.25923,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",198,0.25908,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",199,0.26023,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",200,0.25859,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",201,0.25817,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",202,0.25856,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",203,0.25806,15
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",204,0.25781,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",205,0.25791,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",206,0.25727,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",207,0.25727,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",208,0.25685,14
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",209,0.25637,13
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",210,0.25672,13
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",211,0.25629,13
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",212,0.25519,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",213,0.25658,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",214,0.25632,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",215,0.2563,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",216,0.25552,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",217,0.25441,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",218,0.255,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",219,0.2543,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",220,0.25497,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",221,0.25463,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",222,0.25364,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",223,0.25383,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",224,0.25278,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",225,0.25336,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",226,0.25304,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",227,0.25332,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",228,0.25323,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",229,0.25238,16
+"ViT-B VideoMAE, 16 nodes, 7x DiLoCo (longest run)",230,0.25231,15
+"ViT-B VideoMAE, 9 nodes, 1x plain average",1,0.75258,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",2,0.60677,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",3,0.59124,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",4,0.58974,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",5,0.58615,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",6,0.57978,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",7,0.57454,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",8,0.56646,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",9,0.56126,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",10,0.55487,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",11,0.55077,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",12,0.53899,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",13,0.53375,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",14,0.53336,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",15,0.5294,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",16,0.52797,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",17,0.52248,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",18,0.51796,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",19,0.51245,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",20,0.50732,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",21,0.50263,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",22,0.4982,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",23,0.49496,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",24,0.49243,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",25,0.48723,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",26,0.48394,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",27,0.48005,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",28,0.47676,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",29,0.473,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",30,0.46988,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",31,0.46916,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",32,0.46394,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",33,0.46315,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",34,0.46074,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",35,0.45943,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",36,0.45741,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",37,0.45478,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",38,0.45442,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",39,0.45135,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",40,0.45035,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",41,nan,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",42,0.44617,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",43,nan,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",44,nan,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",45,0.44353,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",46,nan,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",47,nan,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",48,nan,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",49,0.43945,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",50,0.43841,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",51,0.43726,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",52,0.4361,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",53,0.43554,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",54,0.43459,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",55,0.43399,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",56,0.43362,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",57,0.43142,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",58,0.43233,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",59,0.43205,9
+"ViT-B VideoMAE, 9 nodes, 1x plain average",60,0.43173,1
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",1,0.08454,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",2,0.08278,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",3,0.08236,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",4,0.08267,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",5,0.07852,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",6,0.08062,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",7,0.0772,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",8,0.07528,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",9,0.07722,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",10,0.07111,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",11,0.07154,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",12,0.07023,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",13,0.07152,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",14,0.07265,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",15,0.06857,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",16,0.06658,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",17,0.06765,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",18,0.06718,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",19,nan,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",20,0.06603,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",21,0.06577,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",22,0.06309,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",23,0.06413,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",24,0.06387,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",25,0.06264,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",26,0.06279,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",27,0.06205,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",28,0.0627,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",29,0.0614,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",30,0.0611,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",31,0.06031,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",32,0.06011,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",33,0.05937,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",34,0.05914,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",35,0.05804,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",36,0.05947,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",37,0.05788,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",38,0.05753,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",39,0.05634,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",40,0.05608,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",41,0.05543,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",42,0.05456,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",43,0.05635,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",44,0.05487,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",45,0.05492,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",46,0.0548,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",47,0.05499,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",48,0.05384,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",49,nan,11
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",50,nan,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",51,nan,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",52,nan,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",53,nan,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",54,nan,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",55,0.05452,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",56,0.05394,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",57,0.05297,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",58,0.05323,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",59,0.05317,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",60,0.05262,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",61,0.05245,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",62,0.05309,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",63,0.05216,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",64,0.05215,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",65,0.05211,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",66,0.05391,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",67,0.05284,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",68,0.05255,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",69,0.05111,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",70,0.05205,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",71,0.05276,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",72,0.05115,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",73,0.05197,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",74,0.0525,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",75,0.05215,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",76,0.05105,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",77,0.05161,14
+"lean LeVJEPA, 14 nodes, 1x DiLoCo",78,0.05286,2

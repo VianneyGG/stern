@@ -58,8 +58,7 @@ Description=STERN mesh/watcher tick (one-shot, timer-driven)
 Type=oneshot
 WorkingDirectory=%h/stern
 # --no-sync is load-bearing: without it every tick re-syncs the 9.4 GB NFS venv,
-# and overlapping syncs raced each other into ModuleNotFoundError crash loops
-# (commit 3ca9ba4).
+# and overlapping syncs raced each other into ModuleNotFoundError crash loops.
 ExecStart=%h/.local/bin/uv run --no-sync python -m stern.watcher.watch_training
 StandardOutput=append:%h/stern/runs/state/watcher_systemd.log
 StandardError=append:%h/stern/runs/state/watcher_systemd.log

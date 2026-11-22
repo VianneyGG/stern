@@ -136,11 +136,11 @@ recreates state for any config that lacks it.
   `_clean_stale_run_artifacts` (`watcher/mesh_tick.py`) clears them, with a
   digit-only glob so `pool-fish` cannot delete `pool-fish-5r`'s.
 - **Merge crash loop.** A merge killed at 300 s, after its writes finished, left
-  every retry seeing deltas from an already-applied round. Fixed in `5addb16`: a
+  every retry seeing deltas from an already-applied round. Fixed on 2026-08-28: a
   no-op for an applied round, and a 900 s timeout.
 - **Shard-assignment race.** `shard_assignments_<run>.json` changed while queued
-  jobs read it. A job could fail on a host missing from the new file. Fixed in
-  `e4880b7`: each job reads an immutable per-node snapshot.
+  jobs read it. A job could fail on a host missing from the new file. Fixed by
+  giving each job an immutable per-node snapshot to read.
 - **Oversubscription.** Nine live runs claimed about 126 roster slots for about
   62 schedulable slots. Runs below quorum relaunch from the same round until
   capacity returns. Check `squeue` before adding pools.

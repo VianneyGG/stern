@@ -1,0 +1,8 @@
+arm,multiplier,route,outer_lr_momentum,seed,nodes,rounds,group,last_round,final_val_loss,l12_motion_r2_grouped,l12_motion_r2_token,l1_motion_r2_grouped
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,60,0.4223,0.393,0.621,0.637
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,60,0.4317,0.494,0.645,0.654
+3x plain AdamW,3.0,plain,,1,1,20,dose2,19,0.5143,-0.128,0.549,0.464
+2x plain AdamW,2.0,plain,,0,1,20,dose2,18,0.5185,0.135,0.609,0.544
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,20,0.5334,0.334,0.647,0.594
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,20,0.5427,0.214,0.619,0.546
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,18,0.5695,0.241,0.635,0.564

@@ -1,0 +1,12 @@
+arm,multiplier,route,outer_lr_momentum,seed,nodes,rounds,group,l12_motion_r2
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,0.643
+1x plain AdamW,1.0,plain,,0,1,20,dose,0.648
+1x plain AdamW,1.0,plain,,1,1,20,dose,0.662
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,0.617
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,0.626
+3x plain AdamW,3.0,plain,,0,1,20,dose,0.558
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,0.533
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,0.541
+7x plain AdamW,7.0,plain,,0,1,20,dose,0.414
+7x plain AdamW,7.0,plain,,1,1,20,dose,0.429
+random init,,none,,,0,0,reference,0.637

@@ -1,0 +1,91 @@
+arm_label,arm,seed,ccc,ccc_valence,ccc_arousal
+released ViT-L + continued pretraining,cpt,0,0.32068,0.16639,0.47496
+released ViT-L + continued pretraining,cpt,1,0.33503,0.1739,0.49616
+released ViT-L + continued pretraining,cpt,2,0.33673,0.18865,0.48481
+released ViT-L + continued pretraining,cpt,3,0.33792,0.18814,0.48771
+released ViT-L + continued pretraining,cpt,4,0.31112,0.1664,0.45583
+released ViT-L + continued pretraining,cpt,5,0.34864,0.1972,0.50008
+released ViT-L + continued pretraining,cpt,6,0.37956,0.23202,0.52711
+released ViT-L + continued pretraining,cpt,7,0.32074,0.16329,0.47819
+released ViT-L + continued pretraining,cpt,8,0.29847,0.12335,0.47358
+released ViT-L + continued pretraining,cpt,9,0.38081,0.26389,0.49773
+released ViT-L + continued pretraining,cpt,10,0.34467,0.18563,0.50371
+released ViT-L + continued pretraining,cpt,11,0.29539,0.11714,0.47365
+released ViT-L + continued pretraining,cpt,12,0.33698,0.18602,0.48795
+released ViT-L + continued pretraining,cpt,13,0.32705,0.17892,0.47518
+released ViT-L + continued pretraining,cpt,14,0.35715,0.20711,0.50719
+released ViT-L + continued pretraining,cpt,15,0.32415,0.1603,0.488
+released ViT-L + continued pretraining,cpt,16,0.3231,0.16319,0.48302
+released ViT-L + continued pretraining,cpt,17,0.32848,0.17277,0.4842
+released ViT-L + continued pretraining,cpt,18,0.3173,0.17687,0.45773
+released ViT-L + continued pretraining,cpt,19,0.26256,0.07551,0.44961
+released ViT-L + continued pretraining,cpt,20,0.343,0.16065,0.52536
+released ViT-L + continued pretraining,cpt,21,0.32118,0.17803,0.46433
+released ViT-L + continued pretraining,cpt,22,0.32123,0.16687,0.47559
+released ViT-L + continued pretraining,cpt,23,0.3233,0.17424,0.47236
+released ViT-L + continued pretraining,cpt,24,0.34932,0.19037,0.50828
+released ViT-L + continued pretraining,cpt,25,0.31383,0.13638,0.49128
+released ViT-L + continued pretraining,cpt,26,0.33044,0.15753,0.50335
+released ViT-L + continued pretraining,cpt,27,0.37223,0.26641,0.47804
+released ViT-L + continued pretraining,cpt,28,0.33237,0.16518,0.49956
+released ViT-L + continued pretraining,cpt,29,0.34568,0.19924,0.49213
+released ViT-L,hf,0,0.2874,0.09374,0.48106
+released ViT-L,hf,1,0.2972,0.09793,0.49648
+released ViT-L,hf,2,0.28512,0.09536,0.47487
+released ViT-L,hf,3,0.30767,0.13583,0.4795
+released ViT-L,hf,4,0.25561,0.0684,0.44281
+released ViT-L,hf,5,0.31429,0.12436,0.50422
+released ViT-L,hf,6,0.29713,0.08817,0.50608
+released ViT-L,hf,7,0.30475,0.11188,0.49762
+released ViT-L,hf,8,0.27372,0.08467,0.46277
+released ViT-L,hf,9,0.32474,0.15909,0.49039
+released ViT-L,hf,10,0.28796,0.0972,0.47871
+released ViT-L,hf,11,0.29378,0.07228,0.51528
+released ViT-L,hf,12,0.2884,0.09506,0.48174
+released ViT-L,hf,13,0.27682,0.09804,0.4556
+released ViT-L,hf,14,0.29948,0.08849,0.51048
+released ViT-L,hf,15,0.28477,0.06305,0.5065
+released ViT-L,hf,16,0.25357,0.03747,0.46966
+released ViT-L,hf,17,0.3162,0.1116,0.5208
+released ViT-L,hf,18,0.27048,0.05904,0.48191
+released ViT-L,hf,19,0.27632,0.08546,0.46717
+released ViT-L,hf,20,0.28221,0.08177,0.48264
+released ViT-L,hf,21,0.27192,0.07117,0.47268
+released ViT-L,hf,22,0.26855,0.06409,0.47301
+released ViT-L,hf,23,0.25549,0.08186,0.42912
+released ViT-L,hf,24,0.31422,0.11248,0.51596
+released ViT-L,hf,25,0.26745,0.07514,0.45977
+released ViT-L,hf,26,0.28966,0.07806,0.50126
+released ViT-L,hf,27,0.2824,0.11758,0.44721
+released ViT-L,hf,28,0.28807,0.07996,0.49618
+released ViT-L,hf,29,0.28289,0.08293,0.48285
+random init,random,0,0.06025,0.1205,0.0
+random init,random,1,0.0272,0.0,0.05441
+random init,random,2,0.07055,0.13301,0.00809
+random init,random,3,0.06117,0.12234,0.0
+random init,random,4,0.08426,0.16852,0.0
+random init,random,5,0.02281,0.00185,0.04377
+random init,random,6,0.06695,0.0739,0.06
+random init,random,7,0.06026,0.12165,-0.00112
+random init,random,8,0.07641,0.15282,0.0
+random init,random,9,0.04515,0.09031,0.0
+random init,random,10,0.10152,0.10998,0.09306
+random init,random,11,0.05659,0.11318,0.0
+random init,random,12,0.05807,0.11613,0.0
+random init,random,13,0.03849,0.078,-0.00102
+random init,random,14,0.10989,0.14759,0.07219
+random init,random,15,0.02308,0.04617,0.0
+random init,random,16,0.1013,0.18878,0.01382
+random init,random,17,0.06116,0.11357,0.00876
+random init,random,18,0.03204,0.04274,0.02135
+random init,random,19,0.07189,0.14379,0.0
+random init,random,20,0.03055,0.0,0.06109
+random init,random,21,0.03651,0.07302,0.0
+random init,random,22,0.00454,0.0,0.00908
+random init,random,23,0.06343,0.12744,-0.00059
+random init,random,24,0.1384,0.18656,0.09025
+random init,random,25,0.0031,-0.00075,0.00694
+random init,random,26,0.00285,0.0057,0.0
+random init,random,27,0.02562,0.05124,0.0
+random init,random,28,0.07971,0.1654,-0.00598
+random init,random,29,-0.00171,0.0,-0.00342

@@ -1,0 +1,5 @@
+rung,checkpoint,kind,layer6_ccc,layer6_sd,control_ccc,control_sd,diff,separated,final_block_ccc,final_block_sd
+1,"from-scratch 9-node DiLoCo ViT-B",project,0.189,0.009,0.066,0.014,0.123,yes,0.213,0.026
+2,"overfit-50, seed-42 run (superseded)",project,0.095,0.038,0.090,0.025,0.004,no,,
+3,"public VideoMAE V2 ViT-B, UCF101 fine-tune (mae-b)",reference,0.200,0.026,0.097,0.026,0.103,yes,0.271,0.029
+4,"released LeVJEPA ViT-L, fine-tuned (layer 12 of 24)",reference,0.209,0.014,0.070,0.017,0.140,yes,0.252,0.018

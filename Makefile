@@ -1,6 +1,6 @@
 .PHONY: verify mutants
 
-# Fast loop: meta gate + assertion-strength gate + non-integration/system tests.
+# Fast loop: every test except the integration and system ones.
 verify:
 	uv run pytest -q -m "not integration and not system"
 

@@ -25,7 +25,7 @@ in it, so any `val_loss` ranking should be read as provisional.
 
 | Campaign | Dates | Question | Outcome |
 |---|---|---|---|
-| Single-node and small-pool profiling (24 rows in `sweep.csv`) | 2026-07-10 to 07-11 | Batch, accumulation, precision, and node count vs throughput | Single node beats 8-node DDP: 13.4 samples/s at batch 1 and 24.0 at batch 4 (bf16). 8-node scaling efficiency 0.027. Motivated DiLoCo. |
+| Single-node and small-pool profiling (24 rows in `docs/data/throughput_sweep.csv`) | 2026-07-10 to 07-11 | Batch, accumulation, precision, and node count vs throughput | Single node beats 8-node DDP: 13.4 samples/s at batch 1 and 24.0 at batch 4 (bf16). 8-node scaling efficiency 0.027. Motivated DiLoCo. |
 | Mesh bring-up (`step0-*`, `pool-cars-2r` to `phase4-fix2`) | 2026-07-28 to 08-08 | Does the merge loop run end to end? | Infrastructure check. No science. |
 | `sw1` outer-optimizer grid (fish, birds) | 2026-07-28 to 07-29 | Outer lr and momentum, 7 rounds, no quorum | Final val_loss within about 0.02 across momentum. No winner. `sw1-fish-lr050m090` had one contributor and is excluded. |
 | `sw2` extension | 2026-07-30 | Same arms at 15 rounds | Two arms collapsed on quorum at 11 and 5 rounds. Not comparable. |
@@ -37,12 +37,12 @@ in it, so any `val_loss` ranking should be read as provisional.
 | `recipe2x2` (legacy and paper recipes, 2 targets) | 2026-08-23 to 08-26 | Does the paper-faithful recipe help? | The paper recipe fixed positional collapse and introduced depth collapse. The four cells ran on four tiers, and most rounds merged on timeout. The ranking between arms is not reliable. |
 | `recipe2x2` conditioning, PCA, and real-video diagnostics | 2026-08-28 | Where does the collapse live? | Weights stay high-rank. Activations and gradients collapse, starting at block 1. Attention sinks sharpen with depth. Real-video norms confirm it. Single checkpoints only. |
 | `e2b` depth-collapse ablation (pre-registered 2026-08-27) | launched 2026-08-28, stopped 2026-08-29 | Does a visible-loss weight, or deep supervision at layers 4, 8, 12, keep the stream alive? | Stopped at rounds 26 (fish), 13 (birds), 28 (cars), 43 (countries) of 50. Rosters were unequal and cluster oversubscribed. No outcome. |
-| `e2b` merge fault (`5addb16`) | 2026-08-28 | Why did merges fail? | A 300 s subprocess timeout killed each merge about 90 s after its writes finished. The retry loop found stale deltas and failed 722 times. Fixed by a no-op for already-applied rounds and a 900 s timeout. |
+| `e2b` merge fault | 2026-08-28 | Why did merges fail? | A 300 s subprocess timeout killed each merge about 90 s after its writes finished. The retry loop found stale deltas and failed 722 times. Fixed by a no-op for already-applied rounds and a 900 s timeout. |
 | LeVJEPA objective and encoder | 2026-09-01 to 09-30 | Does a second SSL objective avoid collapse? | In-house checkpoints collapsed more. The mesh loss path still called the VideoMAE step at archive time (2026-09-30). |
 | Attentive-probe ladder (AFEW-VA) | 2026-09-26 to 09-27 | CCC of frozen probes vs random init | Rung 1 separates from its control at layer 6 by a ± sd band (+0.123). Rung 2 does not (superseded run). Rungs 3 and 4 use pretrained weights and are reference rungs. |
 | Dose-response, Phase 3b | 2026-09-21 | Does effective update size drive motion R²? | Motion R² falls with the multiplier. Low doses avoid damage but match random init. The pre-registered test was not run. |
 | `p3v` seven-arm batch | launched 2026-09-22 | Pre-registered claims C1 and C7 | Training finished. The readout pass was not run, so no claim was tested. |
-| AFEW-VA fine-tune gate | 2026-09-30 to 10-02 | End-to-end check of the from-scratch checkpoint vs random init | Early runs read exactly 0 CCC from a saturated head (fixed in `430e0b1`). Final verdict INCONCLUSIVE: −0.056 vs −0.030, CI95 [−0.277, 0.225]. Revised 1-epoch, 10-seed gate: not yet run. |
+| AFEW-VA fine-tune gate | 2026-09-30 to 10-02 | End-to-end check of the from-scratch checkpoint vs random init | Early runs read exactly 0 CCC from a saturated head (fixed with an unbounded head). Final verdict INCONCLUSIVE: −0.056 vs −0.030, CI95 [−0.277, 0.225]. Revised 1-epoch, 10-seed gate: not yet run. |
 | Ladder rebuild | 2026-10-03 to 10-04 | Make rung 2 and rung 4 comparable | Rung 2 rebuilt as 300 rounds from seed 0, as rung 1. Rung 4 re-pointed at the in-house lean LeVJEPA. Neither has a probe result. |
 | Depth-collapse repair | 2026-10-07 | Fix blocks 4 to 12 | LayerNorm scaling, depth-aware init, and a fail-closed loader were committed. Not yet validated. |
 

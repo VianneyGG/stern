@@ -96,10 +96,10 @@ Frozen attentive probe, layer 6, 3 seeds, CCC, each against a control from the s
 | 4 | released LeVJEPA ViT-L, fine-tuned (layer 12 of 24) | 0.209 ± 0.014 | 0.070 ± 0.017 | +0.140 | yes |
 
 - **Rungs 3 and 4 use pretrained weights** and are reference encoders only.
-- Rung 4 was first defined as the released ViT-L; commit `416fc06` (2026-10-03)
-  re-pointed it at the in-house lean LeVJEPA, which has no recorded probe.
-- Rung 2's "no separation" was an artifact of its seed and short training
-  (`2e8f155`); its 300-round rebuild has no probe result.
+- Rung 4 was first defined as the released ViT-L; on 2026-10-03 it was
+  re-pointed at the in-house lean LeVJEPA, which has no recorded probe.
+- Rung 2's "no separation" was an artifact of its seed and short training;
+  its 300-round rebuild has no probe result.
 - The control is unseeded (0.066 in one job, 0.097 in another). Compare only within a job.
 - Separation is a ± sd band. No checkpoint meets the paired-CI bar.
 - Final block: rung 1 0.213 ± 0.026; rung 3 0.271 ± 0.029; rung 4 0.252 ± 0.018.
@@ -116,9 +116,9 @@ Frozen attentive probe, layer 6, 3 seeds, CCC, each against a control from the s
 Difference −0.026, 95% CI [−0.277, 0.225], minimum detectable effect 0.251.
 The interval is too wide to call either direction.
 
-Earlier runs read exactly 0 CCC from a saturated tanh head (fixed in `430e0b1`).
+Earlier runs read exactly 0 CCC from a saturated tanh head (fixed with an unbounded head).
 The gate scored the last, overfit epoch; best-epoch CCC was 0.05 to 0.13.
-**Revised gate (1 epoch × 10 seeds, `065b86a`): not yet measured.**
+**Revised gate (1 epoch × 10 seeds): not yet measured.**
 
 ## 6. LeVJEPA
 
@@ -127,7 +127,7 @@ The gate scored the last, overfit epoch; best-epoch CCC was 0.05 to 0.13.
 
 ## 7. Motion budget and motion blindness
 
-**Motion budget** (`diag_motion_budget.py`, commit `bad73c0`). Target variance
+**Motion budget** (`stern/evaluation/diagnostics/motion_budget.py`). Target variance
 removed by time-averaging, VoxCeleb2 shards 000007/000029/000051: stride 1
 **0.178**, stride 2 **0.230**, stride 4 **0.263**. The targets contain real
 inter-frame change.
@@ -140,7 +140,7 @@ and temporal hold-out 0.443 (2.4×). Reconstruction is 25.26 dB PSNR.
 ## 8. Open measurements
 
 - **Revised fine-tune gate** (1 epoch × 10 seeds). Not yet measured.
-- **Depth-collapse fixes** (`6ed9ef2`, 2026-10-07: LayerNorm scaling, depth-aware
+- **Depth-collapse fixes** (2026-10-07: LayerNorm scaling, depth-aware
   init, fail-closed loader): implemented, not validated. Encoders loaded before
   2026-10-07 need re-checking, since a non-strict load can silently train
   half-random encoders.

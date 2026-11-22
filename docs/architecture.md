@@ -113,7 +113,7 @@ weighting. Default outer lr and momentum are 0.7 and 0.9.
 nodes check in. `grace_s` is the fallback deadline. `effective_quorum_k` lowers
 the quorum for missing nodes, never below 60% of the pool (`mesh_tick.py`).
 Round and merge timeouts are both 900 s. The merge timeout was 300 s until a
-merge killed at 300 s was found to have finished its writes (`5addb16`).
+merge killed at 300 s was found to have finished its writes (fixed 2026-08-28).
 
 **Checkpoint flow.** Workers push to `pending/`, which a merge clears only on
 success. `master.pt` is overwritten each merge, so a finished run keeps only
@@ -147,4 +147,4 @@ overlaps those hours. With the 2-hour walltime cap,
 weekday launches are allowed from 20:00 to 06:00; weekends are open. There is
 no override. Enforcement sits in three places: the job scripts, a shim in
 front of `sbatch`/`srun`/`salloc` on the shared home, and the watcher, which
-suppresses resubmission during class hours. Added 2026-10-07 (`8882f2a`).
+suppresses resubmission during class hours. Added 2026-10-07.

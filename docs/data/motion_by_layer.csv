@@ -1,0 +1,378 @@
+arm,multiplier,route,outer_lr_momentum,seed,nodes,rounds,group,readout,layer,motion_r2
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,0,-0.014
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,1,0.376
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,2,0.411
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,3,0.41
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,4,0.417
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,5,0.422
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,6,0.421
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,7,0.417
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,8,0.418
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,9,0.418
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,10,0.418
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,11,0.415
+7x plain AdamW,7.0,plain,,0,1,20,dose,token_split,12,0.414
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,0,-0.012
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,1,0.417
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,2,0.431
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,3,0.433
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,4,0.437
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,5,0.437
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,6,0.436
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,7,0.436
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,8,0.437
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,9,0.435
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,10,0.431
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,11,0.431
+7x plain AdamW,7.0,plain,,1,1,20,dose,token_split,12,0.429
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,0,-0.013
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,1,0.665
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,2,0.67
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,3,0.665
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,4,0.663
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,5,0.663
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,6,0.66
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,7,0.657
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,8,0.654
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,9,0.65
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,10,0.648
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,11,0.643
+0.7x DiLoCo,0.7,diloco,0.7/0.0,0,1,20,dose,token_split,12,0.643
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,0,-0.01
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,1,0.648
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,2,0.647
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,3,0.643
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,4,0.637
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,5,0.632
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,6,0.63
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,7,0.625
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,8,0.625
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,9,0.621
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,10,0.619
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,11,0.616
+2x DiLoCo,2.0,diloco,0.2/0.9,0,1,20,dose,token_split,12,0.617
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,0,-0.011
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,1,0.656
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,2,0.655
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,3,0.657
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,4,0.653
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,5,0.647
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,6,0.647
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,7,0.646
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,8,0.642
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,9,0.636
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,10,0.631
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,11,0.627
+2.25x DiLoCo,2.25,diloco,0.45/0.8,0,1,20,dose,token_split,12,0.626
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,0,-0.015
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,1,0.593
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,2,0.592
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,3,0.589
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,4,0.585
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,5,0.58
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,6,0.577
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,7,0.573
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,8,0.567
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,9,0.564
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,10,0.557
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,11,0.555
+3x plain AdamW,3.0,plain,,0,1,20,dose,token_split,12,0.558
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,0,-0.005
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,1,0.688
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,2,0.698
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,3,0.697
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,4,0.692
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,5,0.682
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,6,0.674
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,7,0.665
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,8,0.659
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,9,0.649
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,10,0.639
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,11,0.632
+"2x plain average, 9 nodes, 60 rounds",2.0,plain,,0,9,60,long,token_split,12,0.627
+random init,,none,,,0,0,reference,token_split,0,-0.018
+random init,,none,,,0,0,reference,token_split,1,0.606
+random init,,none,,,0,0,reference,token_split,2,0.619
+random init,,none,,,0,0,reference,token_split,3,0.631
+random init,,none,,,0,0,reference,token_split,4,0.634
+random init,,none,,,0,0,reference,token_split,5,0.637
+random init,,none,,,0,0,reference,token_split,6,0.639
+random init,,none,,,0,0,reference,token_split,7,0.638
+random init,,none,,,0,0,reference,token_split,8,0.638
+random init,,none,,,0,0,reference,token_split,9,0.638
+random init,,none,,,0,0,reference,token_split,10,0.639
+random init,,none,,,0,0,reference,token_split,11,0.634
+random init,,none,,,0,0,reference,token_split,12,0.637
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,0,-0.009
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,1,0.599
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,2,0.581
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,3,0.581
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,4,0.573
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,5,0.572
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,6,0.565
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,7,0.562
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,8,0.556
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,9,0.554
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,10,0.547
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,11,0.541
+7x DiLoCo,7.0,diloco,0.7/0.9,0,1,20,dose,token_split,12,0.533
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,0,-0.006
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,1,0.601
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,2,0.596
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,3,0.584
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,4,0.58
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,5,0.577
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,6,0.573
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,7,0.563
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,8,0.559
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,9,0.557
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,10,0.552
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,11,0.547
+7x DiLoCo,7.0,diloco,0.7/0.9,1,1,20,dose,token_split,12,0.541
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,0,-0.013
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,1,0.671
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,2,0.675
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,3,0.668
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,4,0.67
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,5,0.665
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,6,0.661
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,7,0.66
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,8,0.657
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,9,0.659
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,10,0.656
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,11,0.651
+1x plain AdamW,1.0,plain,,0,1,20,dose,token_split,12,0.648
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,0,-0.015
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,1,0.677
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,2,0.673
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,3,0.674
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,4,0.678
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,5,0.674
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,6,0.672
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,7,0.672
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,8,0.67
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,9,0.666
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,10,0.665
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,11,0.666
+1x plain AdamW,1.0,plain,,1,1,20,dose,token_split,12,0.662
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,0,-0.001
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,1,0.252
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,2,0.324
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,3,0.354
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,4,0.373
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,5,0.387
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,6,0.4
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,7,0.413
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,8,0.423
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,9,0.432
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,10,0.441
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,11,0.445
+fix: LayerScale init 1e-4,7.0,diloco,0.7/0.9,0,1,20,fix,token_split,12,0.447
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,0,0.014
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,1,0.691
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,2,0.698
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,3,0.694
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,4,0.689
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,5,0.683
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,6,0.674
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,7,0.669
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,8,0.663
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,9,0.657
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,10,0.653
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,11,0.648
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,token_split,12,0.645
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,0,0.011
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,1,0.658
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,2,0.658
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,3,0.647
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,4,0.643
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,5,0.644
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,6,0.642
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,7,0.64
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,8,0.637
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,9,0.636
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,10,0.636
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,11,0.636
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,token_split,12,0.635
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,0,0.01
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,1,0.67
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,2,0.666
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,3,0.665
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,4,0.665
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,5,0.657
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,6,0.658
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,7,0.658
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,8,0.654
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,9,0.653
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,10,0.651
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,11,0.65
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,token_split,12,0.647
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,0,0.012
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,1,0.644
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,2,0.635
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,3,0.636
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,4,0.631
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,5,0.625
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,6,0.624
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,7,0.623
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,8,0.621
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,9,0.622
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,10,0.622
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,11,0.621
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,token_split,12,0.619
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,0,0.012
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,1,0.63
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,2,0.638
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,3,0.632
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,4,0.631
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,5,0.624
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,6,0.627
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,7,0.62
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,8,0.618
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,9,0.616
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,10,0.618
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,11,0.612
+2x plain AdamW,2.0,plain,,0,1,20,dose2,token_split,12,0.609
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,0,0.012
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,1,0.582
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,2,0.596
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,3,0.596
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,4,0.586
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,5,0.582
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,6,0.579
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,7,0.572
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,8,0.567
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,9,0.565
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,10,0.556
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,11,0.553
+3x plain AdamW,3.0,plain,,1,1,20,dose2,token_split,12,0.549
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,0,0.016
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,1,0.682
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,2,0.686
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,3,0.686
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,4,0.684
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,5,0.68
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,6,0.669
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,7,0.658
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,8,0.648
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,9,0.645
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,10,0.641
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,11,0.632
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,token_split,12,0.621
+random init,,none,,,0,0,reference,token_split,0,0.008
+random init,,none,,,0,0,reference,token_split,1,0.622
+random init,,none,,,0,0,reference,token_split,2,0.639
+random init,,none,,,0,0,reference,token_split,3,0.647
+random init,,none,,,0,0,reference,token_split,4,0.65
+random init,,none,,,0,0,reference,token_split,5,0.651
+random init,,none,,,0,0,reference,token_split,6,0.652
+random init,,none,,,0,0,reference,token_split,7,0.654
+random init,,none,,,0,0,reference,token_split,8,0.656
+random init,,none,,,0,0,reference,token_split,9,0.655
+random init,,none,,,0,0,reference,token_split,10,0.657
+random init,,none,,,0,0,reference,token_split,11,0.654
+random init,,none,,,0,0,reference,token_split,12,0.652
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,0,0.004
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,1,0.654
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,2,0.648
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,3,0.619
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,4,0.602
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,5,0.585
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,6,0.569
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,7,0.551
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,8,0.534
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,9,0.524
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,10,0.522
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,11,0.508
+"1x plain average, 9 nodes, 60 rounds",1.0,plain,,0,9,60,long2,window_grouped,12,0.494
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,0,0.002
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,1,0.564
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,2,0.507
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,3,0.401
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,4,0.33
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,5,0.294
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,6,0.314
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,7,0.315
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,8,0.265
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,9,0.276
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,10,0.278
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,11,0.284
+1x DiLoCo,1.0,diloco,0.1/0.9,0,1,20,dose2,window_grouped,12,0.241
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,0,0.005
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,1,0.594
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,2,0.52
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,3,0.457
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,4,0.434
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,5,0.377
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,6,0.362
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,7,0.381
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,8,0.36
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,9,0.376
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,10,0.359
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,11,0.335
+0.7x DiLoCo,0.7,diloco,0.7/0.0,1,1,20,dose2,window_grouped,12,0.334
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,0,0.006
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,1,0.546
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,2,0.434
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,3,0.401
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,4,0.365
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,5,0.201
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,6,0.176
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,7,0.218
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,8,0.217
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,9,0.257
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,10,0.217
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,11,0.232
+2x DiLoCo,2.0,diloco,0.2/0.9,1,1,20,dose2,window_grouped,12,0.214
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,0,0.003
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,1,0.544
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,2,0.484
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,3,0.402
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,4,0.367
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,5,0.307
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,6,0.328
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,7,0.279
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,8,0.26
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,9,0.208
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,10,0.227
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,11,0.166
+2x plain AdamW,2.0,plain,,0,1,20,dose2,window_grouped,12,0.135
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,0,0.005
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,1,0.464
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,2,0.387
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,3,0.348
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,4,0.278
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,5,0.18
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,6,0.079
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,7,-0.067
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,8,-0.154
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,9,-0.045
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,10,-0.098
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,11,-0.107
+3x plain AdamW,3.0,plain,,1,1,20,dose2,window_grouped,12,-0.128
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,0,0.004
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,1,0.637
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,2,0.601
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,3,0.565
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,4,0.568
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,5,0.533
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,6,0.472
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,7,0.456
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,8,0.432
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,9,0.434
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,10,0.442
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,11,0.421
+"2x plain, 1 node, 60 rounds",2.0,plain,,0,1,60,long2,window_grouped,12,0.393
+random init,,none,,,0,0,reference,window_grouped,0,0.003
+random init,,none,,,0,0,reference,window_grouped,1,0.583
+random init,,none,,,0,0,reference,window_grouped,2,0.58
+random init,,none,,,0,0,reference,window_grouped,3,0.577
+random init,,none,,,0,0,reference,window_grouped,4,0.566
+random init,,none,,,0,0,reference,window_grouped,5,0.567
+random init,,none,,,0,0,reference,window_grouped,6,0.562
+random init,,none,,,0,0,reference,window_grouped,7,0.565
+random init,,none,,,0,0,reference,window_grouped,8,0.563
+random init,,none,,,0,0,reference,window_grouped,9,0.531
+random init,,none,,,0,0,reference,window_grouped,10,0.554
+random init,,none,,,0,0,reference,window_grouped,11,0.555
+random init,,none,,,0,0,reference,window_grouped,12,0.546

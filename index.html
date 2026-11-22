@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>STERN: video pretraining on shared workstations with DiLoCo</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<details id="resume"><summary>Contents</summary><div id="resume-body"></div></details>
+<main>
+
+<header class="hero" id="top">
+  <div class="kicker">STERN · self-supervised video pretraining · summer 2026 internship</div>
+  <h1>Pretraining a video encoder on shared lab workstations: one training failure, its cause, and what correcting it bought</h1>
+  <p class="lede">STERN pretrains video encoders on unlabelled face clips and measures them on valence and arousal prediction. Training runs on lab workstations shared with teaching, with DiLoCo, a method in which machines train alone and merge rarely. For 230 rounds the loss fell while the encoder was losing information it had at initialisation. This page shows how that was found, what caused it, and what the corrected setting gives.</p>
+  <div id="answer">
+    <h4>What worked</h4>
+    <ul>
+      <li><b>The cause was found and removed.</b> DiLoCo's default outer step multiplies each update by up to 7. At 7× the residual-stream norm reaches 370 to 460 and a motion readout falls below its random-initialisation level. At 1× the norm stays near 90 and the readout stays at that level.</li>
+      <li><b>Encoders trained with the corrected setting are useful downstream.</b> On a frozen probe for valence and arousal, the from-scratch ViT-B reads 0.189 against 0.066 for a random initialisation; two public pretrained models read 0.200 and 0.209 on the same probe. A smaller from-scratch encoder, fine-tuned, beats a random initialisation by +0.031 (95% interval +0.005 to +0.057).</li>
+      <li><b>Continued pretraining improves a released model.</b> Fine-tuned CCC goes from 0.287 to 0.331 over 30 seeds; 29 of the 30 improve.</li>
+      <li><b>The training system.</b> Decentralized training on a pool of 113 single-GPU workstations, with a watcher that keeps runs alive and keeps them off the machines during class hours.</li>
+    </ul>
+    <h4>What is still open</h4>
+    <ul>
+      <li>In the from-scratch ViT-B, blocks 4 to 12 still contribute almost nothing to the reconstruction. Ten changes to the recipe did not alter that. A 3-block encoder reaches the same loss, which points at the objective.</li>
+      <li>Fine-tuned, the from-scratch encoder is far from the released model: +0.03 over a random initialisation against about +0.26.</li>
+    </ul>
+  </div>
+  <p class="byline">Solo project, summer 2026 internship. Every number on this page is read from the result tables in <code>docs/data/</code>; the notebook <code>notebooks/stern_overview.ipynb</code> rebuilds them into the figures. One figure plays as you scroll through it; the others are still.</p>
+</header>
+
+<h2 id="diloco"><span class="n">1 · DiLoCo</span>Training on machines that talk once per round</h2>
+<p>The pool is 113 lab workstations with one GPU each, joined by ordinary 1 GbE. Exchanging gradients at every step over that network is slower than training on one machine (<a href="#throughput">appendix D</a>). DiLoCo (Douillard et al., 2023) avoids the exchange: in each round every machine starts from the same weights and trains alone on its own data; the machines then send their weight changes, the changes are averaged, and an <em>outer</em> optimiser applies the average to the shared weights.</p>
+<div class="setup">
+<figure class="card"><h4>The task</h4>
+<svg viewBox="0 0 300 120" role="img" aria-label="A 16-frame clip, 90 percent of its patches hidden, goes through the encoder and a small decoder that reconstructs the hidden patches">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" class="dg-ah"/></marker></defs>
+<rect class="dg-box" x="6" y="36" width="66" height="48" rx="8"/><text class="dg-t" x="39" y="57" text-anchor="middle">clip</text><text class="dg-m" x="39" y="73" text-anchor="middle">90% hidden</text>
+<rect class="dg-box on" x="98" y="30" width="84" height="60" rx="8"/><text class="dg-t" x="140" y="57" text-anchor="middle">encoder</text><text class="dg-m" x="140" y="73" text-anchor="middle">12 blocks</text>
+<rect class="dg-box" x="208" y="36" width="86" height="48" rx="8"/><text class="dg-t" x="251" y="57" text-anchor="middle">decoder</text><text class="dg-m" x="251" y="73" text-anchor="middle">rebuilds pixels</text>
+<path class="dg-a" marker-end="url(#ah)" d="M72,60 H96"/><path class="dg-a" marker-end="url(#ah)" d="M182,60 H206"/>
+</svg><figcaption>Masked reconstruction in the style of VideoMAE: ViT-B encoder written from scratch, no pretrained weights, on 218 hours of unlabelled face video (VoxCeleb2).</figcaption></figure>
+<figure class="card"><h4>One round</h4>
+<svg viewBox="0 0 300 120" role="img" aria-label="Loop: each machine trains alone, sends its update, the updates are averaged, the outer step moves the shared weights, the weights are sent back">
+<rect class="dg-box" x="6" y="8" width="124" height="34" rx="8"/><text class="dg-t" x="68" y="30" text-anchor="middle">train alone</text>
+<rect class="dg-box" x="170" y="8" width="124" height="34" rx="8"/><text class="dg-t" x="232" y="30" text-anchor="middle">average updates</text>
+<rect class="dg-box on" x="170" y="78" width="124" height="34" rx="8"/><text class="dg-t" x="232" y="100" text-anchor="middle">outer step</text>
+<rect class="dg-box" x="6" y="78" width="124" height="34" rx="8"/><text class="dg-t" x="68" y="100" text-anchor="middle">sync weights</text>
+<path class="dg-a" marker-end="url(#ah)" d="M130,25 H168"/><path class="dg-a" marker-end="url(#ah)" d="M232,42 V76"/><path class="dg-a" marker-end="url(#ah)" d="M170,95 H132"/><path class="dg-a" marker-end="url(#ah)" d="M68,78 V44"/>
+</svg><figcaption>The highlighted box is where this page's finding lives: how far the outer step moves the shared weights.</figcaption></figure>
+<figure class="card"><h4>Colours on this page</h4>
+<ul class="chips"><li><i style="background:var(--s-blue)"></i><b>0.7× and 1×</b> small effective update</li><li><i style="background:var(--s-green)"></i><b>2× to 3×</b> medium</li><li><i style="background:var(--s-orange)"></i><b>7×</b> the DiLoCo default</li><li><i style="background:var(--s-grey)"></i><b>grey</b> random initialisation</li></ul>
+<figcaption>A solid line is the DiLoCo outer step; a dashed line is plain AdamW at a larger learning rate.</figcaption></figure>
+</div>
+<p>The outer optimiser is SGD with Nesterov momentum. With <code>g</code> the averaged update, <code>b</code> a buffer and <code>w</code> the shared weights:</p>
+<div class="eqbox">b ← momentum · b + g
+w ← w − outer_lr · (g + momentum · b)</div>
+<p>If <code>g</code> keeps the same direction, the step grows round after round towards <code>outer_lr / (1 − momentum)</code> times <code>g</code>. With the paper's defaults, 0.7 and 0.9, that is 7. The figure plays three rounds as you scroll.</p>
+<div class="story" style="--len:420vh"><div class="pin"><figure><canvas data-scene="diloco" style="--ar:16/7.4"></canvas></figure></div></div>
+<p class="small"><b>Left: a schematic of three rounds</b>, not data. Grey: each machine's own training. Blue arrow: the average of the updates. Orange arrow: what the outer step actually applies. <b>Right: the formula above</b>, for a constant update direction, with the five outer settings used in this project (outer learning rate / momentum). The value at the end of each curve is its limit; for a real run it is an upper bound.</p>
+
+<h2 id="symptom"><span class="n">2 · The symptom</span>The loss falls, and one block does the work</h2>
+<p>Every early run was ranked on reconstruction validation loss. This is the longest one, on 16 machines with the default outer step.</p>
+<figure><canvas data-scene="loss" style="--ar:16/4.4;--arn:10/8"></canvas>
+<figcaption><b>Reconstruction validation loss</b> over 230 DiLoCo rounds.</figcaption></figure>
+<p class="why"><b>Why the next figure.</b> A falling loss does not say which parts of the encoder are used. A block-skip test does: replace one block with the identity and measure how much the held-out reconstruction error rises.</p>
+<figure><canvas data-scene="skip" style="--ar:16/9.4;--arn:10/15"></canvas>
+<figcaption><b>Top: cost of skipping each block</b>, for ten encoders trained for 20 rounds on one machine (seven settings, three of them with two seeds) and a random initialisation. <span class="legend"><span><i style="background:var(--s-blue)"></i>0.7× and 1×</span><span><i style="background:var(--s-green)"></i>2× to 3×</span><span><i style="background:var(--s-orange)"></i>7×</span><span><i style="background:var(--s-grey)"></i>random init</span><span><i class="solid"></i>DiLoCo</span><span><i class="dash"></i>plain AdamW</span></span> <b>Bottom: the same curves, magnified.</b> From block 4 on, every trained encoder stays inside or just above the range a random initialisation shows.</figcaption></figure>
+<p>Skipping block 1 costs 0.26 to 1.12. Skipping any one of blocks 4 to 12 costs at most 0.017. After 100 rounds on 16 machines block 2 contributes as well (block 1 costs 0.42, block 2 0.16), and blocks 4 to 12 still do not (at most 0.014).</p>
+
+<h2 id="cause"><span class="n">3 · The cause</span>The size of the update</h2>
+<p>Define the effective multiplier as <code>outer_lr / (1 − momentum) × lr_mult</code>, and reach the same value by two routes: through the outer step, or with plain AdamW and a larger learning rate. Two measurements follow it. The first is the norm of the residual stream after each block. The second is motion R²: a linear map from the frozen last-block tokens to how much each patch changes between frames, which says whether the encoder keeps information about motion.</p>
+<figure><canvas data-scene="cause" style="--ar:16/6.4;--arn:10/17"></canvas>
+<figcaption><b>Left: stream norm by block. Right: last-block motion R² against the effective multiplier.</b> <span class="legend"><span><i style="background:var(--s-blue)"></i>0.7× and 1×</span><span><i style="background:var(--s-green)"></i>2× to 3×</span><span><i style="background:var(--s-orange)"></i>7×</span><span><i style="background:var(--s-grey)"></i>random init</span><span><i class="solid"></i>DiLoCo</span><span><i class="dash"></i>plain AdamW</span></span> Twenty rounds on one machine; 1× and both 7× settings have two seeds.</figcaption></figure>
+<p>At 0.7× and 1× the norm ends near 90 and motion R² stays at 0.64 to 0.66, the level of a random initialisation (0.64). At 7× the norm ends between 370 and 460 and motion R² falls to 0.53 to 0.54 with the DiLoCo outer step, and to 0.41 to 0.43 with plain AdamW at seven times the learning rate.</p>
+<div class="callout good"><h4>Reading</h4><p>Plain AdamW at 7× is affected more than DiLoCo at 7×. So the outer momentum is not what does it: the size of the update is. The validation loss cannot show it: across all these settings it stays between 0.513 and 0.548.</p></div>
+
+<h2 id="fix"><span class="n">4 · The correction</span>Training at 1×, and what the encoders are worth</h2>
+<p>Every later run keeps the effective multiplier at 1×. Two downstream checks were run on encoders trained that way. Both use AFEW-VA (600 clips, 240 actors) and the concordance correlation coefficient (CCC) on held-out actors: 1 is perfect agreement with the human annotation of valence and arousal, 0 is none.</p>
+<h3 id="probe">Frozen features</h3>
+<p class="why"><b>Why this figure.</b> It asks whether the encoder's features carry valence and arousal without any fine-tuning: the encoder is frozen and a small attentive probe is trained on its layer-6 tokens.</p>
+<figure><canvas data-scene="ladder" style="--ar:16/5;--arn:10/11"></canvas>
+<figcaption><b>Frozen-probe CCC.</b> Filled dot: the encoder. Hollow dot: a random initialisation of the same architecture, probed in the same job. Three seeds each. <span class="legend"><span><i style="background:var(--s-blue)"></i>from scratch at 1×</span><span><i style="background:var(--s-green)"></i>public pretrained models, for scale</span><span><i style="background:var(--s-grey)"></i>random-init controls, and a superseded run</span></span></figcaption></figure>
+<p>The from-scratch ViT-B, trained for 60 rounds on 9 machines at 1×, reads 0.189 against 0.066 for its control. A public VideoMAE V2 ViT-B fine-tuned on UCF101 action labels reads 0.200 and the released LeVJEPA ViT-L 0.209 on the same probe. Scope: three seeds, one layer, a small probe; the controls are not seeded, so differences are read within a row.</p>
+<h3 id="gate">Fine-tuned, against a random initialisation</h3>
+<p class="why"><b>Why this figure.</b> Fine-tuning is the stricter test, because a random initialisation also learns when fine-tuned. The encoder and a random initialisation are fine-tuned with the same 10 seeds, and the paired difference is reported with a 95% interval.</p>
+<figure><canvas data-scene="gate" style="--ar:16/5.4;--arn:10/9"></canvas>
+<figcaption><b>Fine-tuned CCC minus random init, by training round.</b> A smaller encoder (depth 7, about 34M parameters, LeVJEPA objective) on 14 machines, DiLoCo at 0.1 / 0.9, which is 1×. <span class="legend"><span><i style="background:var(--s-blue)"></i>after the seeding fix, with 95% interval</span><span><i style="background:var(--s-grey)"></i>before the fix, no interval shown</span></span></figcaption></figure>
+<p>At round 48 the encoder reaches a CCC of 0.089 against 0.058 for a random initialisation: +0.031, interval +0.005 to +0.057. At round 78 the difference is +0.011 and the interval includes zero. Earlier snapshots are shown without intervals because of a seeding bug fixed on 2026-11-01 (<a href="#system-detail">appendix D</a>). For scale, the released ViT-L scores about +0.26 on this test. It is one training run.</p>
+
+<h2 id="open"><span class="n">5 · Still open</span>The deep blocks</h2>
+<p>Lowering the update removes the norm growth and the loss of motion information. It does not make blocks 4 to 12 contribute: in <a href="#symptom">section 2</a> the blue curves are as flat as the orange ones. Ten variants of the recipe were tried against that, and none changes it (<a href="#variants">appendix A</a>).</p>
+<p>A 3-block encoder trained with the same recipe reaches the same validation loss as the 12-block one: 0.516 and 0.518 against 0.524 and 0.525, two seeds each. The reconstruction objective at this scale can be met with a few blocks, so the next thing to change is the objective, not the optimiser.</p>
+<p class="small">A stricter version of the motion readout, split by clip, shows the same thing from another side: motion information decreases with depth in every trained encoder (<a href="#readout">appendix B</a>).</p>
+
+<h2 id="cpt"><span class="n">6 · Continued pretraining</span>Improving a released model on unlabelled face video</h2>
+<p>Start from the released LeVJEPA ViT-L, continue its self-supervised pretraining on the same unlabelled face video for about 1,080 encoder steps, then fine-tune on AFEW-VA. Thirty seeds per arm, one job per seed.</p>
+<figure><canvas data-scene="cpt" style="--ar:16/9.4;--arn:10/15"></canvas>
+<figcaption><b>Top: fine-tuned CCC, 30 seeds per arm. Bottom: the gain, seed by seed.</b> Each seed of the continued-pretraining arm is compared with the same seed of the released model. Band: 95% interval of the mean gain.</figcaption></figure>
+<p>The gain is in valence, whose CCC goes from 0.090 to 0.176; arousal is unchanged (<a href="#cpt-table">table in appendix E</a>). Scope: 48 held-out actors, 102 clips, one identity split. The snapshot was chosen by a small frozen probe among five runs at four learning rates.</p>
+
+<h2 id="system"><span class="n">7 · The system</span>Running on machines shared with teaching</h2>
+<div class="setup">
+<figure class="card two"><h4>The pool</h4>
+<div class="stats"><div><b>113</b>workstations, one GPU each</div><div><b>5</b>hardware tiers</div><div><b>1 GbE</b>between machines</div><div><b>9–16</b>machines in the runs shown here</div></div>
+<figcaption>Each worker is one GPU process with no <code>torch.distributed</code>: it trains on the shards it holds and pushes a checkpoint once per round.</figcaption></figure>
+<figure class="card"><h4>Tests</h4>
+<div class="stats" style="grid-template-columns:1fr"><div><b>≈ 1.9k</b>tests mirroring the package</div></div>
+<figcaption>The merge, quorum, placement and watcher logic is pure and tested on fixtures, without a cluster.</figcaption></figure>
+</div>
+<p>Exchanging gradients at every step was measured first: eight machines together process 11.1 samples per second where one alone processes 24.0. So each machine trains alone and merges once per round. A watcher advances every run each minute, restarts a dead job once, and keeps every job off the machines on weekdays from 08:00 to 20:00 (<a href="#throughput">appendix D</a>).</p>
+
+<h2 id="limits"><span class="n">8 · Limits</span>What these results do not cover</h2>
+<ul class="plain">
+<li>Sections 2 and 3 and appendices A and B rest on 20-round, single-machine encoders, mostly one seed per setting. The dose-response was pre-registered as a rank test (Spearman at most −0.8, p &lt; 0.05). Four doses survive for the stricter readout, too few for that threshold: the test gives ρ = −0.80, p = 0.17.</li>
+<li>The frozen probe of section 4 is three seeds on one layer. The ViT-B encoders have not been through the paired fine-tuning test.</li>
+<li>The fine-tuning result of section 4 is one training run, and the difference is no longer resolved at round 78.</li>
+<li>All downstream numbers are on AFEW-VA.</li>
+</ul>
+
+<h2 id="appendix"><span class="n">Appendix</span>Secondary results and details</h2>
+<p>Every item here is linked from the text above.</p>
+<h3 id="variants">A · Ten variants of the recipe</h3>
+<figure><canvas data-scene="fixes" style="--ar:16/7.4;--arn:10/16"></canvas>
+<figcaption><b>Ten variants of the 7× recipe.</b> Left: cost of skipping block 1. Right, magnified: the largest cost among blocks 4 to 12, with the range a random initialisation shows. No variant moves the deep blocks out of that neighbourhood. LayerScale at 10⁻⁴ removes the dependence on block 1 only because the encoder stops writing to the stream (norm 20 after block 12).</figcaption></figure>
+<h3 id="readout">B · A stricter motion readout</h3>
+<p class="why"><b>Why this figure.</b> The motion readout of section 3 splits train and test by token, so tokens of one clip sit on both sides. This version splits by clip. It was run on a second batch of encoders, from 0.7× to 3×.</p>
+<figure><canvas data-scene="motion" style="--ar:16/6.6;--arn:10/10"></canvas>
+<figcaption><b>Motion R² read out at each block, train and test split by clip.</b> <span class="legend"><span><i style="background:var(--s-blue)"></i>0.7× and 1×</span><span><i style="background:var(--s-green)"></i>2× to 3×</span><span><i style="background:var(--s-grey)"></i>random init</span><span><i class="solid"></i>DiLoCo</span><span><i class="dash"></i>plain AdamW</span></span> Thick line: the 9-machine encoder of section 4. One seed per setting, 48 clips.</figcaption></figure>
+<p>With this split, motion information is highest at block 1 and decreases with depth in every trained encoder, faster at a larger update: the last block reads 0.33 at 0.7×, 0.24 at 1×, and −0.13 at 3×. A random initialisation stays near 0.55. The 9-machine 1× encoder holds up best, from 0.65 at block 1 to 0.49 at block 12.</p>
+<h3 id="rank">C · A second collapse: rank collapse in the small encoder, and its fix</h3>
+<p>The small LeVJEPA encoder had its own failure. With its regulariser (SIGReg) computed on batches of 16, the effective rank of its final token falls to about 1.2 within one round. Pooling the regulariser over a batch of 256 removes it.</p>
+<figure><canvas data-scene="rank" style="--ar:16/6;--arn:10/16"></canvas>
+<figcaption><b>Effective rank and speaker-identity accuracy by training round.</b> <span class="legend"><span><i style="background:var(--s-blue)"></i>pooled batch 256, two seeds</span><span><i style="background:var(--s-orange)"></i>batch 16</span><span><i style="background:var(--s-grey)"></i>random init</span></span></figcaption></figure>
+<p>With the pooled batch the rank reaches 10.4 and speaker identity 0.21, on both seeds, against 2.7 and 0.168 at a random initialisation. The rank fix alone did not improve valence and arousal: fine-tuned, these encoders scored about 0.03 below a random initialisation (measured before the seeding fix).</p>
+<h3 id="throughput">D · The system in more detail</h3>
+<figure><canvas data-scene="throughput" style="--ar:16/5.4;--arn:10/9"></canvas>
+<figcaption><b>Why not synchronous training.</b> Total throughput when machines exchange gradients at every step. At batch 4, one machine alone processes 24.0 samples per second and eight together 11.1.</figcaption></figure>
+<div id="system-detail"></div>
+<ul class="plain">
+<li><b>One round.</b> Assign shards (each held by exactly one machine), run local steps, wait for a quorum or a grace deadline, merge (drop stale and non-finite updates, weighted average, Nesterov outer step), sync the new master. The quorum shrinks for missing machines, never below 60% of the pool.</li>
+<li><b>Watcher.</b> A one-minute tick advances every run's state machine and runs six detectors: dead job, stalled job, foreign GPU process, quota, drained node, NaN. A dead job is resubmitted once; a second death escalates.</li>
+<li><b>Class-hours gate.</b> No job runs on weekdays from 08:00 to 20:00, and a job is refused if any part of its walltime would overlap that window. Enforced in the job scripts, in a shim in front of the scheduler commands, and in the watcher.</li>
+<li><b>Seeding of the fine-tuning test.</b> Until 2026-11-01 the test did not apply its seed, so seeds within one job could repeat and intervals computed before that date are too narrow. Only results re-run after the fix are given with an interval.</li>
+</ul>
+<h3 id="cpt-table">E · Continued pretraining, by dimension</h3>
+<div class="tbl"><table>
+<tr><th>Arm (30 seeds)</th><th>CCC</th><th>Valence</th><th>Arousal</th></tr>
+<tr><td>Random init</td><td>0.054</td><td>0.090</td><td>0.018</td></tr>
+<tr><td>Released ViT-L</td><td>0.287</td><td>0.090</td><td>0.483</td></tr>
+<tr class="own"><td>Released ViT-L + continued pretraining</td><td>0.331</td><td>0.176</td><td>0.487</td></tr>
+</table></div>
+
+<footer>Code, tests, configs and the result tables are in the repository. <code>notebooks/stern_overview.ipynb</code> redraws the README figures and rewrites <code>assets/data.js</code>, which this page's figures are drawn from. Figures follow the light or dark setting of the browser.<br>Vianney Gauthier · <a href="https://github.com/VianneyGG">github.com/VianneyGG</a> · All rights reserved.</footer>
+</main>
+<script src="assets/data.js"></script>
+<script src="assets/engine.js"></script>
+<script src="assets/scenes.js"></script>
+</body>
+</html>
