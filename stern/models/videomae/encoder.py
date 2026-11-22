@@ -102,6 +102,7 @@ class VideoMAEEncoder(nn.Module):
                     qk_norm=qk_norm,
                     layer_scale_init=layer_scale_init,
                     ln_scale=1 / math.sqrt(i + 1) if layernorm_scaling else 1.0,
+                    use_skip=bool(model_cfg.get("use_skip", True)),
                 )
             )
             for i in range(depth)

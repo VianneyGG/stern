@@ -194,3 +194,99 @@ def test_forward_tokens_last_intermediate_matches_the_final_output():
         out, intermediates = encoder.forward_tokens(x, keep_indices, return_layers=[4])
 
     assert torch.equal(out, intermediates[0])
+
+
+def test_use_skip_false_removes_both_residual_adds_in_every_encoder_block():
+    torch.manual_seed(0)
+    encoder = VideoMAEEncoder(_tiny_cfg(use_skip=False))
+    block = encoder.blocks[0]
+    x = torch.randn(2, 8, 32)
+
+    attn_out, _ = block.attn(block.norm1(x), need_weights=False)
+    expected = block.mlp(block.norm2(attn_out))
+
+    assert [b.use_skip for b in encoder.blocks] == [False, False]
+    torch.testing.assert_close(block(x), expected)
+    # the same block with its residual restored gives a different output
+    block.use_skip = True
+    assert (block(x) - expected).abs().max() > 0.1
+
+
+def test_use_skip_defaults_to_true_and_leaves_init_unchanged():
+    torch.manual_seed(0)
+    default = VideoMAEEncoder(_tiny_cfg())
+    torch.manual_seed(0)
+    explicit = VideoMAEEncoder(_tiny_cfg(use_skip=True))
+    x = torch.randn(2, 3, 4, 16, 16)
+
+    assert [b.use_skip for b in default.blocks] == [True, True]
+    torch.testing.assert_close(default(x), explicit(x), rtol=0, atol=0)
+
+
+def test_skipless_cutting_skip_encoder_trains_one_step():
+    torch.manual_seed(0)
+    encoder = VideoMAEEncoder(_tiny_cfg(use_skip=False, weight_init="cutting_skip"))
+    x = torch.randn(2, 3, 4, 16, 16)
+
+    feat = encoder(x)
+    feat.pow(2).mean().backward()
+
+    assert torch.isfinite(feat).all()
+    grad = encoder.blocks[0].attn.qkv.weight.grad
+    assert grad is not None and grad.abs().sum() > 0
+
+    torch.manual_seed(0)
+    kept = VideoMAEEncoder(_tiny_cfg(weight_init="cutting_skip"))
+    kept_feat = kept(x)
+    kept_feat.pow(2).mean().backward()
+    # same seed, same weights: only the cut skips separate the two
+    assert (feat - kept_feat).abs().max() > 1e-3
+    assert not torch.allclose(grad, kept.blocks[0].attn.qkv.weight.grad)
+
+
+def test_mae_pretraining_cuts_encoder_skips_and_keeps_decoder_skips():
+    from stern.models.videomae.mae import VideoMAEForPreTraining
+    from stern.models.videomae.masking import RandomTubeMasking
+
+    cfg = _tiny_cfg(
+        use_skip=False,
+        image_size=32,
+        patch_size=16,
+        decoder_depth=2,
+        decoder_embed_dim=8,
+        decoder_num_heads=2,
+        mask_ratio=0.5,
+    )
+    torch.manual_seed(0)
+    model = VideoMAEForPreTraining(cfg)
+    pixel_values = torch.randn(2, 3, 4, 32, 32)
+    keep, masked = RandomTubeMasking(mask_ratio=0.5)(
+        pixel_values, (2, 2, 2), torch.device("cpu"), batch_size=2
+    )
+
+    pred, target = model(pixel_values, keep, masked)
+    loss = model.compute_loss(pred, target)
+
+    assert [b.use_skip for b in model.encoder.blocks] == [False, False]
+    assert [b.use_skip for b in model.decoder_blocks] == [True, True]
+    assert torch.isfinite(loss)
+
+
+def test_hydra_override_sets_use_skip_false_as_a_bool():
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    conf = Path(__file__).resolve().parents[2] / "configs"
+    with initialize_config_dir(config_dir=str(conf), version_base=None):
+        cfg = compose(
+            "config",
+            overrides=[
+                "experiment=videomae_mesh_ssl",
+                "+model.use_skip=false",
+                "model.weight_init=cutting_skip",
+            ],
+        )
+
+    assert cfg.model.use_skip is False
+    assert cfg.model.weight_init == "cutting_skip"
