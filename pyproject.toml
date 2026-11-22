@@ -69,6 +69,10 @@ also_copy = [
     "tests",
 ]
 
+[tool.ruff.lint]
+# Errors only: syntax, undefined names, unused imports and variables.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 # mutmut copies source/test files under mutants/ to mutate them in isolation;
