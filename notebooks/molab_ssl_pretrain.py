@@ -69,7 +69,7 @@ def _(Path, github_pat, mo, os, repo_ready, subprocess, sys):
 
     clone_dir = "/tmp/stern"
     if not os.path.isdir(f"{clone_dir}/.git"):
-        clone_url = f"https://{github_pat.value}@github.com/VianneyGG/STERN.git"
+        clone_url = f"https://{github_pat.value}@github.com/VianneyGG/stern.git"
         subprocess.run(
             ["git", "clone", clone_url, clone_dir],
             check=True,
